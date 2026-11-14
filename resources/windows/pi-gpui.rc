@@ -1,0 +1,3 @@
+// gpui loads icon 1 from the executable for its windows (taskbar, Alt+Tab);
+// Explorer shows it for the .exe too.
+1 ICON "resources/windows/pi-gpui.ico"

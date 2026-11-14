@@ -1,3 +1,6 @@
+// Release builds on Windows are GUI apps: no console window opens with them.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod attachments;
 mod chat;
 mod diff;

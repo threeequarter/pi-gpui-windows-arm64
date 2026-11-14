@@ -14,6 +14,8 @@ use futures::SinkExt as _;
 use futures::channel::mpsc;
 use serde_json::Value;
 
+use crate::platform::ConsoleWindow as _;
+
 /// Capacity of the stdout → UI queue. When the UI falls behind, the reader
 /// thread blocks, the pipe fills, and the child slows down instead of the app
 /// buffering without limit.
@@ -44,6 +46,7 @@ impl JsonlProcess {
     /// Spawns `command` with piped stdio and starts the reader/writer threads.
     pub fn spawn(command: &mut Command) -> std::io::Result<(Self, mpsc::Receiver<JsonlMessage>)> {
         let mut child = command
+            .without_console_window()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -127,6 +130,7 @@ fn kill_tree(child: &mut Child) -> std::io::Result<()> {
 #[cfg(windows)]
 fn kill_tree(child: &mut Child) -> std::io::Result<()> {
     let status = Command::new("taskkill")
+        .without_console_window()
         .args(["/T", "/F", "/PID", &child.id().to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

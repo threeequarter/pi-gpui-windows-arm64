@@ -12,6 +12,7 @@ use std::process::Command;
 use serde_json::Value;
 
 use crate::pi::{self, Installation, Version};
+use crate::platform::ConsoleWindow as _;
 
 const PI_PACKAGE: &str = "@earendil-works/pi-coding-agent";
 
@@ -76,6 +77,7 @@ pub fn check(installation: &Installation) -> Updates {
 /// Runs `pi update <args>` and returns its output. Blocking.
 pub fn run(installation: &Installation, args: &[&str]) -> Result<String, String> {
     let output = Command::new(&installation.executable)
+        .without_console_window()
         .arg("update")
         .args(args)
         .env(
@@ -105,6 +107,7 @@ pub fn run(installation: &Installation, args: &[&str]) -> Result<String, String>
 /// `(source, install path)` pairs from `pi list`.
 fn installed_packages(installation: &Installation) -> Vec<(String, PathBuf)> {
     let Ok(output) = Command::new(&installation.executable)
+        .without_console_window()
         .arg("list")
         .env(
             "PATH",
@@ -158,6 +161,7 @@ fn package_version(path: &Path) -> Option<String> {
 
 fn latest_version(name: &str) -> Option<String> {
     let output = Command::new("curl")
+        .without_console_window()
         .args(["-fsSL", "--max-time", "15"])
         .arg(format!("https://registry.npmjs.org/{name}/latest"))
         .output()

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use futures::channel::mpsc;
 
 use crate::jsonl::{JsonlMessage, JsonlProcess};
+use crate::platform::ConsoleWindow as _;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -275,6 +276,7 @@ pub fn path_with_executable_dir(executable: &Path) -> OsString {
 
 fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<String, String> {
     let mut child = command
+        .without_console_window()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

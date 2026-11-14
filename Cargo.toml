@@ -31,6 +31,10 @@ objc = "0.2"
 # Already comes with gpui; Objective-C blocks for the folder picker's completion handler.
 block = "0.1"
 
+[target.'cfg(windows)'.build-dependencies]
+# Already comes with gpui; embeds the app icon (build.rs).
+embed-resource = "3"
+
 [profile.dev]
 # GPUI is slow in unoptimized builds; optimize dependencies, keep our code debuggable.
 opt-level = 1

@@ -13,6 +13,7 @@ use gpui::{
     div, px,
 };
 
+use crate::platform::ConsoleWindow as _;
 use crate::sessions;
 use crate::settings::Settings;
 use crate::ui::prelude::*;
@@ -532,6 +533,7 @@ impl GitError {
 
 fn git(directory: &Path, arguments: &[&str]) -> Result<String, GitError> {
     let output = Command::new("git")
+        .without_console_window()
         .arg("-C")
         .arg(directory)
         .args(arguments)

@@ -12,6 +12,9 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
+#[cfg(windows)]
+use crate::platform::ConsoleWindow as _;
+
 /// pi-gui refreshes its leases every minute and treats them as stale after five.
 const LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 const TITLE_MAX_CHARS: usize = 80;
@@ -184,6 +187,7 @@ pub fn foreign_lease_holder(session: &Path) -> Option<String> {
 #[cfg(windows)]
 fn process_is_alive(pid: u64) -> bool {
     let Ok(output) = Command::new("tasklist")
+        .without_console_window()
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
         .stderr(Stdio::null())
         .output()

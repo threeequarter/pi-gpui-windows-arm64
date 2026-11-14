@@ -6,6 +6,28 @@
 
 use gpui::Window;
 
+/// Console programs we start (git, pi, PowerShell) would each open a console
+/// window on Windows, where the release build is a GUI app without a console
+/// to share. A no-op elsewhere.
+pub trait ConsoleWindow {
+    fn without_console_window(&mut self) -> &mut Self;
+}
+
+impl ConsoleWindow for std::process::Command {
+    #[cfg(windows)]
+    fn without_console_window(&mut self) -> &mut Self {
+        use std::os::windows::process::CommandExt as _;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        self.creation_flags(CREATE_NO_WINDOW)
+    }
+
+    #[cfg(not(windows))]
+    fn without_console_window(&mut self) -> &mut Self {
+        self
+    }
+}
+
 /// Starts dragging the window from our custom title bar.
 ///
 /// Call it on the first mouse move after a mouse down in the title bar, like
@@ -166,6 +188,7 @@ pub fn move_to_trash(path: &std::path::Path) -> Result<(), String> {
         $env:PI_GPUI_TRASH_PATH, 'OnlyErrorDialogs', 'SendToRecycleBin')";
 
     let output = std::process::Command::new("powershell")
+        .without_console_window()
         .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
         .env("PI_GPUI_TRASH_PATH", path)
         .output()
@@ -250,12 +273,20 @@ pub fn open_in_editor(path: &std::path::Path) {
     } else {
         // Zed's CLI is `zed`, or `zeditor` in some distributions' packages.
         // Explorer opens a file with the app Windows associates with it.
-        let fallback = if cfg!(windows) { "explorer" } else { "xdg-open" };
+        let fallback = if cfg!(windows) {
+            "explorer"
+        } else {
+            "xdg-open"
+        };
         match ["zed", "zeditor"]
             .into_iter()
             .find(|program| on_path(program))
         {
-            Some(zed) => Command::new(zed).arg(path).spawn().map(drop),
+            Some(zed) => Command::new(zed)
+                .without_console_window()
+                .arg(path)
+                .spawn()
+                .map(drop),
             None => Command::new(fallback).arg(path).spawn().map(drop),
         }
     };

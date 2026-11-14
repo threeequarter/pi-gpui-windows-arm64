@@ -130,8 +130,8 @@ fn bind(on_line: impl Fn(String) + Send + 'static) {
     let prefix = format!("{token} ");
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            if let Some(message) = read_line(stream)
-                .and_then(|line| line.strip_prefix(&prefix).map(str::to_string))
+            if let Some(message) =
+                read_line(stream).and_then(|line| line.strip_prefix(&prefix).map(str::to_string))
             {
                 on_line(message);
             }

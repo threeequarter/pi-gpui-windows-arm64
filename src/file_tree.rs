@@ -14,6 +14,7 @@ use gpui::{
 };
 
 use crate::diff::FileStatus;
+use crate::platform::ConsoleWindow as _;
 use crate::ui::prelude::*;
 
 actions!(
@@ -691,6 +692,7 @@ fn read_directory(directory: &Path) -> Result<Vec<Entry>, String> {
 fn git_state(workspace: &Path) -> GitState {
     let run = |arguments: &[&str]| -> Option<Vec<u8>> {
         let output = Command::new("git")
+            .without_console_window()
             .arg("-C")
             .arg(workspace)
             .args(arguments)

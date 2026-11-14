@@ -301,12 +301,16 @@ fn relaunch_command(cleanup: &str, launch: &str) -> Command {
 /// empty and only the development build is started again.
 #[cfg(windows)]
 fn relaunch_command(_cleanup: &str, _launch: &str) -> Command {
+    use crate::platform::ConsoleWindow as _;
+
     let script = format!(
         "Wait-Process -Id {pid} -ErrorAction SilentlyContinue; Start-Process -FilePath $env:PI_GPUI_RELAUNCH",
         pid = std::process::id(),
     );
     let mut command = Command::new("powershell");
-    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    command
+        .without_console_window()
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script]);
     if let Ok(executable) = std::env::current_exe() {
         command.env("PI_GPUI_RELAUNCH", executable);
     }
