@@ -71,6 +71,39 @@ pub fn start_window_drag(window: &Window) {
     window.start_window_move();
 }
 
+/// Maximizes the window, or restores it when it is maximized. On Windows,
+/// gpui 0.2.2's `zoom_window` only maximizes, so we restore through Win32.
+#[cfg(windows)]
+pub fn toggle_maximized(window: &Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn ShowWindowAsync(hwnd: isize, command: i32) -> i32;
+    }
+    const SW_RESTORE: i32 = 9;
+
+    if !window.is_maximized() {
+        window.zoom_window();
+        return;
+    }
+    // `Window` also has an inherent `window_handle()`; ask the raw-window-handle trait.
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: `hwnd` is gpui's live window handle; ShowWindowAsync only posts
+    // a show command to it.
+    unsafe { ShowWindowAsync(win32.hwnd.get(), SW_RESTORE) };
+}
+
+#[cfg(not(windows))]
+pub fn toggle_maximized(window: &Window) {
+    window.zoom_window();
+}
+
 /// Tells macOS whether the app looks dark or light, so system-drawn parts
 /// (traffic lights, menus, scroll bars, permission sheets) and other apps
 /// asking for our appearance match the theme instead of the system setting.

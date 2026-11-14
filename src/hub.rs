@@ -2072,43 +2072,62 @@ impl HubView {
     /// What the macOS menu bar holds, for platforms without one.
     fn render_app_menu(&self, position: Point<Pixels>, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let item = |id: &'static str, label: &'static str, keys: Option<&'static str>| {
-            h_flex()
-                .id(id)
-                .h(px(28.))
-                .px(px(8.))
-                .gap(px(8.))
-                .rounded(px(5.))
-                .cursor_pointer()
-                .hover(|style| style.bg(colors.element_hover))
-                .child(
-                    div()
-                        .flex_1()
-                        .child(Label::new(label).size(LabelSize::Small)),
-                )
-                .children(keys.map(KeyHint::new))
-        };
-        let settings = item("app-menu-settings", "Settings", Some("⌘,")).on_click(cx.listener(
-            |this, _, window, cx| {
+        let item =
+            |id: &'static str, label: &'static str, keys: Option<&'static str>, enabled: bool| {
+                h_flex()
+                    .id(id)
+                    .h(px(28.))
+                    .px(px(8.))
+                    .gap(px(8.))
+                    .rounded(px(5.))
+                    .when(enabled, |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.bg(colors.element_hover))
+                    })
+                    .when(!enabled, |this| this.cursor_not_allowed())
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Label::new(label).size(LabelSize::Small).color(if enabled {
+                                Color::Default
+                            } else {
+                                Color::Disabled
+                            })),
+                    )
+                    .children(keys.map(KeyHint::new))
+            };
+        let settings = item("app-menu-settings", "Settings", Some("⌘,"), true).on_click(
+            cx.listener(|this, _, window, cx| {
                 this.app_menu = None;
                 this.open_settings(&OpenSettings, window, cx);
-            },
-        ));
-        let updates = item("app-menu-updates", "Check for Updates", None).on_click(cx.listener(
-            |this, _, _, cx| {
+            }),
+        );
+        // Updates only work in an installed bundle, never on Windows, so the
+        // item is greyed out where they are unavailable.
+        let updates_enabled = AutoUpdater::global(cx).read(cx).available();
+        let updates = item(
+            "app-menu-updates",
+            "Check for Updates",
+            None,
+            updates_enabled,
+        );
+        let updates = if updates_enabled {
+            updates.on_click(cx.listener(|this, _, _, cx| {
                 this.app_menu = None;
                 AutoUpdater::global(cx).update(cx, |updater, cx| updater.check(true, cx));
                 cx.notify();
-            },
-        ));
-        let about = item("app-menu-about", "About Pi GPUI", None).on_click(cx.listener(
+            }))
+        } else {
+            updates
+        };
+        let about = item("app-menu-about", "About Pi GPUI", None, true).on_click(cx.listener(
             |this, _, _, cx| {
                 this.app_menu = None;
                 cx.open_url("https://github.com/bytesbay/pi-gpui");
                 cx.notify();
             },
         ));
-        let quit = item("app-menu-quit", "Quit", Some("⌘Q")).on_click(|_, _, cx| cx.quit());
+        let quit = item("app-menu-quit", "Quit", Some("⌘Q"), true).on_click(|_, _, cx| cx.quit());
         deferred(
             anchored()
                 .position(position)
@@ -4454,13 +4473,14 @@ impl HubView {
             }))
             // Double-click follows the user's macOS setting (zoom or minimize);
             // on Linux it maximizes, and a right click opens the window menu.
-            // On Windows the drag area is the native caption, which does both.
+            // On Windows the drag area is the native caption, which opens the
+            // window menu; double-click is handled in the breadcrumb drag area.
             .on_click(|event, window, _| {
                 if event.click_count() >= 2 && !cfg!(windows) {
                     if cfg!(target_os = "macos") {
                         window.titlebar_double_click();
                     } else {
-                        window.zoom_window();
+                        platform::toggle_maximized(window);
                     }
                 }
             })
@@ -4486,7 +4506,23 @@ impl HubView {
                     .pr(px(10.))
                     .gap(px(12.))
                     .children(self.render_dock_toggle(DockSide::Left, cx))
-                    .child(div().flex_1().min_w(px(0.)).flex().child(breadcrumb))
+                    .child({
+                        let drag_area = div().flex_1().min_w(px(0.)).flex().child(breadcrumb);
+                        if cfg!(windows) {
+                            // gpui consumes the native caption double click, so
+                            // toggle on the second press. Scoped to the breadcrumb
+                            // area: the title-bar buttons are its siblings, and a
+                            // double click on them must not maximize the window.
+                            drag_area.on_mouse_down(MouseButton::Left, |event, window, cx| {
+                                if event.click_count == 2 {
+                                    platform::toggle_maximized(window);
+                                    cx.stop_propagation();
+                                }
+                            })
+                        } else {
+                            drag_area
+                        }
+                    })
                     .children(plugin_statuses)
                     .children(status)
                     .children(self.render_update_chip(cx))
@@ -4775,7 +4811,7 @@ impl Render for HubView {
                 }),
             )
             .on_action(|_: &Minimize, window, _| window.minimize_window())
-            .on_action(|_: &Zoom, window, _| window.zoom_window())
+            .on_action(|_: &Zoom, window, _| platform::toggle_maximized(window))
             .on_action(|_: &ToggleFullScreen, window, _| window.toggle_fullscreen())
             .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
                 // ⌘ on macOS, Ctrl elsewhere, and nothing else held.
@@ -4877,7 +4913,7 @@ fn render_window_controls(window: &Window) -> Option<AnyElement> {
                     } else {
                         "Maximize"
                     }))
-                    .on_click(|_, window, _| window.zoom_window()),
+                    .on_click(|_, window, _| platform::toggle_maximized(window)),
                 )
             })
             .child(

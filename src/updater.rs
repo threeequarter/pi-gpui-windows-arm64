@@ -107,6 +107,12 @@ impl AutoUpdater {
         self.current
     }
 
+    /// Whether this build can self-update. Only installed bundles can, so this
+    /// is false on Windows and in development builds (see `running_bundle`).
+    pub fn available(&self) -> bool {
+        self.bundle.is_some()
+    }
+
     /// The result of a "Check for Updates" the user asked for, once.
     pub fn take_manual_result(&mut self) -> Option<UpdateStatus> {
         self.manual_result.take()
