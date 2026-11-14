@@ -62,7 +62,7 @@ fn main() {
         .nth(1)
         .filter(|_| initial_link.is_none())
         .map(PathBuf::from)
-        .map(|path| match path.canonicalize() {
+        .map(|path| match dunce::canonicalize(&path) {
             Ok(path) if path.is_dir() => path,
             Ok(path) => {
                 eprintln!("pi-gpui: {} is not a directory", path.display());
@@ -118,6 +118,12 @@ fn main() {
             cx.open_url("https://github.com/bytesbay/pi-gpui");
         });
         cx.on_action(|_: &Quit, cx| cx.quit());
+        #[cfg(windows)]
+        cx.on_app_quit(|_| {
+            single_instance::release();
+            async {}
+        })
+        .detach();
         updater::AutoUpdater::init(cx);
         highlight::preload();
         cx.on_action(|_: &CheckForUpdates, cx| {

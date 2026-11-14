@@ -3232,10 +3232,13 @@ fn format_time(at: i64, full: bool) -> String {
     ];
     let local = |ms: i64| {
         let seconds = (ms / 1000) as libc::time_t;
-        // SAFETY: localtime_r only writes into the struct we pass.
+        // SAFETY: localtime_r and localtime_s only write into the struct we pass.
         unsafe {
             let mut tm: libc::tm = std::mem::zeroed();
+            #[cfg(unix)]
             libc::localtime_r(&seconds, &mut tm);
+            #[cfg(windows)]
+            libc::localtime_s(&mut tm, &seconds);
             tm
         }
     };

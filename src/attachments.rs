@@ -42,7 +42,9 @@ pub fn is_image(path: &Path) -> bool {
         })
 }
 
-/// A temporary symlink to `original`, keeping its file name.
+/// A temporary symlink to `original`, keeping its file name. Windows allows
+/// symlinks only in developer mode, so there it is a hard link, which works
+/// for files on the temp folder's drive; callers fall back to the original.
 pub fn link_file(original: &Path) -> std::io::Result<PathBuf> {
     let name = original
         .file_name()
@@ -52,7 +54,10 @@ pub fn link_file(original: &Path) -> std::io::Result<PathBuf> {
         .join(unique_id());
     std::fs::create_dir_all(&directory)?;
     let link = directory.join(name);
+    #[cfg(unix)]
     std::os::unix::fs::symlink(original, &link)?;
+    #[cfg(windows)]
+    std::fs::hard_link(original, &link)?;
     Ok(link)
 }
 

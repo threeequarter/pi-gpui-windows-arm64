@@ -269,13 +269,7 @@ impl AutoUpdater {
                 }
             },
         };
-        let script = format!(
-            "while kill -0 {pid} 2>/dev/null; do sleep 0.1; done; {cleanup}{launch}",
-            pid = std::process::id(),
-        );
-        let spawned = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(script)
+        let spawned = relaunch_command(&cleanup, &launch)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -290,6 +284,33 @@ impl AutoUpdater {
         }
         cx.quit();
     }
+}
+
+#[cfg(not(windows))]
+fn relaunch_command(cleanup: &str, launch: &str) -> Command {
+    let script = format!(
+        "while kill -0 {pid} 2>/dev/null; do sleep 0.1; done; {cleanup}{launch}",
+        pid = std::process::id(),
+    );
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(script);
+    command
+}
+
+/// Windows never stages an update (see `running_bundle`), so `cleanup` is
+/// empty and only the development build is started again.
+#[cfg(windows)]
+fn relaunch_command(_cleanup: &str, _launch: &str) -> Command {
+    let script = format!(
+        "Wait-Process -Id {pid} -ErrorAction SilentlyContinue; Start-Process -FilePath $env:PI_GPUI_RELAUNCH",
+        pid = std::process::id(),
+    );
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    if let Ok(executable) = std::env::current_exe() {
+        command.env("PI_GPUI_RELAUNCH", executable);
+    }
+    command
 }
 
 struct Release {
@@ -555,7 +576,11 @@ fn run(command: &mut Command) -> Result<(), String> {
 /// `…/Pi GPUI.app` when running from a bundle; on Linux the install folder
 /// from the release tarball (`…/pi-gpui.app/bin/pi-gpui`). A binary a distro
 /// package put in `/usr/bin` is not one: its package manager updates it.
+/// Windows has no release build yet, so nothing there updates itself.
 fn running_bundle() -> Option<PathBuf> {
+    if cfg!(windows) {
+        return None;
+    }
     let executable = std::env::current_exe().ok()?.canonicalize().ok()?;
     if !cfg!(target_os = "macos") {
         let bin = executable.parent()?;

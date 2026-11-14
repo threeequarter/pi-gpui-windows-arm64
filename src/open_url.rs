@@ -34,13 +34,11 @@ pub fn parse(url: &str) -> Option<OpenRequest> {
 }
 
 /// `pi-gpui://open?workspace=<dir>` for a project folder.
-/// Linux only: a second launch hands its folder to the running app.
+/// Linux and Windows only: a second launch hands its folder to the running app.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn workspace_link(workspace: &std::path::Path) -> String {
-    use std::os::unix::ffi::OsStrExt as _;
-
     let mut link = String::from("pi-gpui://open?workspace=");
-    for &byte in workspace.as_os_str().as_bytes() {
+    for &byte in workspace.as_os_str().as_encoded_bytes() {
         if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
             link.push(byte as char);
         } else {

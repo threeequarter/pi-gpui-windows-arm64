@@ -181,6 +181,19 @@ pub fn foreign_lease_holder(session: &Path) -> Option<String> {
     )
 }
 
+#[cfg(windows)]
+fn process_is_alive(pid: u64) -> bool {
+    let Ok(output) = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+}
+
+#[cfg(not(windows))]
 fn process_is_alive(pid: u64) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -238,24 +251,32 @@ pub fn display_path(path: &Path) -> String {
 }
 
 pub fn home_directory() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    let variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(variable).map(PathBuf::from)
 }
 
 /// The app's own files (settings, projects, plugins): `~/Library/Application
-/// Support/pi-gpui` on macOS, `$XDG_CONFIG_HOME/pi-gpui` (`~/.config/pi-gpui`)
-/// elsewhere.
+/// Support/pi-gpui` on macOS, `%APPDATA%\pi-gpui` on Windows,
+/// `$XDG_CONFIG_HOME/pi-gpui` (`~/.config/pi-gpui`) elsewhere.
 pub fn app_data_directory() -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
         return Some(home_directory()?.join("Library/Application Support/pi-gpui"));
+    }
+    if cfg!(windows) {
+        return Some(windows_directory("APPDATA")?.join("pi-gpui"));
     }
     Some(xdg_directory("XDG_CONFIG_HOME", ".config")?.join("pi-gpui"))
 }
 
 /// Downloads that can be thrown away: `~/Library/Caches/pi-gpui` on macOS,
-/// `$XDG_CACHE_HOME/pi-gpui` (`~/.cache/pi-gpui`) elsewhere.
+/// `%LOCALAPPDATA%\pi-gpui` on Windows, `$XDG_CACHE_HOME/pi-gpui`
+/// (`~/.cache/pi-gpui`) elsewhere.
 pub fn app_cache_directory() -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
         return Some(home_directory()?.join("Library/Caches/pi-gpui"));
+    }
+    if cfg!(windows) {
+        return Some(windows_directory("LOCALAPPDATA")?.join("pi-gpui"));
     }
     Some(xdg_directory("XDG_CACHE_HOME", ".cache")?.join("pi-gpui"))
 }
@@ -268,9 +289,15 @@ fn xdg_directory(variable: &str, fallback: &str) -> Option<PathBuf> {
         .or_else(|| Some(home_directory()?.join(fallback)))
 }
 
+fn windows_directory(variable: &str) -> Option<PathBuf> {
+    std::env::var_os(variable)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
 fn same_directory(cwd: &str, workspace: &Path) -> bool {
     let cwd = Path::new(cwd);
-    cwd == workspace || cwd.canonicalize().is_ok_and(|cwd| cwd == workspace)
+    cwd == workspace || dunce::canonicalize(cwd).is_ok_and(|cwd| cwd == workspace)
 }
 
 fn trim_line(line: &[u8]) -> &[u8] {

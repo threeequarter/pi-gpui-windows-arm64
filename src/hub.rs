@@ -765,7 +765,7 @@ impl HubView {
         let request = crate::open_url::parse(url);
         let Some(workspace) = request
             .as_ref()
-            .and_then(|request| PathBuf::from(&request.workspace).canonicalize().ok())
+            .and_then(|request| dunce::canonicalize(PathBuf::from(&request.workspace)).ok())
             .filter(|path| path.is_dir())
         else {
             self.notice = Some((
@@ -793,7 +793,7 @@ impl HubView {
     }
 
     fn add_workspace(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let path = path.canonicalize().unwrap_or(path);
+        let path = dunce::canonicalize(&path).unwrap_or(path);
         if let Some(entry) = self.entry_mut(&path) {
             entry.expanded = true;
         } else {
@@ -1473,7 +1473,7 @@ impl HubView {
         let Some(workspace) = params["workspace"]
             .as_str()
             .map(PathBuf::from)
-            .and_then(|path| path.canonicalize().ok())
+            .and_then(|path| dunce::canonicalize(path).ok())
             .filter(|path| path.is_dir())
         else {
             reply.finish(
@@ -4454,8 +4454,9 @@ impl HubView {
             }))
             // Double-click follows the user's macOS setting (zoom or minimize);
             // on Linux it maximizes, and a right click opens the window menu.
+            // On Windows the drag area is the native caption, which does both.
             .on_click(|event, window, _| {
-                if event.click_count() >= 2 {
+                if event.click_count() >= 2 && !cfg!(windows) {
                     if cfg!(target_os = "macos") {
                         window.titlebar_double_click();
                     } else {
@@ -4463,7 +4464,7 @@ impl HubView {
                     }
                 }
             })
-            .when(!cfg!(target_os = "macos"), |this| {
+            .when(!cfg!(any(target_os = "macos", windows)), |this| {
                 this.on_mouse_down(MouseButton::Right, |event, window, _| {
                     window.show_window_menu(event.position)
                 })
@@ -4837,12 +4838,14 @@ impl Render for HubView {
 }
 
 /// Minimize, maximize and close, when the app draws its own frame (Linux
-/// without server-side decorations). The window manager draws them otherwise.
+/// without server-side decorations, and Windows, where the custom title bar
+/// replaces the system one). The window manager draws them otherwise.
 fn render_window_controls(window: &Window) -> Option<AnyElement> {
-    if !matches!(
+    let draws_own_frame = matches!(
         window.window_decorations(),
         gpui::Decorations::Client { .. }
-    ) {
+    );
+    if !draws_own_frame && !cfg!(windows) {
         return None;
     }
     let controls = window.window_controls();

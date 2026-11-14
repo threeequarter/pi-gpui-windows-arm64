@@ -1,5 +1,5 @@
 //! Platform pieces gpui 0.2.2 does not provide: AppKit calls on macOS, the
-//! freedesktop equivalents on Linux.
+//! freedesktop equivalents on Linux, Explorer and the Recycle Bin on Windows.
 
 // `objc` 0.2 macros probe a `cargo-clippy` feature that modern rustc flags.
 #![allow(unexpected_cfgs)]
@@ -124,7 +124,7 @@ pub fn move_to_trash(path: &std::path::Path) -> Result<(), String> {
 /// `gio trash` (GLib, on GNOME and most other desktops), then `kioclient`
 /// (KDE), then `trash-put` (trash-cli). Never deletes for good: without any of
 /// them the file stays where it is.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn move_to_trash(path: &std::path::Path) -> Result<(), String> {
     use std::process::Command;
 
@@ -155,7 +155,34 @@ pub fn move_to_trash(path: &std::path::Path) -> Result<(), String> {
     Err("no trash tool found (install gio, kioclient or trash-cli)".to_string())
 }
 
+/// Moves a file to the Recycle Bin through .NET's `FileSystem.DeleteFile`,
+/// which every Windows PowerShell has. The path goes in an environment
+/// variable, so it is never parsed as PowerShell code.
+#[cfg(windows)]
+pub fn move_to_trash(path: &std::path::Path) -> Result<(), String> {
+    const SCRIPT: &str = "$ErrorActionPreference = 'Stop'; \
+        Add-Type -AssemblyName Microsoft.VisualBasic; \
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(\
+        $env:PI_GPUI_TRASH_PATH, 'OnlyErrorDialogs', 'SendToRecycleBin')";
+
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .env("PI_GPUI_TRASH_PATH", path)
+        .output()
+        .map_err(|error| format!("could not run PowerShell: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if message.is_empty() {
+        "the file could not be moved to the Recycle Bin".to_string()
+    } else {
+        message
+    })
+}
+
 /// Shows the file in Finder, or in the file manager on Linux.
+#[cfg(not(windows))]
 pub fn reveal_in_file_manager(path: &std::path::Path) {
     use std::process::Command;
 
@@ -192,6 +219,21 @@ pub fn reveal_in_file_manager(path: &std::path::Path) {
     }
 }
 
+/// Opens Explorer with the file selected. Explorer wants `/select,"path"` as
+/// one argument with the quotes inside, which the standard quoting cannot
+/// produce.
+#[cfg(windows)]
+pub fn reveal_in_file_manager(path: &std::path::Path) {
+    use std::os::windows::process::CommandExt as _;
+
+    let result = std::process::Command::new("explorer")
+        .raw_arg(format!("/select,\"{}\"", path.display()))
+        .spawn();
+    if let Err(error) = result {
+        eprintln!("pi-gpui: could not reveal {}: {error}", path.display());
+    }
+}
+
 /// Opens a file in Zed when it is installed, otherwise in the default editor.
 pub fn open_in_editor(path: &std::path::Path) {
     use std::process::Command;
@@ -207,12 +249,14 @@ pub fn open_in_editor(path: &std::path::Path) {
         command.arg(path).spawn().map(drop)
     } else {
         // Zed's CLI is `zed`, or `zeditor` in some distributions' packages.
+        // Explorer opens a file with the app Windows associates with it.
+        let fallback = if cfg!(windows) { "explorer" } else { "xdg-open" };
         match ["zed", "zeditor"]
             .into_iter()
             .find(|program| on_path(program))
         {
             Some(zed) => Command::new(zed).arg(path).spawn().map(drop),
-            None => Command::new("xdg-open").arg(path).spawn().map(drop),
+            None => Command::new(fallback).arg(path).spawn().map(drop),
         }
     };
     if let Err(error) = result {
@@ -222,11 +266,16 @@ pub fn open_in_editor(path: &std::path::Path) {
 
 fn on_path(program: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|directory| directory.join(program).is_file())
+        std::env::split_paths(&paths).any(|directory| {
+            directory
+                .join(format!("{program}{}", std::env::consts::EXE_SUFFIX))
+                .is_file()
+        })
     })
 }
 
 /// `file://` URI with the bytes that need it percent-encoded.
+#[cfg(not(windows))]
 fn file_uri(path: &std::path::Path) -> String {
     use std::os::unix::ffi::OsStrExt as _;
 

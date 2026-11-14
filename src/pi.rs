@@ -194,6 +194,33 @@ fn discover() -> Option<PathBuf> {
 /// The inherited `PATH`, then the user's login shell. Apps started from Finder
 /// do not inherit PATH entries added by shell rc files (nvm, fnm, volta), so
 /// the shell lookup is what usually finds `pi` and `node`. Blocking.
+///
+/// Windows apps inherit the user's PATH, so there is no shell lookup. npm
+/// installs `pi` there as an extensionless shell script next to `pi.cmd`, so
+/// only files `Command` can start are considered.
+#[cfg(windows)]
+pub fn find_executable(name: &str) -> Option<PathBuf> {
+    const STARTABLE: [&str; 4] = ["com", "exe", "bat", "cmd"];
+
+    let has_startable_extension = Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| STARTABLE.contains(&extension.to_ascii_lowercase().as_str()));
+    let file_names: Vec<String> = if has_startable_extension {
+        vec![name.to_string()]
+    } else {
+        STARTABLE
+            .iter()
+            .map(|extension| format!("{name}.{extension}"))
+            .collect()
+    };
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .flat_map(|directory| file_names.iter().map(move |file| directory.join(file)))
+        .find(|candidate| candidate.is_file())
+}
+
+#[cfg(not(windows))]
 pub fn find_executable(name: &str) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("PATH")
         && let Some(found) = std::env::split_paths(&path)

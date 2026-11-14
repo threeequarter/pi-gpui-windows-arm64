@@ -109,12 +109,32 @@ impl Drop for JsonlProcess {
                 }
             }
             if let Ok(mut child) = child.lock()
-                && let Err(error) = child.kill()
+                && let Err(error) = kill_tree(&mut child)
             {
                 eprintln!("pi-gpui: failed to stop a child process: {error}");
             }
         });
     }
+}
+
+#[cfg(not(windows))]
+fn kill_tree(child: &mut Child) -> std::io::Result<()> {
+    child.kill()
+}
+
+/// On Windows pi starts through `pi.cmd`, so the child is `cmd.exe` and pi
+/// runs in a `node` process below it, which `Child::kill` would leave behind.
+#[cfg(windows)]
+fn kill_tree(child: &mut Child) -> std::io::Result<()> {
+    let status = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &child.id().to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+    child.kill()
 }
 
 fn missing_pipe() -> std::io::Error {
