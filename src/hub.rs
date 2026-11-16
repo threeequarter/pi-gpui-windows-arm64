@@ -9,10 +9,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyElement, AnyView, App, ClickEvent, Context, ElementId, Entity, FocusHandle, Focusable,
-    FontWeight, KeyBinding, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    Pixels, Point, SharedString, StyleRefinement, Subscription, Task, Window, WindowControlArea,
-    actions, anchored, deferred, div, point, px,
+    AnyElement, AnyView, App, Bounds, ClickEvent, Context, ElementId, Entity, FocusHandle,
+    Focusable, FontWeight, KeyBinding, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, Pixels, Point, SharedString, StyleRefinement, Subscription, Task, Window,
+    WindowControlArea, actions, anchored, deferred, div, point, px,
 };
 use serde_json::{Value, json};
 
@@ -324,6 +324,8 @@ pub struct HubView {
     diff_panel: Entity<DiffPanel>,
     files_panel: Entity<FilesPanel>,
     file_viewer: Option<Entity<FileViewer>>,
+    /// Where the last file viewer was moved or resized to, for this run.
+    file_viewer_frame: Option<Bounds<Pixels>>,
     /// Focus returns to the Files panel after the viewer closes.
     focus_files: bool,
     /// Right-click menu of a side panel.
@@ -500,6 +502,7 @@ impl HubView {
             diff_panel,
             files_panel,
             file_viewer: None,
+            file_viewer_frame: None,
             focus_files: false,
             panel_menu: None,
             resizing_dock: None,
@@ -4762,12 +4765,17 @@ impl Focusable for HubView {
 
 impl HubView {
     fn open_file_viewer(&mut self, path: PathBuf, title: String, cx: &mut Context<Self>) {
-        let viewer = cx.new(|cx| FileViewer::new(path, title, cx));
-        cx.subscribe(&viewer, |this: &mut Self, _, _: &FileViewerEvent, cx| {
-            this.file_viewer = None;
-            this.focus_files = true;
-            cx.notify();
-        })
+        let frame = self.file_viewer_frame;
+        let viewer = cx.new(|cx| FileViewer::new(path, title, frame, cx));
+        cx.subscribe(
+            &viewer,
+            |this: &mut Self, viewer, _: &FileViewerEvent, cx| {
+                this.file_viewer_frame = viewer.read(cx).frame();
+                this.file_viewer = None;
+                this.focus_files = true;
+                cx.notify();
+            },
+        )
         .detach();
         self.file_viewer = Some(viewer);
         cx.notify();

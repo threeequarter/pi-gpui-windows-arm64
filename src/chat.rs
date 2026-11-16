@@ -1,6 +1,7 @@
 //! One pi session: transcript, composer and its own `pi --mode rpc` process.
 
 mod ansi;
+mod bootstrap;
 mod dialog;
 mod log_viewer;
 mod overlays;
@@ -83,6 +84,9 @@ const EDIT_CONTEXT: &str = "MessageEdit";
 const COMPOSER_PLACEHOLDER: &str = "Message pi…";
 /// Ignore the chip click that arrives right after a click outside closed the picker.
 const PICKER_REOPEN_GUARD: Duration = Duration::from_millis(250);
+/// A running call's output opens only after this long, so quick calls do
+/// not flash open for their one partial update.
+const STREAM_OPEN_DELAY: Duration = Duration::from_secs(1);
 /// Upper bound of pi records applied per UI update, so a burst cannot hold
 /// the foreground thread long enough to delay input.
 const MAX_RECORDS_PER_UPDATE: usize = 256;
@@ -302,6 +306,8 @@ enum Row {
     User {
         text: SharedString,
         steering: bool,
+        /// The memory-bootstrap card this message triggered, shown above it.
+        bootstrap: Option<bootstrap::Bootstrap>,
         /// Pasted images (their paths are in the text) and inline images.
         images: Vec<Picture>,
         /// When it was sent, Unix ms.
@@ -444,6 +450,12 @@ pub struct ChatView {
     list_state: ListState,
     active_assistant: Option<usize>,
     tool_rows: HashMap<String, usize>,
+    /// A memory-bootstrap signal asked for the `get_entries` in flight.
+    bootstrap_signal: bool,
+    /// Bootstrap runs on the branch, from the last `get_entries`.
+    bootstraps: Vec<bootstrap::Found>,
+    /// Phases of runs signaled in this process, by run id.
+    bootstrap_live: HashMap<String, bootstrap::Phase>,
     next_request_id: u64,
     composer: Entity<TextInput>,
     focus_handle: FocusHandle,
@@ -566,6 +578,9 @@ impl ChatView {
             usage_closed_at: None,
             stats_notice: false,
             _usage_tick: Task::ready(()),
+            bootstrap_signal: false,
+            bootstraps: Vec::new(),
+            bootstrap_live: HashMap::new(),
             pending_prompt: false,
             needs_list_reset: false,
             model: None,
@@ -740,6 +755,7 @@ impl ChatView {
                 if self.rows.is_empty() && self.session_file.is_some() {
                     self.loading_history = true;
                     commands.push(json!({ "type": "get_messages" }));
+                    commands.push(json!({ "type": "get_entries" }));
                 }
                 for command in commands {
                     if let Err(error) = self.send(command) {
@@ -823,6 +839,7 @@ impl ChatView {
                     at: Some(now_ms()),
                     text: SharedString::from(message.to_string()),
                     steering,
+                    bootstrap: None,
                     images: attachments::image_paths_in(message)
                         .into_iter()
                         .map(Picture::File)
@@ -1179,6 +1196,7 @@ impl ChatView {
                 rows.append(&mut self.rows);
                 self.rows = rows;
                 self.needs_list_reset = true;
+                self.attach_bootstraps(false, cx);
                 self.request_stats();
                 if let Some(message) = self.send_after_reload.take() {
                     self.send_prompt(&message, cx);
@@ -1233,6 +1251,7 @@ impl ChatView {
                 self.slash_commands.extend(slash::from_pi(data));
             }
             "get_entries" => {
+                self.bootstrap_entries(data, cx);
                 if let Some(view) = &mut self.tree {
                     let (lines, current) = tree::flatten(data);
                     view.selected = current.unwrap_or(lines.len().saturating_sub(1));
@@ -1590,6 +1609,7 @@ impl ChatView {
         self.send_all([
             json!({ "type": "get_state" }),
             json!({ "type": "get_messages" }),
+            json!({ "type": "get_entries" }),
         ]);
     }
 
@@ -2236,6 +2256,7 @@ impl ChatView {
                     self.usage_extra = Some(extra);
                 }
             }
+            "setStatus" if self.bootstrap_signaled(record) => {}
             "setWidget" => self.widgets.apply(record),
             // Other statuses, setTitle: no UI for them yet.
             _ => {}
@@ -2590,9 +2611,14 @@ impl ChatView {
                 let has_details = !output.is_empty() || !images.is_empty();
                 let (code_size, code_line) = crate::settings::Settings::get(cx).dense_code_size();
                 let running = *status == ToolStatus::Running;
-                // Output streams in open, unless the user closed this row.
-                let open = expanded.unwrap_or(default_open || (running && !output.is_empty()))
-                    && has_details;
+                // Output of a long call streams in open, unless the user
+                // closed this row; quick calls stay closed, without a flash.
+                let streaming = running
+                    && !output.is_empty()
+                    && log
+                        .started
+                        .is_some_and(|started| started.elapsed() >= STREAM_OPEN_DELAY);
+                let open = expanded.unwrap_or(default_open || streaming) && has_details;
                 let timing = match (running, log.started, log.duration_ms) {
                     (true, Some(started), _) => Some(format!("{} s", started.elapsed().as_secs())),
                     (false, _, Some(ms)) => Some(format_duration(ms)),
@@ -2837,7 +2863,14 @@ impl ChatView {
         } else {
             "Fork after this turn"
         };
-        div()
+        let bootstrap_card = match row {
+            Row::User {
+                bootstrap: Some(card),
+                ..
+            } => Some(self.render_bootstrap(index, card, default_open, cx)),
+            _ => None,
+        };
+        let row_element = div()
             .id(("row", index))
             .group(ROW_GROUP)
             .w_full()
@@ -2897,7 +2930,24 @@ impl ChatView {
                         )
                     }),
             )
-            .into_any_element()
+            .into_any_element();
+        match bootstrap_card {
+            // Outside the row, so the row's hover pills stay on the message.
+            Some(card) => v_flex()
+                .w_full()
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .px(px(ROW_GUTTER))
+                        .pt(px(6.))
+                        .child(div().w_full().max_w(px(CONTENT_MAX_WIDTH)).child(card)),
+                )
+                .child(row_element)
+                .into_any_element(),
+            None => row_element,
+        }
     }
 
     /// A tool-style card: the message's first line, the full text on demand.
@@ -3662,6 +3712,7 @@ fn history_rows(messages: &[Value]) -> Vec<Row> {
             "user" => {
                 let text = sessions::message_text(message);
                 rows.push(Row::User {
+                    bootstrap: None,
                     at: message["timestamp"].as_i64(),
                     images: Picture::of_message(&message["content"], &text),
                     text: SharedString::from(text),

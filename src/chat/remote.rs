@@ -125,6 +125,7 @@ impl ChatView {
                     at: Some(now_ms()),
                     text: SharedString::from(message.to_string()),
                     steering: queued,
+                    bootstrap: None,
                     images: attachments::image_paths_in(message)
                         .into_iter()
                         .map(Picture::File)
