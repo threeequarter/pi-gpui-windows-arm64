@@ -329,6 +329,7 @@ fn heading_level(level: HeadingLevel) -> u8 {
 // Spacing from Zed's agent markdown style. Text sizes come from the
 // settings (`agent_font_size`, `buffer_font_*`), with Zed's proportions.
 const PARAGRAPH_SPACING: f32 = 8.;
+const TABLE_MIN_COLUMN_WIDTH: f32 = 48.;
 
 /// Renders parsed markdown. `key` must be unique and stable per message: it
 /// identifies text blocks for selection and element ids.
@@ -572,7 +573,9 @@ impl Renderer<'_> {
     }
 
     /// Zed's markdown table: columns as wide as their content, 1.5 px outer
-    /// border, title bar colored header, striped rows, horizontal scrolling.
+    /// border, title bar colored header, striped rows. A table wider than
+    /// the message shrinks to fit and wraps its cells; wide columns give up
+    /// more width than narrow ones.
     fn table(
         &self,
         key: &str,
@@ -591,16 +594,23 @@ impl Renderer<'_> {
                 FontWeight::NORMAL
             };
             for (column, cell) in row.iter().enumerate() {
-                widths[column] =
-                    widths[column].max(text_width(&cell.text, weight, self.body, window));
+                widths[column] = widths[column].max(text_width(
+                    cell,
+                    weight,
+                    self.body,
+                    &self.code_font,
+                    window,
+                ));
             }
         }
         let border = colors.border;
         let header_background = colors.title_bar_background;
         let stripe = colors.panel_background;
 
+        let total: f32 = widths.iter().map(|width| f32::from(*width)).sum();
         let table = v_flex()
-            .flex_none()
+            .flex_shrink()
+            .min_w(px(0.))
             .border_1()
             .border_color(border)
             .rounded(px(2.))
@@ -622,15 +632,20 @@ impl Renderer<'_> {
                     .when(row_index > 0, |this| this.border_t_1().border_color(border))
                     .children((0..columns).map(|column| {
                         let cell = row.get(column).cloned().unwrap_or_default();
-                        div()
-                            .w(widths[column] + px(8. + 2.))
-                            .flex_none()
+                        let mut cell_element = div()
+                            .flex_basis(widths[column] + px(8. + 2.))
+                            .min_w(px(TABLE_MIN_COLUMN_WIDTH))
+                            .overflow_hidden();
+                        // Flex shrinks by factor × basis; a factor that grows with
+                        // the width keeps narrow columns from wrapping first.
+                        cell_element.style().flex_shrink =
+                            Some(f32::from(widths[column]) / total.max(1.));
+                        cell_element
                             .px(px(4.))
                             .py(px(2.))
                             .when(column > 0, |this| this.border_l_1().border_color(border))
                             .child(
                                 self.text(format!("{key}.{row_index}.{column}"), &cell)
-                                    .no_wrap()
                                     .when(is_header, |this| this.weight(FontWeight::SEMIBOLD)),
                             )
                     }))
@@ -647,26 +662,59 @@ impl Renderer<'_> {
     }
 }
 
-/// Unwrapped width of the widest line of `text` in the body font.
-fn text_width(text: &str, weight: FontWeight, size: f32, window: &mut Window) -> Pixels {
-    let mut font = window.text_style().font();
-    font.weight = weight;
-    text.split('\n')
-        .map(|line| {
-            let run = TextRun {
-                len: line.len(),
-                font: font.clone(),
-                color: Hsla::default(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            window
-                .text_system()
-                .shape_line(SharedString::from(line.to_string()), px(size), &[run], None)
-                .width
-        })
-        .fold(px(0.), Pixels::max)
+/// Width of the widest line, with inline code in the code font and bold
+/// spans bold, as `SelectableText` lays them out.
+fn text_width(
+    inline: &Inline,
+    weight: FontWeight,
+    size: f32,
+    code_font: &SharedString,
+    window: &mut Window,
+) -> Pixels {
+    let mut base = window.text_style().font();
+    base.weight = weight;
+    let font_at = |position: usize| {
+        let mut font = base.clone();
+        let span = inline
+            .spans
+            .iter()
+            .find(|(range, _)| range.contains(&position));
+        if let Some((_, style)) = span {
+            if style.code {
+                font.family = code_font.clone();
+            }
+            if style.bold {
+                font.weight = FontWeight::BOLD;
+            }
+        }
+        font
+    };
+    let mut widest = px(0.);
+    let mut line_start = 0;
+    for line in inline.text.split('\n') {
+        let mut runs: Vec<TextRun> = Vec::new();
+        for (offset, character) in line.char_indices() {
+            let font = font_at(line_start + offset);
+            match runs.last_mut() {
+                Some(run) if run.font == font => run.len += character.len_utf8(),
+                _ => runs.push(TextRun {
+                    len: character.len_utf8(),
+                    font,
+                    color: Hsla::default(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }),
+            }
+        }
+        let width = window
+            .text_system()
+            .shape_line(SharedString::from(line.to_string()), px(size), &runs, None)
+            .width;
+        widest = widest.max(width);
+        line_start += line.len() + 1;
+    }
+    widest
 }
 
 #[cfg(test)]

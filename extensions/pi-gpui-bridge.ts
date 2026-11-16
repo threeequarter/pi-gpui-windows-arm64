@@ -12,8 +12,24 @@
  *    prompt cache lifetime, whether the provider bills a subscription, and
  *    plan limits from provider response headers. They are published as JSON
  *    through `setStatus("pi-gpui:usage", ...)`, which RPC forwards.
+ * 3. Component widgets: RPC forwards `setWidget` only for string arrays and
+ *    drops component factories. The bridge hosts those components itself,
+ *    renders them to ANSI-styled lines and forwards the lines.
  */
 const STATUS_KEY = "pi-gpui:usage";
+const WIDGET_COLUMNS = 160;
+const WIDGET_ROWS = 50;
+const WIDGET_RENDER_DELAY_MS = 50;
+// chalk is colorless on RPC's piped stdout, so the theme's text styles emit SGR directly.
+const SGR_STYLES: Record<string, readonly [number, number]> = {
+	bold: [1, 22],
+	italic: [3, 23],
+	underline: [4, 24],
+	inverse: [7, 27],
+	strikethrough: [9, 29],
+};
+
+const hostedUIs = new WeakSet<object>();
 
 type PlanLimit = { windowMinutes: number; usedPercent: number; resetsAt?: number };
 
@@ -63,7 +79,10 @@ export default function (pi: any) {
 		} catch {}
 	};
 
-	pi.on("session_start", (_event: unknown, ctx: any) => publish(ctx));
+	pi.on("session_start", (_event: unknown, ctx: any) => {
+		if (ctx.hasUI) hostComponentWidgets(ctx.ui);
+		publish(ctx);
+	});
 	pi.on("model_select", (_event: unknown, ctx: any) => publish(ctx));
 	pi.on("agent_settled", (_event: unknown, ctx: any) => publish(ctx));
 	pi.on("after_provider_response", (event: any, ctx: any) => {
@@ -73,6 +92,79 @@ export default function (pi: any) {
 		if (parsed.length === 0) return;
 		limits = { provider, limits: parsed };
 		publish(ctx);
+	});
+}
+
+/**
+ * Replaces `setWidget` on the session's UI context, which every extension
+ * shares, so component factories render here instead of being dropped.
+ * pi loads `--extension` files first, so this runs before other extensions'
+ * `session_start` handlers.
+ */
+function hostComponentWidgets(ui: any) {
+	if (hostedUIs.has(ui)) return;
+	hostedUIs.add(ui);
+	const forward = ui.setWidget;
+	const theme = styledTheme(ui.theme);
+	ui.theme = theme;
+	const hosts = new Map<string, { dispose: () => void }>();
+	ui.setWidget = (key: string, content: unknown, options?: { placement?: string }) => {
+		hosts.get(key)?.dispose();
+		hosts.delete(key);
+		if (typeof content !== "function") {
+			forward(key, content, options);
+			return;
+		}
+		try {
+			hosts.set(key, hostWidget(content, theme, (lines) => forward(key, lines, options)));
+		} catch (error) {
+			console.error(`pi-gpui: widget ${key} failed to start: ${error}`);
+			forward(key, undefined, options);
+		}
+	};
+}
+
+function hostWidget(factory: (tui: unknown, theme: unknown) => any, theme: unknown, publish: (lines: string[]) => void) {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let disposed = false;
+	let published = "";
+	const render = () => {
+		timer = undefined;
+		if (disposed) return;
+		let lines: string[] = [];
+		try {
+			lines = component.render(WIDGET_COLUMNS);
+		} catch (error) {
+			console.error(`pi-gpui: widget render failed: ${error}`);
+		}
+		const serialized = JSON.stringify(lines);
+		if (serialized === published) return;
+		published = serialized;
+		publish(lines);
+	};
+	const requestRender = () => {
+		if (!disposed && !timer) timer = setTimeout(render, WIDGET_RENDER_DELAY_MS);
+	};
+	const tui = { requestRender, terminal: { columns: WIDGET_COLUMNS, rows: WIDGET_ROWS } };
+	const component = factory(tui, theme);
+	requestRender();
+	return {
+		dispose: () => {
+			disposed = true;
+			clearTimeout(timer);
+			component.dispose?.();
+		},
+	};
+}
+
+function styledTheme(theme: any) {
+	return new Proxy(theme, {
+		get(target, property) {
+			const codes = typeof property === "string" ? SGR_STYLES[property] : undefined;
+			if (codes) return (text: string) => `\x1b[${codes[0]}m${text}\x1b[${codes[1]}m`;
+			const value = Reflect.get(target, property);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
 	});
 }
 

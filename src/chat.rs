@@ -1,5 +1,6 @@
 //! One pi session: transcript, composer and its own `pi --mode rpc` process.
 
+mod ansi;
 mod dialog;
 mod log_viewer;
 mod overlays;
@@ -9,6 +10,7 @@ mod remote;
 mod slash;
 mod tree;
 mod usage;
+mod widgets;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -82,7 +84,8 @@ const PICKER_REOPEN_GUARD: Duration = Duration::from_millis(250);
 /// the foreground thread long enough to delay input.
 const MAX_RECORDS_PER_UPDATE: usize = 256;
 const LIST_OVERDRAW: f32 = 600.;
-const CONTENT_MAX_WIDTH: f32 = 820.;
+const CONTENT_MAX_WIDTH: f32 = 1100.;
+const MESSAGE_HEADLINE_CHARS: usize = 160;
 /// Horizontal row padding; the fork button sits in the left one.
 const ROW_GUTTER: f32 = 28.;
 const ROW_GROUP: &str = "chat-row";
@@ -331,6 +334,13 @@ enum Row {
         tone: Tone,
         text: String,
     },
+    /// A displayed extension message (`sendMessage` with `display: true`),
+    /// such as a worker's result.
+    Message {
+        kind: String,
+        text: String,
+        expanded: bool,
+    },
     /// A compaction (manual or automatic) or a branch summary.
     Summary {
         kind: SummaryKind,
@@ -402,6 +412,7 @@ pub struct ChatView {
     navigating: Option<(String, Option<String>)>,
     usage_stats: Option<usage::Stats>,
     usage_extra: Option<usage::Extra>,
+    widgets: widgets::Widgets,
     /// Free tokens below which pi compacts, `None` when auto-compaction is off.
     compaction_reserve: Option<u64>,
     usage_open: bool,
@@ -530,6 +541,7 @@ impl ChatView {
             navigating: None,
             usage_stats: None,
             usage_extra: None,
+            widgets: widgets::Widgets::default(),
             compaction_reserve: None,
             usage_open: false,
             usage_closed_at: None,
@@ -679,6 +691,7 @@ impl ChatView {
         // Replacing the task drops the previous pump before a new process starts.
         self._events_task = Task::ready(());
         self.running = false;
+        self.widgets.clear();
         let extensions = self.plugins.read(cx).pi_extensions().to_vec();
         let spawned = pi::spawn_pi(
             &self.installation,
@@ -908,6 +921,9 @@ impl ChatView {
             }
             "message_end" if record["message"]["role"] == "assistant" => {
                 self.apply_assistant_end(&record["message"], changed);
+            }
+            "message_end" if is_displayed_custom(&record["message"]) => {
+                self.rows.push(message_row(&record["message"]));
             }
             "tool_execution_start" => {
                 let name = record["toolName"].as_str().unwrap_or("tool").to_string();
@@ -1495,6 +1511,14 @@ impl ChatView {
         Some(index)
     }
 
+    fn toggle_message(&mut self, row: usize, cx: &mut Context<Self>) {
+        if let Some(Row::Message { expanded, .. }) = self.rows.get_mut(row) {
+            *expanded = !*expanded;
+            self.list_state.splice(row..row + 1, 1);
+            cx.notify();
+        }
+    }
+
     fn toggle_summary(&mut self, row: usize, cx: &mut Context<Self>) {
         if let Some(Row::Summary { expanded, .. }) = self.rows.get_mut(row) {
             *expanded = !*expanded;
@@ -2067,7 +2091,8 @@ impl ChatView {
                     self.usage_extra = Some(extra);
                 }
             }
-            // Other statuses, setWidget, setTitle: no UI for them yet.
+            "setWidget" => self.widgets.apply(record),
+            // Other statuses, setTitle: no UI for them yet.
             _ => {}
         }
     }
@@ -2362,16 +2387,6 @@ impl ChatView {
                     (false, _, Some(ms)) => Some(format_duration(ms)),
                     _ => None,
                 };
-                let log_button =
-                    (!log.text.is_empty() || log.file.is_some()).then(|| {
-                        IconButton::new(("tool-log", index), IconName::Terminal)
-                            .size(ButtonSize::Compact)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text(if running { "Live log" } else { "Full log" }))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_log(index, window, cx)
-                            }))
-                    });
                 let status_icon = match status {
                     ToolStatus::Running => Spinner::new()
                         .size(IconSize::XSmall)
@@ -2425,7 +2440,6 @@ impl ChatView {
                                         .color(Color::Placeholder),
                                 )
                             })
-                            .children(log_button)
                             .when(has_details, |this| {
                                 this.child(disclosure_button(
                                     ("tool-disclosure", index),
@@ -2567,6 +2581,11 @@ impl ChatView {
                     .into_any_element()
             }
             Row::Dialog(dialog) => self.render_dialog(index, dialog, cx),
+            Row::Message {
+                kind,
+                text,
+                expanded,
+            } => self.render_message(index, kind, text, *expanded, window, cx),
             Row::Notice { tone, text } => {
                 let (icon, color) = match tone {
                     Tone::Info => (IconName::Info, Color::Muted),
@@ -2596,7 +2615,7 @@ impl ChatView {
 
         let forkable = !matches!(
             row,
-            Row::Notice { .. } | Row::Summary { .. } | Row::Dialog(_)
+            Row::Notice { .. } | Row::Message { .. } | Row::Summary { .. } | Row::Dialog(_)
         ) && self.can_fork();
         let sent_at = match row {
             Row::User { at, .. } | Row::Assistant { at, .. } => *at,
@@ -2667,6 +2686,78 @@ impl ChatView {
                         )
                     }),
             )
+            .into_any_element()
+    }
+
+    /// A tool-style card: the message's first line, the full text on demand.
+    fn render_message(
+        &self,
+        index: usize,
+        kind: &str,
+        text: &str,
+        expanded: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let headline = sessions::one_line(text, MESSAGE_HEADLINE_CHARS);
+        let has_more = text.trim() != headline;
+        let open = expanded && has_more;
+        let body = open.then(|| {
+            let nodes = markdown::parse(text);
+            div()
+                .px(px(10.))
+                .py(px(8.))
+                .border_t_1()
+                .border_color(colors.border_variant)
+                .child(markdown::render(
+                    &format!("{index}:message"),
+                    &nodes,
+                    &self.selection,
+                    window,
+                    cx,
+                ))
+        });
+        v_flex()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(colors.border_variant)
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .gap(px(6.))
+                    .h(px(28.))
+                    .pl(px(8.))
+                    .pr(px(4.))
+                    .bg(colors.panel_background)
+                    .child(
+                        Icon::new(IconName::Message)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(kind.to_string())
+                            .size(LabelSize::Small)
+                            .weight(FontWeight::MEDIUM),
+                    )
+                    .child(
+                        div().flex_1().min_w(px(0.)).child(
+                            Label::new(headline)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
+                    )
+                    .when(has_more, |this| {
+                        this.child(disclosure_button(
+                            ("message-disclosure", index),
+                            open,
+                            "message",
+                            cx.listener(move |this, _, _, cx| this.toggle_message(index, cx)),
+                        ))
+                    }),
+            )
+            .children(body)
             .into_any_element()
     }
 
@@ -3076,6 +3167,7 @@ impl ChatView {
                     .w_full()
                     .max_w(px(CONTENT_MAX_WIDTH))
                     .gap(px(6.))
+                    .children(self.widgets.render(widgets::Placement::AboveComposer, cx))
                     .child(activity_line)
                     .child(
                         v_flex()
@@ -3141,7 +3233,8 @@ impl ChatView {
                                     )
                                     .child(actions),
                             ),
-                    ),
+                    )
+                    .children(self.widgets.render(widgets::Placement::BelowComposer, cx)),
             )
     }
 }
@@ -3463,10 +3556,7 @@ fn history_rows(messages: &[Value]) -> Vec<Row> {
                 tokens_after: None,
                 expanded: false,
             }),
-            "custom" if message["display"].as_bool() == Some(true) => rows.push(Row::Notice {
-                tone: Tone::Info,
-                text: sessions::message_text(message),
-            }),
+            "custom" if is_displayed_custom(message) => rows.push(message_row(message)),
             _ => {}
         }
     }
@@ -3479,6 +3569,21 @@ fn history_rows(messages: &[Value]) -> Vec<Row> {
         }
     }
     rows
+}
+
+fn is_displayed_custom(message: &Value) -> bool {
+    message["role"] == "custom" && message["display"].as_bool() == Some(true)
+}
+
+fn message_row(message: &Value) -> Row {
+    Row::Message {
+        kind: message["customType"]
+            .as_str()
+            .unwrap_or("message")
+            .to_string(),
+        text: sessions::message_text(message),
+        expanded: false,
+    }
 }
 
 fn tool_icon(name: &str) -> IconName {
