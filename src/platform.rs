@@ -66,7 +66,60 @@ pub fn start_window_drag(window: &Window) {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// On Windows, gpui 0.2.2's `start_window_move` is a no-op, and the native
+/// caption drag never starts on its own: the focusable root consumes the
+/// caption mouse down (`prevent_default`), so `DefWindowProc` never sees the
+/// `HTCAPTION` press. Hand the drag to the system move loop ourselves.
+///
+/// The message must be posted, not sent: the move loop is modal and keeps
+/// dispatching `WM_TIMER`/`WM_PAINT`, which gpui answers by re-entering the
+/// app. Running it from inside this listener, while gpui holds the app and the
+/// window's input callback, panics across the window procedure and aborts.
+#[cfg(windows)]
+pub fn start_window_drag(window: &Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetCursorPos(point: *mut CursorPoint) -> i32;
+        fn ReleaseCapture() -> i32;
+        fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+    }
+    #[repr(C)]
+    struct CursorPoint {
+        x: i32,
+        y: i32,
+    }
+    const WM_SYSCOMMAND: u32 = 0x0112;
+    const SC_MOVE: usize = 0xF010;
+    const HTCAPTION: usize = 2;
+
+    // `Window` also has an inherent `window_handle()`; ask the raw-window-handle trait.
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return;
+    };
+    let mut point = CursorPoint { x: 0, y: 0 };
+    // SAFETY: `hwnd` is gpui's live window handle. GetCursorPos writes to a
+    // valid local. SC_MOVE | HTCAPTION is what DefWindowProc itself sends for a
+    // caption drag; gpui passes WM_SYSCOMMAND through to DefWindowProc once the
+    // main loop dispatches it, and the move loop runs until the button is up.
+    unsafe {
+        GetCursorPos(&mut point);
+        ReleaseCapture();
+        let position = (point.x as u16 as isize) | ((point.y as u16 as isize) << 16);
+        PostMessageW(
+            win32.hwnd.get(),
+            WM_SYSCOMMAND,
+            SC_MOVE | HTCAPTION,
+            position,
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn start_window_drag(window: &Window) {
     window.start_window_move();
 }
