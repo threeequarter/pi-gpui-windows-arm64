@@ -208,7 +208,7 @@ impl EventEmitter<DiffPanelEvent> for DiffPanel {}
 
 impl DiffPanel {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let commit_input = cx.new(|cx| TextInput::new("Commit message", cx).compact());
+        let commit_input = cx.new(|cx| TextInput::new(commit::COMMIT_PLACEHOLDER, cx).compact());
         // The Commit button depends on whether the message is empty.
         let subscriptions = vec![cx.observe(&commit_input, |_, _, cx| cx.notify())];
         Self {
@@ -504,7 +504,7 @@ impl DiffPanel {
             .unwrap_or_else(|| "detached HEAD".to_string());
         let distance = status.upstream.as_ref().map(|upstream| {
             (
-                format!("↑{} ↓{}", status.ahead, status.behind),
+                [("↑", status.ahead), ("↓", status.behind)],
                 format!(
                     "{} ahead of and {} behind {upstream}",
                     status.ahead, status.behind
@@ -543,11 +543,22 @@ impl DiffPanel {
                                 .id("branch-distance")
                                 .flex_none()
                                 .tooltip(Tooltip::text(tooltip))
-                                .child(
-                                    Label::new(distance)
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                ),
+                                .flex()
+                                .gap(px(6.))
+                                .children(distance.map(|(arrow, count)| {
+                                    h_flex()
+                                        .gap(px(2.))
+                                        .child(
+                                            Label::new(arrow)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(
+                                            Label::new(count.to_string())
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                })),
                         )
                     }),
             )
@@ -608,15 +619,15 @@ impl DiffPanel {
             .border_b_1()
             .border_color(colors.border_variant)
             .child(
-                div().flex_1().min_w(px(0.)).child(
-                    Label::new(
-                        self.summary()
-                            .unwrap_or_else(|| "Working tree against HEAD".to_string()),
-                    )
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
-                    .truncate(),
-                ),
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .children(self.summary().map(|summary| {
+                        Label::new(summary)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate()
+                    })),
             )
             .when_some(staging, |this, (can_stage, can_unstage)| {
                 this.child(
