@@ -91,6 +91,25 @@ In the tree: `↑↓` move, `←→` jump between branches, `↩` go there, `⌥
 
 On Linux `⌘` is `Ctrl` and `⌥` is `Alt`, with one exception: compact is `Ctrl+Alt+C`, because `Ctrl+Shift+C` copies the selection as it does in a terminal.
 
+## Git panel
+
+The Changes panel is a small git client for the active session's project.
+
+- **Staging.** Each file has a checkbox showing the git index: empty (unstaged or untracked), a dash (partly staged), checked (staged). Clicking stages the file fully, or unstages it when it is checked. Stage All / Unstage All work on everything. Clicking the row still opens the diff, which always shows the working tree against HEAD.
+- **Commit.** What the Commit button does depends on the Amend checkbox and on whether anything is staged:
+
+  | Amend | Staged | Button | Commits |
+  |---|---|---|---|
+  | off | yes | Commit | the staged changes |
+  | off | no | Commit Tracked | every change to tracked files (`git commit -a`) |
+  | on | yes | Amend | the last commit plus the staged changes |
+  | on | no | Amend | the last commit with the new message only |
+
+  Untracked files are never committed unless you stage them. An amend with an empty message keeps the last commit's message. Git never opens an editor, and a conflicted index blocks the commit.
+- **Keys.** In the message box `↩` is a new line and `⌘↩` commits.
+- **Generate** (the sparkle button) asks your installed pi to write the message from exactly what Commit would take, in one-shot print mode with no session file and no tools. The prompt is `commit_message_instructions` and the model `commit_message_model` in `settings.json` (an empty model means pi's default). The button is off when pi is missing or too old for print mode.
+- **Branch bar.** Branch name, commits ahead/behind the upstream, and Fetch, Pull and Push. Pull is `git pull --ff-only`: a diverged branch fails with git's message instead of creating a merge. Network calls never wait for a typed password: terminal and askpass prompts are off, so missing credentials fail at once with git's error, while a credential manager or ssh-agent keeps working. Errors show in a strip above the message box.
+
 ## Settings
 
 `~/Library/Application Support/pi-gpui/settings.json` (on Linux `~/.config/pi-gpui/settings.json`) is the source of truth. The app applies it as soon as it is saved, so you or a pi agent can edit it directly; the Settings page (`⌘,`) writes the same file and keeps its comments.

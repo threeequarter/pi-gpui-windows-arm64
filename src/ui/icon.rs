@@ -42,6 +42,7 @@ macro_rules! icons {
 }
 
 icons! {
+    ArrowDown => "arrow_down",
     ArrowUp => "arrow_up",
     Archive => "archive",
     Check => "check",

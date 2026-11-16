@@ -7,6 +7,7 @@
 
 mod animation;
 mod button;
+mod checkbox;
 mod icon;
 mod label;
 mod list_item;
@@ -16,6 +17,7 @@ pub mod user_theme;
 
 pub use animation::AnimationTicker;
 pub use button::{Button, ButtonSize, ButtonStyle, IconButton, TintColor};
+pub use checkbox::{Checkbox, ToggleState};
 pub use icon::{Assets, Icon, IconName, IconSize, Spinner};
 pub use label::{Label, LabelSize, LoadingLabel};
 pub use list_item::{Indicator, KeyHint, ListItem, Tooltip};
@@ -35,9 +37,9 @@ pub fn v_flex() -> Div {
 
 pub mod prelude {
     pub use super::{
-        ActiveTheme as _, Button, ButtonSize, ButtonStyle, Color, Icon, IconButton, IconName,
-        IconSize, Indicator, KeyHint, Label, LabelSize, ListItem, LoadingLabel, Spinner, TintColor,
-        Tooltip, h_flex, v_flex,
+        ActiveTheme as _, Button, ButtonSize, ButtonStyle, Checkbox, Color, Icon, IconButton,
+        IconName, IconSize, Indicator, KeyHint, Label, LabelSize, ListItem, LoadingLabel, Spinner,
+        TintColor, ToggleState, Tooltip, h_flex, v_flex,
     };
     pub use gpui::prelude::*;
 }

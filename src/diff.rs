@@ -1,29 +1,52 @@
 //! The Changes panel: `git diff` of the active session's project against
-//! HEAD, untracked files included. Read-only; git is run directly with
-//! separate arguments, never through a shell.
+//! HEAD, untracked files included, with the git client around it: staging
+//! from the index, commit and amend, fetch/pull/push and a commit
+//! message written by pi. Git is run directly with separate arguments, never
+//! through a shell; every git and pi call runs in the background.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use gpui::{
-    AnyElement, Context, ElementId, FontWeight, HighlightStyle, Hsla, StyledText, Task, Window,
-    div, px,
+    AnyElement, App, Context, ElementId, Entity, EventEmitter, FontWeight, HighlightStyle, Hsla,
+    KeyBinding, StyledText, Subscription, Task, Window, actions, div, px,
 };
 
-use crate::platform::ConsoleWindow as _;
+use crate::git::{self, GitError, RepoStatus, StatusEntry, git};
+use crate::pi::{self, Installation};
 use crate::sessions;
 use crate::settings::Settings;
+use crate::text_input::TextInput;
 use crate::ui::prelude::*;
 use crate::ui::{AnimationTicker, SyntaxColors};
 
+mod commit;
+
+actions!(diff, [CommitNow]);
+
+/// The commit message box. Enter stays a newline there, so committing
+/// from the keyboard is ⌘Enter.
+const COMMIT_CONTEXT: &str = "GitCommit";
 /// Lines drawn per file; the rest is summarized. Keeps a huge generated
 /// file from building thousands of elements.
 const MAX_LINES_PER_FILE: usize = 1_500;
 /// Untracked files larger than this are listed without content.
 const MAX_UNTRACKED_BYTES: u64 = 512 * 1024;
+
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new(
+        &crate::keys::binding("cmd-enter"),
+        CommitNow,
+        Some(COMMIT_CONTEXT),
+    )]);
+}
+
+pub enum DiffPanelEvent {
+    /// A git action ran: the index, HEAD or the remote refs may have changed.
+    RepositoryChanged,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileStatus {
@@ -101,7 +124,58 @@ enum State {
     Loading,
     NotARepository,
     Failed(String),
-    Loaded(Changes),
+    Loaded(Changes, RepoStatus),
+}
+
+/// The git or pi work in flight. One at a time: two git processes would
+/// fight over `index.lock`, and a second click must not commit twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitAction {
+    ToggleFile,
+    StageAll,
+    UnstageAll,
+    Commit,
+    Generate,
+    Fetch,
+    Pull,
+    Push,
+}
+
+impl GitAction {
+    /// Shown while the action runs, e.g. as the reason other buttons wait.
+    fn progress(self) -> &'static str {
+        match self {
+            GitAction::ToggleFile | GitAction::StageAll => "Staging…",
+            GitAction::UnstageAll => "Unstaging…",
+            GitAction::Commit => "Committing…",
+            GitAction::Generate => "pi is writing the commit message…",
+            GitAction::Fetch => "Fetching…",
+            GitAction::Pull => "Pulling…",
+            GitAction::Push => "Pushing…",
+        }
+    }
+
+    fn failure(self) -> &'static str {
+        match self {
+            GitAction::ToggleFile => "Staging failed",
+            GitAction::StageAll => "Stage All failed",
+            GitAction::UnstageAll => "Unstage All failed",
+            GitAction::Commit => "Commit failed",
+            GitAction::Generate => "Generating the commit message failed",
+            GitAction::Fetch => "Fetch failed",
+            GitAction::Pull => "Pull failed",
+            GitAction::Push => "Push failed",
+        }
+    }
+}
+
+/// The checkbox of a file: the index holds all, part or none of its changes.
+fn stage_state(entry: &StatusEntry) -> ToggleState {
+    match (entry.staged, entry.unstaged) {
+        (true, false) => ToggleState::Selected,
+        (true, true) => ToggleState::Indeterminate,
+        _ => ToggleState::Unselected,
+    }
 }
 
 pub struct DiffPanel {
@@ -109,19 +183,51 @@ pub struct DiffPanel {
     state: State,
     /// A refresh is in flight while the previous result stays on screen.
     refreshing: bool,
+    /// A refresh was asked for while one was in flight; it runs when that
+    /// one lands, so the state after a git action is never skipped.
+    refresh_pending: bool,
     expanded: HashSet<String>,
+    commit_input: Entity<TextInput>,
+    /// Unsent commit messages of the other projects, by workspace.
+    drafts: HashMap<PathBuf, String>,
+    amend: bool,
+    busy: Option<GitAction>,
+    action_error: Option<String>,
+    installation: Option<Installation>,
+    /// Whether this pi has the print mode Generate needs; `None` while the
+    /// probe runs.
+    print_mode: Option<bool>,
     _task: Task<()>,
+    _action_task: Task<()>,
+    _probe_task: Task<()>,
+    _subscriptions: Vec<Subscription>,
     animation: AnimationTicker,
 }
 
+impl EventEmitter<DiffPanelEvent> for DiffPanel {}
+
 impl DiffPanel {
-    pub fn new() -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let commit_input = cx.new(|cx| TextInput::new("Commit message", cx).compact());
+        // The Commit button depends on whether the message is empty.
+        let subscriptions = vec![cx.observe(&commit_input, |_, _, cx| cx.notify())];
         Self {
             workspace: None,
             state: State::NoProject,
             refreshing: false,
+            refresh_pending: false,
             expanded: HashSet::new(),
+            commit_input,
+            drafts: HashMap::new(),
+            amend: false,
+            busy: None,
+            action_error: None,
+            installation: None,
+            print_mode: None,
             _task: Task::ready(()),
+            _action_task: Task::ready(()),
+            _probe_task: Task::ready(()),
+            _subscriptions: subscriptions,
             animation: AnimationTicker::default(),
         }
     }
@@ -131,7 +237,22 @@ impl DiffPanel {
         if self.workspace == workspace {
             return false;
         }
+        if let Some(previous) = self.workspace.take() {
+            let draft = self.commit_input.read(cx).text().to_string();
+            if draft.trim().is_empty() {
+                self.drafts.remove(&previous);
+            } else {
+                self.drafts.insert(previous, draft);
+            }
+        }
         self.workspace = workspace;
+        let draft = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| self.drafts.remove(workspace))
+            .unwrap_or_default();
+        self.commit_input
+            .update(cx, |input, cx| input.set_text(draft, cx));
         self.expanded.clear();
         self.state = if self.workspace.is_some() {
             State::Loading
@@ -140,6 +261,12 @@ impl DiffPanel {
         };
         self._task = Task::ready(());
         self.refreshing = false;
+        self.refresh_pending = false;
+        // A running action belongs to the old project; its result is dropped.
+        self._action_task = Task::ready(());
+        self.busy = None;
+        self.action_error = None;
+        self.amend = false;
         cx.notify();
         true
     }
@@ -148,27 +275,72 @@ impl DiffPanel {
         self.workspace.as_deref()
     }
 
+    /// The pi that writes commit messages. A new one is probed once for
+    /// print mode in the background; the answer is kept until it changes.
+    pub fn set_installation(&mut self, installation: Option<Installation>, cx: &mut Context<Self>) {
+        let unchanged = match (&self.installation, &installation) {
+            (Some(current), Some(new)) => {
+                current.executable == new.executable && current.version == new.version
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+        self.installation = installation.clone();
+        self.print_mode = None;
+        self._probe_task = match installation {
+            Some(installation) => {
+                let probe = cx.background_spawn(async move {
+                    let supported = pi::supports_print_mode(&installation);
+                    if !supported {
+                        eprintln!(
+                            "pi-gpui: pi {} has no print mode; commit messages cannot be generated",
+                            installation.version
+                        );
+                    }
+                    supported
+                });
+                cx.spawn(async move |this, cx| {
+                    let supported = probe.await;
+                    this.update(cx, |this, cx| {
+                        this.print_mode = Some(supported);
+                        cx.notify();
+                    })
+                    .ok();
+                })
+            }
+            None => Task::ready(()),
+        };
+        cx.notify();
+    }
+
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.clone() else {
             return;
         };
         if self.refreshing {
+            self.refresh_pending = true;
             return;
         }
         self.refreshing = true;
-        let load = cx.background_spawn(async move { load_changes(&workspace) });
+        let load = cx.background_spawn(async move { load_repository(&workspace) });
         self._task = cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
                 this.refreshing = false;
                 this.state = match result {
-                    Ok(Some(changes)) => State::Loaded(changes),
+                    Ok(Some((changes, status))) => State::Loaded(changes, status),
                     Ok(None) => State::NotARepository,
                     Err(error) => {
                         eprintln!("pi-gpui: git diff failed: {error}");
                         State::Failed(error)
                     }
                 };
+                if std::mem::take(&mut this.refresh_pending) {
+                    this.refresh(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -178,7 +350,7 @@ impl DiffPanel {
 
     /// "3 files  +12 −4" for the panel header.
     pub fn summary(&self) -> Option<String> {
-        let State::Loaded(changes) = &self.state else {
+        let State::Loaded(changes, _) = &self.state else {
             return None;
         };
         if changes.files.is_empty() {
@@ -193,11 +365,118 @@ impl DiffPanel {
         Some(format!("{files}  +{additions} −{deletions}"))
     }
 
+    fn status(&self) -> Option<&RepoStatus> {
+        match &self.state {
+            State::Loaded(_, status) => Some(status),
+            _ => None,
+        }
+    }
+
     fn toggle_file(&mut self, path: &str, cx: &mut Context<Self>) {
         if !self.expanded.remove(path) {
             self.expanded.insert(path.to_string());
         }
         cx.notify();
+    }
+
+    /// Runs `job` against the repository root in the background, then shows
+    /// its error, refreshes and tells the hub the repository changed.
+    fn run_git(
+        &mut self,
+        action: GitAction,
+        job: impl FnOnce(&Path) -> Result<(), String> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy.is_some() {
+            return;
+        }
+        let (Some(workspace), State::Loaded(changes, _)) = (self.workspace.clone(), &self.state)
+        else {
+            return;
+        };
+        let root = changes.root.clone();
+        self.busy = Some(action);
+        self.action_error = None;
+        let work = cx.background_spawn(async move { job(&root) });
+        self._action_task = cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                if this.workspace.as_ref() != Some(&workspace) {
+                    return;
+                }
+                this.busy = None;
+                match result {
+                    Ok(()) if action == GitAction::Commit => {
+                        this.commit_input.update(cx, |input, cx| input.clear(cx));
+                        this.amend = false;
+                    }
+                    Ok(()) => {}
+                    Err(error) => this.show_error(action, error),
+                }
+                this.refresh(cx);
+                cx.emit(DiffPanelEvent::RepositoryChanged);
+                cx.notify();
+            })
+            .ok();
+        });
+        cx.notify();
+    }
+
+    fn show_error(&mut self, action: GitAction, error: String) {
+        let message = format!("{}: {error}", action.failure());
+        eprintln!("pi-gpui: {message}");
+        self.action_error = Some(message);
+    }
+
+    /// Unstaged or partly staged → stage it fully; staged → unstage it.
+    fn toggle_staged(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Some(entry) = self
+            .status()
+            .and_then(|status| status.entries.iter().find(|entry| entry.path == path))
+            .cloned()
+        else {
+            return;
+        };
+        let stage = stage_state(&entry) != ToggleState::Selected;
+        self.run_git(
+            GitAction::ToggleFile,
+            move |root| {
+                let entries = [&entry];
+                let result = if stage {
+                    git::stage(root, &entries)
+                } else {
+                    git::unstage(root, &entries)
+                };
+                result.map_err(GitError::message)
+            },
+            cx,
+        );
+    }
+
+    fn stage_all(&mut self, cx: &mut Context<Self>) {
+        self.run_git(
+            GitAction::StageAll,
+            |root| git::stage_all(root).map_err(GitError::message),
+            cx,
+        );
+    }
+
+    fn unstage_all(&mut self, cx: &mut Context<Self>) {
+        self.run_git(
+            GitAction::UnstageAll,
+            |root| git::unstage_all(root).map_err(GitError::message),
+            cx,
+        );
+    }
+
+    fn run_network(&mut self, action: GitAction, cx: &mut Context<Self>) {
+        let operation: fn(&Path) -> Result<String, String> = match action {
+            GitAction::Fetch => git::fetch,
+            GitAction::Pull => git::pull,
+            GitAction::Push => git::push,
+            _ => return,
+        };
+        self.run_git(action, move |root| operation(root).map(|_| ()), cx);
     }
 
     fn render_message(&self, message: String) -> AnyElement {
@@ -216,7 +495,192 @@ impl DiffPanel {
             .into_any_element()
     }
 
-    fn render_file(&self, file: &FileDiff, root: &Path, cx: &mut Context<Self>) -> AnyElement {
+    /// Branch, distance to the upstream, and the network actions.
+    fn render_branch_bar(&self, status: &RepoStatus, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let branch = status
+            .branch
+            .clone()
+            .unwrap_or_else(|| "detached HEAD".to_string());
+        let distance = status.upstream.as_ref().map(|upstream| {
+            (
+                format!("↑{} ↓{}", status.ahead, status.behind),
+                format!(
+                    "{} ahead of and {} behind {upstream}",
+                    status.ahead, status.behind
+                ),
+            )
+        });
+        h_flex()
+            .flex_none()
+            .h(px(30.))
+            .pl(px(12.))
+            .pr(px(6.))
+            .gap(px(6.))
+            .border_b_1()
+            .border_color(colors.border_variant)
+            .child(
+                Icon::new(IconName::Fork)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .gap(px(6.))
+                    .child(
+                        div().min_w(px(0.)).child(
+                            Label::new(branch)
+                                .size(LabelSize::XSmall)
+                                .weight(FontWeight::MEDIUM)
+                                .truncate(),
+                        ),
+                    )
+                    .when_some(distance, |this, (distance, tooltip)| {
+                        this.child(
+                            div()
+                                .id("branch-distance")
+                                .flex_none()
+                                .tooltip(Tooltip::text(tooltip))
+                                .child(
+                                    Label::new(distance)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    }),
+            )
+            .child(self.render_network_button(
+                "git-fetch",
+                IconName::Refresh,
+                GitAction::Fetch,
+                "Fetch",
+                cx,
+            ))
+            .child(self.render_network_button(
+                "git-pull",
+                IconName::ArrowDown,
+                GitAction::Pull,
+                "Pull (fast-forward only)",
+                cx,
+            ))
+            .child(self.render_network_button(
+                "git-push",
+                IconName::ArrowUp,
+                GitAction::Push,
+                "Push",
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn render_network_button(
+        &self,
+        id: &'static str,
+        icon: IconName,
+        action: GitAction,
+        tooltip: &'static str,
+        cx: &Context<Self>,
+    ) -> IconButton {
+        IconButton::new(id, icon)
+            .size(ButtonSize::Compact)
+            .icon_size(IconSize::XSmall)
+            .loading(self.busy == Some(action))
+            .disabled(self.busy.is_some())
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(cx.listener(move |this, _, _, cx| this.run_network(action, cx)))
+    }
+
+    /// The diff summary, the bulk staging buttons and refresh.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let staging = self.status().map(|status| {
+            let can_stage = status.entries.iter().any(|entry| entry.unstaged);
+            (can_stage, status.has_staged())
+        });
+        h_flex()
+            .flex_none()
+            .h(px(30.))
+            .pl(px(12.))
+            .pr(px(6.))
+            .gap(px(6.))
+            .border_b_1()
+            .border_color(colors.border_variant)
+            .child(
+                div().flex_1().min_w(px(0.)).child(
+                    Label::new(
+                        self.summary()
+                            .unwrap_or_else(|| "Working tree against HEAD".to_string()),
+                    )
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .truncate(),
+                ),
+            )
+            .when_some(staging, |this, (can_stage, can_unstage)| {
+                this.child(
+                    Button::new("stage-all", "Stage All")
+                        .size(ButtonSize::Compact)
+                        .loading(self.busy == Some(GitAction::StageAll))
+                        .disabled(self.busy.is_some() || !can_stage)
+                        .tooltip(Tooltip::text(
+                            "Stage every change, untracked files included",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| this.stage_all(cx))),
+                )
+                .child(
+                    Button::new("unstage-all", "Unstage All")
+                        .size(ButtonSize::Compact)
+                        .loading(self.busy == Some(GitAction::UnstageAll))
+                        .disabled(self.busy.is_some() || !can_unstage)
+                        .tooltip(Tooltip::text("Take everything out of the index"))
+                        .on_click(cx.listener(|this, _, _, cx| this.unstage_all(cx))),
+                )
+            })
+            .child(
+                IconButton::new("refresh-diff", IconName::Refresh)
+                    .size(ButtonSize::Compact)
+                    .icon_size(IconSize::XSmall)
+                    .loading(self.refreshing)
+                    .tooltip(Tooltip::text("Refresh"))
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+            )
+            .into_any_element()
+    }
+
+    fn render_stage_checkbox(
+        &self,
+        file: &FileDiff,
+        entry: Option<&StatusEntry>,
+        cx: &mut Context<Self>,
+    ) -> Checkbox {
+        let id = ElementId::Name(format!("stage:{}", file.path).into());
+        let Some(entry) = entry else {
+            // git status has not caught up with the diff yet.
+            return Checkbox::new(id, ToggleState::Unselected).disabled(true);
+        };
+        let state = stage_state(entry);
+        let tooltip = match state {
+            ToggleState::Selected => "Unstage",
+            ToggleState::Indeterminate if entry.conflicted => "Stage (marks the conflict resolved)",
+            ToggleState::Indeterminate => "Stage the rest of this file",
+            ToggleState::Unselected => "Stage",
+        };
+        let path = file.path.clone();
+        Checkbox::new(id, state)
+            .disabled(self.busy.is_some())
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_staged(&path, cx)))
+    }
+
+    fn render_file(
+        &self,
+        file: &FileDiff,
+        root: &Path,
+        entry: Option<&StatusEntry>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = cx.theme().colors.clone();
         let expanded = self.expanded.contains(&file.path);
         let (directory, name) = match file.path.rsplit_once('/') {
@@ -233,17 +697,20 @@ impl DiffPanel {
                 sessions::display_path(&full_path)
             ),
         };
+        let checkbox = self.render_stage_checkbox(file, entry, cx);
 
         let header = h_flex()
             .id(ElementId::Name(format!("diff-file:{}", file.path).into()))
             .h(px(28.))
-            .px(px(8.))
+            .pl(px(4.))
+            .pr(px(8.))
             .gap(px(6.))
             .rounded(px(5.))
             .cursor_pointer()
             .hover(|style| style.bg(colors.element_hover))
             .tooltip(Tooltip::text(tooltip))
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_file(&path, cx)))
+            .child(checkbox)
             .child(
                 Icon::new(if expanded {
                     IconName::ChevronDown
@@ -409,8 +876,8 @@ impl DiffPanel {
 impl Render for DiffPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let loading = matches!(self.state, State::Loading);
-        self.animation.set_active(loading || self.refreshing, cx);
-        let colors = cx.theme().colors.clone();
+        self.animation
+            .set_active(loading || self.refreshing || self.busy.is_some(), cx);
         let content = match &self.state {
             State::NoProject => {
                 self.render_message("Open a session to see its project's changes.".into())
@@ -426,15 +893,18 @@ impl Render for DiffPanel {
                 self.render_message("This project is not a git repository.".into())
             }
             State::Failed(error) => self.render_message(format!("git diff failed: {error}")),
-            State::Loaded(changes) if changes.files.is_empty() => {
+            State::Loaded(changes, _) if changes.files.is_empty() => {
                 self.render_message("No changes against HEAD.".into())
             }
-            State::Loaded(changes) => {
+            State::Loaded(changes, status) => {
                 let root = changes.root.clone();
                 let files: Vec<AnyElement> = changes
                     .files
                     .iter()
-                    .map(|file| self.render_file(file, &root, cx))
+                    .map(|file| {
+                        let entry = status.entries.iter().find(|entry| entry.path == file.path);
+                        self.render_file(file, &root, entry, cx)
+                    })
                     .collect();
                 div()
                     .id("diff-files")
@@ -447,37 +917,31 @@ impl Render for DiffPanel {
                     .into_any_element()
             }
         };
-        let toolbar = self.workspace.is_some().then(|| {
-            h_flex()
-                .flex_none()
-                .h(px(30.))
-                .pl(px(12.))
-                .pr(px(6.))
-                .gap(px(6.))
-                .border_b_1()
-                .border_color(colors.border_variant)
-                .child(
-                    div().flex_1().min_w(px(0.)).child(
-                        Label::new(
-                            self.summary()
-                                .unwrap_or_else(|| "Working tree against HEAD".to_string()),
-                        )
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .truncate(),
-                    ),
-                )
-                .child(
-                    IconButton::new("refresh-diff", IconName::Refresh)
-                        .size(ButtonSize::Compact)
-                        .icon_size(IconSize::XSmall)
-                        .loading(self.refreshing)
-                        .tooltip(Tooltip::text("Refresh"))
-                        .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                )
-        });
-        v_flex().size_full().children(toolbar).child(content)
+        let (branch_bar, footer) = match &self.state {
+            State::Loaded(_, status) => (
+                Some(self.render_branch_bar(status, cx)),
+                Some(self.render_commit_footer(status, cx)),
+            ),
+            _ => (None, None),
+        };
+        let toolbar = self.workspace.is_some().then(|| self.render_toolbar(cx));
+        v_flex()
+            .size_full()
+            .children(branch_bar)
+            .children(toolbar)
+            .child(content)
+            .children(footer)
     }
+}
+
+/// The diff and the status of the repository, read in one background job.
+/// `Ok(None)` when the folder is not inside a git work tree.
+fn load_repository(workspace: &Path) -> Result<Option<(Changes, RepoStatus)>, String> {
+    let Some(changes) = load_changes(workspace)? else {
+        return Ok(None);
+    };
+    let status = git::status(&changes.root).map_err(GitError::message)?;
+    Ok(Some((changes, status)))
 }
 
 /// `Ok(None)` when the folder is not inside a git work tree.
@@ -516,39 +980,6 @@ fn load_changes(workspace: &Path) -> Result<Option<Changes>, String> {
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(Some(Changes { root, files }))
-}
-
-enum GitError {
-    Spawn(String),
-    Failed(String),
-}
-
-impl GitError {
-    fn message(self) -> String {
-        match self {
-            GitError::Spawn(message) | GitError::Failed(message) => message,
-        }
-    }
-}
-
-fn git(directory: &Path, arguments: &[&str]) -> Result<String, GitError> {
-    let output = Command::new("git")
-        .without_console_window()
-        .arg("-C")
-        .arg(directory)
-        .args(arguments)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| GitError::Spawn(format!("could not run git: {error}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(GitError::Failed(if stderr.is_empty() {
-            format!("git exited with {}", output.status)
-        } else {
-            stderr
-        }));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn untracked_file(root: &Path, path: &str) -> FileDiff {

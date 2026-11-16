@@ -25,6 +25,9 @@ use crate::ui::ActiveTheme as _;
 pub const KEY_CONTEXT: &str = "TextInput";
 const LINE_HEIGHT: f32 = 22.;
 const MAX_VISIBLE_LINES: f32 = 10.;
+/// A compact multi-line field: smaller text, fewer rows, no inner padding.
+const COMPACT_LINE_HEIGHT: f32 = 18.;
+const COMPACT_MAX_VISIBLE_LINES: f32 = 8.;
 /// A masked field wraps its dots up to this many rows, then scrolls.
 const MAX_MASKED_LINES: f32 = 3.;
 /// Shown for every character of a masked field.
@@ -316,6 +319,8 @@ pub struct TextInput {
     content: SharedString,
     placeholder: SharedString,
     single_line: bool,
+    /// A smaller multi-line field for side panels (see `compact`).
+    compact: bool,
     /// Shows a dot per character (passwords, keys); copy and cut do nothing.
     masked: bool,
     /// Up and Down go to the parent even in a multi-line field (e.g. while a
@@ -356,6 +361,7 @@ impl TextInput {
             content: SharedString::default(),
             placeholder: placeholder.into(),
             single_line: false,
+            compact: false,
             masked: false,
             vertical_passthrough: false,
             selected_range: 0..0,
@@ -504,6 +510,13 @@ impl TextInput {
             single_line: true,
             ..Self::new(placeholder, cx)
         }
+    }
+
+    /// A multi-line field with panel-sized text and no inner padding, for
+    /// boxes whose container already draws the frame (the commit message).
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
+        self
     }
 
     pub fn set_placeholder(
@@ -1710,8 +1723,22 @@ impl Render for TextInput {
             MAX_MASKED_LINES
         } else if self.single_line {
             1.
+        } else if self.compact {
+            COMPACT_MAX_VISIBLE_LINES
         } else {
             MAX_VISIBLE_LINES
+        };
+        let line_height = if self.compact {
+            COMPACT_LINE_HEIGHT
+        } else {
+            LINE_HEIGHT
+        };
+        let (text_size, padding_x, padding_y, scroll_allowance) = if self.single_line {
+            (13., 8., 3., 18.)
+        } else if self.compact {
+            (13., 0., 0., 0.)
+        } else {
+            (15., 12., 9., 18.)
         };
         let preview = self.render_chip_preview(cx);
         div()
@@ -1765,18 +1792,18 @@ impl Render for TextInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .w_full()
-            .text_size(px(if self.single_line { 13. } else { 15. }))
-            .line_height(px(LINE_HEIGHT))
+            .text_size(px(text_size))
+            .line_height(px(line_height))
             .child(
                 div()
                     .id("text-input-scroll")
                     .w_full()
-                    .max_h(px(LINE_HEIGHT * max_lines + 18.))
+                    .max_h(px(line_height * max_lines + scroll_allowance))
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
-                    // Single-line fields sit inside other controls: compact.
-                    .px(px(if self.single_line { 8. } else { 12. }))
-                    .py(px(if self.single_line { 3. } else { 9. }))
+                    // Single-line and compact fields sit inside other controls.
+                    .px(px(padding_x))
+                    .py(px(padding_y))
                     .child(TextElement { input: cx.entity() }),
             )
     }

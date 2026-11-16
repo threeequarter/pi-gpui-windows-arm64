@@ -6,6 +6,7 @@ mod chat;
 mod diff;
 mod dock;
 mod file_tree;
+mod git;
 mod highlight;
 mod hub;
 mod jsonl;
@@ -16,6 +17,7 @@ mod pi;
 mod pi_updates;
 mod platform;
 mod plugins;
+mod process;
 mod selectable;
 mod sessions;
 mod settings;
@@ -107,6 +109,7 @@ fn main() {
         text_input::bind_keys(cx);
         chat::bind_keys(cx);
         file_tree::bind_keys(cx);
+        diff::bind_keys(cx);
         hub::bind_keys(cx);
         cx.bind_keys([KeyBinding::new(&crate::keys::binding("cmd-q"), Quit, None)]);
         #[cfg(target_os = "macos")]

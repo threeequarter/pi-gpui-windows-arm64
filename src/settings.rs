@@ -21,6 +21,8 @@ const DEFAULT_BUFFER_FONT: &str = "JetBrains Mono NL";
 /// Ships with macOS; used when the configured code font is missing.
 const FALLBACK_BUFFER_FONT: &str = "Menlo";
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_COMMIT_MESSAGE_INSTRUCTIONS: &str = "Analyze the provided code changes (git diff) and generate a clear, concise Git commit message following best practices. Output only the commit message text.";
+const DEFAULT_COMMIT_MESSAGE_MODEL: &str = "qwen-token-plan-individual/deepseek-v4.1-flash-1017";
 
 const DEFAULT_FILE: &str = r#"// Pi GPUI settings.
 //
@@ -44,6 +46,14 @@ const DEFAULT_FILE: &str = r#"// Pi GPUI settings.
   // back to Menlo.
   "buffer_font_family": "JetBrains Mono NL",
   "buffer_font_size": 12,
+
+  // What the Changes panel asks pi when it writes a commit message; the diff
+  // follows these instructions.
+  "commit_message_instructions": "Analyze the provided code changes (git diff) and generate a clear, concise Git commit message following best practices. Output only the commit message text.",
+
+  // Model for commit messages as "provider/id" (see `pi --list-models`).
+  // An empty string uses pi's default model.
+  "commit_message_model": "qwen-token-plan-individual/deepseek-v4.1-flash-1017",
 }
 "#;
 
@@ -54,6 +64,9 @@ pub struct Settings {
     pub agent_font_size: f32,
     pub buffer_font_family: SharedString,
     pub buffer_font_size: f32,
+    pub commit_message_instructions: SharedString,
+    /// `None` lets pi pick its default model.
+    pub commit_message_model: Option<SharedString>,
     /// Plugin settings: top-level `"<plugin id>.<key>"` values, checked
     /// against each plugin's declarations where they are used.
     pub plugin_values: serde_json::Map<String, Value>,
@@ -67,6 +80,8 @@ impl Default for Settings {
             agent_font_size: 14.,
             buffer_font_family: DEFAULT_BUFFER_FONT.into(),
             buffer_font_size: 12.,
+            commit_message_instructions: DEFAULT_COMMIT_MESSAGE_INSTRUCTIONS.into(),
+            commit_message_model: Some(DEFAULT_COMMIT_MESSAGE_MODEL.into()),
             plugin_values: serde_json::Map::new(),
         }
     }
@@ -107,6 +122,16 @@ impl Settings {
             agent_font_size: size("agent_font_size", defaults.agent_font_size),
             buffer_font_family: text("buffer_font_family", defaults.buffer_font_family),
             buffer_font_size: size("buffer_font_size", defaults.buffer_font_size),
+            commit_message_instructions: text(
+                "commit_message_instructions",
+                defaults.commit_message_instructions,
+            ),
+            // An explicit empty string means pi's default; a missing key keeps ours.
+            commit_message_model: match value["commit_message_model"].as_str().map(str::trim) {
+                Some("") => None,
+                Some(model) => Some(SharedString::from(model.to_string())),
+                None => defaults.commit_message_model,
+            },
             plugin_values: value
                 .as_object()
                 .into_iter()
@@ -581,6 +606,12 @@ mod tests {
     #[test]
     fn default_file_parses_to_defaults() {
         assert_eq!(parse(DEFAULT_FILE), Ok(Settings::default()));
+    }
+
+    #[test]
+    fn empty_commit_message_model_means_pi_default() {
+        let settings = parse(r#"{ "commit_message_model": "  " }"#).unwrap();
+        assert_eq!(settings.commit_message_model, None);
     }
 
     #[test]

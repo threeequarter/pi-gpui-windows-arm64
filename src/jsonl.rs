@@ -15,6 +15,7 @@ use futures::channel::mpsc;
 use serde_json::Value;
 
 use crate::platform::ConsoleWindow as _;
+use crate::process::kill_tree;
 
 /// Capacity of the stdout → UI queue. When the UI falls behind, the reader
 /// thread blocks, the pipe fills, and the child slows down instead of the app
@@ -118,27 +119,6 @@ impl Drop for JsonlProcess {
             }
         });
     }
-}
-
-#[cfg(not(windows))]
-fn kill_tree(child: &mut Child) -> std::io::Result<()> {
-    child.kill()
-}
-
-/// On Windows pi starts through `pi.cmd`, so the child is `cmd.exe` and pi
-/// runs in a `node` process below it, which `Child::kill` would leave behind.
-#[cfg(windows)]
-fn kill_tree(child: &mut Child) -> std::io::Result<()> {
-    let status = Command::new("taskkill")
-        .without_console_window()
-        .args(["/T", "/F", "/PID", &child.id().to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if status.success() {
-        return Ok(());
-    }
-    child.kill()
 }
 
 fn missing_pipe() -> std::io::Error {

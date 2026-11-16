@@ -17,7 +17,7 @@ use gpui::{
 use serde_json::{Value, json};
 
 use crate::chat::{ChatEvent, ChatStatus, ChatView, DetailsExpanded};
-use crate::diff::DiffPanel;
+use crate::diff::{DiffPanel, DiffPanelEvent};
 use crate::dock::{DockSide, Docks, PanelKind};
 use crate::file_tree::{FilesEvent, FilesPanel};
 use crate::pi::{self, Installation};
@@ -434,7 +434,15 @@ impl HubView {
             }),
         ];
         let docks = state_path.as_deref().map(load_docks).unwrap_or_default();
-        let diff_panel = cx.new(|_| DiffPanel::new());
+        let diff_panel = cx.new(DiffPanel::new);
+        // Staging, commits and pulls change the Files panel's git badges.
+        cx.subscribe(
+            &diff_panel,
+            |this: &mut Self, _, event: &DiffPanelEvent, cx| match event {
+                DiffPanelEvent::RepositoryChanged => this.refresh_files(cx),
+            },
+        )
+        .detach();
         let files_panel = cx.new(FilesPanel::new);
         cx.subscribe(
             &files_panel,
@@ -636,6 +644,7 @@ impl HubView {
                         AutoUpdater::global(cx)
                             .update(cx, |updater, _| updater.set_pi_version(version));
                         this.installation = InstallationState::Ready(installation.clone());
+                        this.sync_diff_installation(cx);
                         let chats = this.open_chats();
                         for chat in &chats {
                             chat.update(cx, |chat, cx| chat.restart(installation.clone(), cx));
@@ -652,6 +661,7 @@ impl HubView {
                     Err(error) => {
                         eprintln!("pi-gpui: {error}");
                         this.installation = InstallationState::Failed(error);
+                        this.sync_diff_installation(cx);
                     }
                 }
                 cx.notify();
@@ -659,6 +669,17 @@ impl HubView {
             .ok();
         });
         cx.notify();
+    }
+
+    /// Hands the current pi to the Changes panel, which writes commit
+    /// messages with it.
+    fn sync_diff_installation(&mut self, cx: &mut Context<Self>) {
+        let installation = match &self.installation {
+            InstallationState::Ready(installation) => Some(installation.clone()),
+            _ => None,
+        };
+        self.diff_panel
+            .update(cx, |panel, cx| panel.set_installation(installation, cx));
     }
 
     fn toggle_details(&mut self, _: &ToggleDetails, _: &mut Window, cx: &mut Context<Self>) {
@@ -734,6 +755,7 @@ impl HubView {
                         AutoUpdater::global(cx)
                             .update(cx, |updater, _| updater.set_pi_version(version));
                         this.installation = InstallationState::Ready(installation);
+                        this.sync_diff_installation(cx);
                         this.check_pi_updates(cx);
                         match this.pending_open.take() {
                             Some((path, Some(session))) => this.open_session(&path, session, cx),
@@ -744,6 +766,7 @@ impl HubView {
                     Err(error) => {
                         eprintln!("pi-gpui: {error}");
                         this.installation = InstallationState::Failed(error);
+                        this.sync_diff_installation(cx);
                     }
                 }
                 cx.notify();
@@ -1248,6 +1271,7 @@ impl HubView {
                     Err(error) => {
                         let message = error.to_string();
                         this.installation = InstallationState::Failed(error);
+                        this.sync_diff_installation(cx);
                         reply.finish(&this.plugins, Err(message), cx);
                         cx.notify();
                         return;
@@ -1256,6 +1280,7 @@ impl HubView {
                 let version = installation.version;
                 AutoUpdater::global(cx).update(cx, |updater, _| updater.set_pi_version(version));
                 this.installation = InstallationState::Ready(installation.clone());
+                this.sync_diff_installation(cx);
                 chat.update(cx, |chat, cx| chat.restart(installation, cx));
                 let info = this.session_info(&chat, cx);
                 reply.finish(&this.plugins, Ok(info), cx);

@@ -4,18 +4,24 @@
 
 use std::ffi::OsString;
 use std::fmt;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use futures::channel::mpsc;
 
 use crate::jsonl::{JsonlMessage, JsonlProcess};
-use crate::platform::ConsoleWindow as _;
+use crate::process::run_with_timeout;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One-shot print mode answers a prompt with a model round-trip, so it gets
+/// far more time than the quick `pi` commands above.
+const GENERATION_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Longest diff (in characters) sent to pi for a commit message; the rest is
+/// cut, with a note, to keep the prompt in a sane size.
+const MAX_COMMIT_DIFF_CHARS: usize = 120_000;
 
 /// Field order makes the derived ordering compare major, then minor, then patch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -160,6 +166,7 @@ pub fn check_installation() -> Result<Installation, CheckError> {
         Command::new(&executable)
             .arg("--version")
             .env("PATH", path_with_executable_dir(&executable)),
+        None,
         COMMAND_TIMEOUT,
     )
     .map_err(|details| CheckError::VersionUnreadable {
@@ -247,6 +254,7 @@ pub fn find_executable(name: &str) -> Option<PathBuf> {
     });
     let output = run_with_timeout(
         Command::new(shell).args(["-ilc", &format!("command -v {name}")]),
+        None,
         COMMAND_TIMEOUT,
     )
     .ok()?;
@@ -274,62 +282,102 @@ pub fn path_with_executable_dir(executable: &Path) -> OsString {
     std::env::join_paths(directories).unwrap_or_default()
 }
 
-fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<String, String> {
-    let mut child = command
-        .without_console_window()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
+/// Whether this pi has the one-shot print mode commit message generation
+/// needs. The flags are probed, not assumed: the oldest supported pi may lack
+/// one of them. Blocking; the caller runs this in the background and caches
+/// the answer.
+pub fn supports_print_mode(installation: &Installation) -> bool {
+    const FLAGS: [&str; 3] = ["--print", "--no-session", "--no-tools"];
 
-    let mut stdout = child.stdout.take().ok_or("stdout is unavailable")?;
-    let mut stderr = child.stderr.take().ok_or("stderr is unavailable")?;
-    let reader = thread::spawn(move || {
-        let mut text = String::new();
-        stdout.read_to_string(&mut text).map(|_| text)
-    });
-    // Read stderr too, so a chatty child cannot block on a full pipe; its
-    // last line explains failures (e.g. "env: node: No such file or directory").
-    let error_reader = thread::spawn(move || {
-        let mut text = String::new();
-        let _ = stderr.read_to_string(&mut text);
-        text
-    });
+    let mut command = Command::new(&installation.executable);
+    command
+        .arg("--help")
+        .env("PATH", path_with_executable_dir(&installation.executable));
+    let Ok(help) = run_with_timeout(&mut command, None, COMMAND_TIMEOUT) else {
+        return false;
+    };
+    FLAGS.iter().all(|flag| help.contains(*flag))
+}
 
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let text = reader
-                    .join()
-                    .map_err(|_| "the reader thread panicked".to_string())?
-                    .map_err(|error| error.to_string())?;
-                let error_text = error_reader.join().unwrap_or_default();
-                return if status.success() {
-                    Ok(text)
-                } else {
-                    match error_text
-                        .lines()
-                        .rev()
-                        .map(str::trim)
-                        .find(|line| !line.is_empty())
-                    {
-                        Some(line) => Err(line.to_string()),
-                        None => Err(format!("exited with {status}")),
-                    }
-                };
-            }
-            Ok(None) if started.elapsed() > timeout => {
-                if let Err(error) = child.kill() {
-                    return Err(format!("timed out and could not be stopped: {error}"));
-                }
-                return Err(format!("no answer within {} s", timeout.as_secs()));
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(error) => return Err(error.to_string()),
+/// A commit message for `diff`, written by pi in one-shot print mode: no
+/// session file, no tools, no extensions, so only the prompt reaches the
+/// model. The prompt goes in over stdin, so a large diff cannot hit the
+/// Windows command-line limit, and `root` is the working directory, so pi sees
+/// the repository the diff came from. Blocking.
+pub fn generate_commit_message(
+    installation: &Installation,
+    root: &Path,
+    instructions: &str,
+    diff: &str,
+    model: Option<&str>,
+) -> Result<String, String> {
+    let prompt = commit_prompt(instructions, diff);
+    let mut command = Command::new(&installation.executable);
+    command
+        .args([
+            "-p",
+            "--no-session",
+            "--no-tools",
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+        ])
+        .current_dir(root)
+        .env("PATH", path_with_executable_dir(&installation.executable));
+    // An empty setting means pi's own default model.
+    if let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) {
+        command.args(["--model", model]);
+    }
+    let output = run_with_timeout(&mut command, Some(prompt.as_bytes()), GENERATION_TIMEOUT)?;
+    clean_commit_message(&output)
+}
+
+/// The prompt for one generation: the user's instructions, a blank line, then
+/// the diff, cut to `MAX_COMMIT_DIFF_CHARS` characters.
+fn commit_prompt(instructions: &str, diff: &str) -> String {
+    let mut prompt = format!("{instructions}\n\n");
+    match diff.char_indices().nth(MAX_COMMIT_DIFF_CHARS) {
+        None => prompt.push_str(diff),
+        // The byte where the cap falls is a character boundary, so cutting
+        // there never splits a multibyte character.
+        Some((cut, _)) => {
+            prompt.push_str(&diff[..cut]);
+            prompt.push_str(&truncation_note());
         }
     }
+    prompt
+}
+
+/// Tells pi the diff is incomplete, so it does not report the changes that
+/// were cut away as missing work.
+fn truncation_note() -> String {
+    format!("\n\n[the diff was truncated after {MAX_COMMIT_DIFF_CHARS} characters]")
+}
+
+/// What pi printed, as the message to hand to git: trimmed, and without a
+/// markdown code fence wrapping the whole answer, which models like to add.
+fn clean_commit_message(output: &str) -> Result<String, String> {
+    let message = strip_code_fence(output.trim()).trim();
+    if message.is_empty() {
+        return Err("pi returned an empty message".to_string());
+    }
+    Ok(message.to_string())
+}
+
+/// The inside of `text` when a markdown code fence wraps all of it, its
+/// opening line carrying an optional language tag; `text` itself otherwise.
+fn strip_code_fence(text: &str) -> &str {
+    let Some(after_fence) = text.strip_prefix("```") else {
+        return text;
+    };
+    // The language tag sits on the fence line and goes with it.
+    let Some((_, body)) = after_fence.split_once('\n') else {
+        return text;
+    };
+    let Some(body) = body.strip_suffix("```") else {
+        return text;
+    };
+    body.trim_end_matches(['\n', '\r'])
 }
 
 /// Starts `pi --mode rpc` in `workspace`: a new session, or `session` resumed.
@@ -462,5 +510,92 @@ mod tests {
             })
         );
         assert_eq!(Version::find_in("no version"), None);
+    }
+
+    #[test]
+    fn the_prompt_is_the_instructions_then_a_blank_line_then_the_diff() {
+        assert_eq!(
+            commit_prompt("write it short", "diff --git a/x b/x"),
+            "write it short\n\ndiff --git a/x b/x"
+        );
+    }
+
+    #[test]
+    fn a_diff_of_exactly_the_limit_is_sent_whole() {
+        let diff = "x".repeat(MAX_COMMIT_DIFF_CHARS);
+        let prompt = commit_prompt("instructions", &diff);
+        assert!(prompt.ends_with(&diff));
+        assert!(!prompt.contains(&truncation_note()));
+    }
+
+    #[test]
+    fn a_diff_over_the_limit_is_cut_and_says_so() {
+        let diff = format!("{}the cut-away part", "x".repeat(MAX_COMMIT_DIFF_CHARS));
+        let prompt = commit_prompt("instructions", &diff);
+        assert!(prompt.contains(&"x".repeat(MAX_COMMIT_DIFF_CHARS)));
+        assert!(!prompt.contains("cut-away"));
+        assert!(prompt.ends_with(&truncation_note()));
+    }
+
+    #[test]
+    fn cutting_the_diff_never_splits_a_multibyte_character() {
+        // `→` is 3 bytes, so a byte-wise cut would land inside one.
+        let diff = "→".repeat(MAX_COMMIT_DIFF_CHARS + 5);
+        let prompt = commit_prompt("instructions", &diff);
+        let kept = prompt
+            .strip_prefix("instructions\n\n")
+            .and_then(|rest| rest.strip_suffix(&truncation_note()))
+            .expect("the prompt keeps its three parts");
+        assert_eq!(kept.chars().count(), MAX_COMMIT_DIFF_CHARS);
+        assert!(kept.chars().all(|character| character == '→'));
+    }
+
+    #[test]
+    fn a_code_fence_wrapping_the_answer_is_removed() {
+        assert_eq!(
+            clean_commit_message("```\nfix the panel\n```"),
+            Ok("fix the panel".to_string())
+        );
+        // The answer ends with the fence, whatever whitespace follows it.
+        assert_eq!(
+            clean_commit_message("```\ntext\n```\n"),
+            Ok("text".to_string())
+        );
+    }
+
+    #[test]
+    fn a_code_fence_with_a_language_tag_is_removed_with_it() {
+        assert_eq!(
+            clean_commit_message("```text\n\nfix the panel\n\nand its test\n```"),
+            Ok("fix the panel\n\nand its test".to_string())
+        );
+    }
+
+    #[test]
+    fn an_empty_answer_is_reported() {
+        assert_eq!(
+            clean_commit_message("  \n"),
+            Err("pi returned an empty message".to_string())
+        );
+        assert_eq!(
+            clean_commit_message("```\n\n```"),
+            Err("pi returned an empty message".to_string())
+        );
+    }
+
+    #[test]
+    fn an_answer_without_a_fence_is_kept_and_trimmed() {
+        assert_eq!(
+            clean_commit_message("  fix the panel\n"),
+            Ok("fix the panel".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unclosed_fence_is_kept_as_it_is() {
+        assert_eq!(
+            clean_commit_message("```\nfix the panel"),
+            Ok("```\nfix the panel".to_string())
+        );
     }
 }
