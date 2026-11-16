@@ -2,7 +2,8 @@ use std::borrow::Cow;
 use std::time::Duration;
 
 use gpui::{
-    App, AssetSource, Pixels, SharedString, Transformation, Window, percentage, prelude::*, px, svg,
+    App, AssetSource, Bounds, Pixels, SharedString, Transformation, TransformationMatrix, Window,
+    canvas, percentage, point, prelude::*, px, size, svg,
 };
 
 use super::animation::phase;
@@ -152,12 +153,37 @@ impl Icon {
 
 impl RenderOnce for Icon {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        svg()
-            .path(self.name.path())
-            .flex_none()
-            .size(self.size.pixels())
-            .text_color(self.color.icon(cx))
+        let path = SharedString::from(self.name.path());
+        let color = self.color.icon(cx);
+        let side = self.size.pixels();
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, cx| {
+                let bounds = snap_to_device_pixels(bounds, side, window.scale_factor());
+                window
+                    .paint_svg(bounds, path, TransformationMatrix::default(), color, cx)
+                    .ok();
+            },
+        )
+        .flex_none()
+        .size(self.size.pixels())
     }
+}
+
+/// A `side`-sized square on whole device pixels, centered where layout put
+/// the icon. Layout rounds edges, not sizes, so a 14 px icon at 125% comes
+/// back 17 or 18 device pixels wide depending on where it sits, and gpui
+/// centers the sprite on that box at a fractional offset; the same icon then
+/// differs in size and blurs along different edges from place to place.
+fn snap_to_device_pixels(bounds: Bounds<Pixels>, side: Pixels, scale: f32) -> Bounds<Pixels> {
+    // 17.4999 and 17.5 must round alike.
+    let device = (f32::from(side) * scale + 0.01).round().max(1.);
+    let snap = |center: Pixels| px((f32::from(center) * scale - device / 2.).round() / scale);
+    let center = bounds.center();
+    Bounds::new(
+        point(snap(center.x), snap(center.y)),
+        size(px(device / scale), px(device / scale)),
+    )
 }
 
 /// A rotating loader. Its angle comes from wall time, so the owning view only
