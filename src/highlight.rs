@@ -68,6 +68,19 @@ pub fn highlight(code: &str, language: Option<&str>, colors: &SyntaxColors) -> O
     Some(highlights)
 }
 
+/// Like [`highlight`], without the cache: for text highlighted once, off
+/// the UI thread (the cache is per thread).
+pub fn highlight_once(
+    code: &str,
+    language: &str,
+    colors: &SyntaxColors,
+) -> Option<Vec<(Range<usize>, Hsla)>> {
+    if code.len() > MAX_HIGHLIGHTED_BYTES {
+        return None;
+    }
+    compute(code, language, colors)
+}
+
 fn compute(code: &str, language: &str, colors: &SyntaxColors) -> Option<Vec<(Range<usize>, Hsla)>> {
     let set = syntaxes();
     let syntax = set

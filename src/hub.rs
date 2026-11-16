@@ -20,6 +20,7 @@ use crate::chat::{ChatEvent, ChatStatus, ChatView, DetailsExpanded};
 use crate::diff::{DiffPanel, DiffPanelEvent};
 use crate::dock::{DockSide, Docks, PanelKind};
 use crate::file_tree::{FilesEvent, FilesPanel};
+use crate::file_viewer::{FileViewer, FileViewerEvent};
 use crate::pi::{self, Installation};
 use crate::pi_updates;
 use crate::platform;
@@ -28,7 +29,7 @@ use crate::plugins::{
     RunPluginCommand, SettingKind,
 };
 use crate::sessions::{self, SessionSummary};
-use crate::settings::{self, Settings};
+use crate::settings::{self, Settings, ui_px};
 use crate::text_input::TextInput;
 use crate::ui::AnimationTicker;
 use crate::ui::prelude::*;
@@ -149,6 +150,8 @@ struct SessionRow {
     /// "3h" for listed sessions.
     age: Option<String>,
     hidden: bool,
+    /// Forks nest under their parent when it is listed.
+    depth: usize,
 }
 
 struct SessionMenu {
@@ -202,7 +205,7 @@ impl Render for DraggedWorkspace {
         let colors = cx.theme().colors.clone();
         h_flex()
             .gap(px(6.))
-            .h(px(26.))
+            .h(ui_px(cx, 26.))
             .px(px(8.))
             .rounded(px(5.))
             .bg(colors.elevated_surface_background)
@@ -234,7 +237,7 @@ impl Render for DraggedTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
         h_flex()
-            .h(px(26.))
+            .h(ui_px(cx, 26.))
             .max_w(px(220.))
             .px(px(10.))
             .rounded(px(5.))
@@ -320,6 +323,9 @@ pub struct HubView {
     docks: Docks,
     diff_panel: Entity<DiffPanel>,
     files_panel: Entity<FilesPanel>,
+    file_viewer: Option<Entity<FileViewer>>,
+    /// Focus returns to the Files panel after the viewer closes.
+    focus_files: bool,
     /// Right-click menu of a side panel.
     panel_menu: Option<PanelMenu>,
     /// A dock edge is being dragged.
@@ -446,17 +452,21 @@ impl HubView {
         let files_panel = cx.new(FilesPanel::new);
         cx.subscribe(
             &files_panel,
-            |this: &mut Self, _, event: &FilesEvent, cx| {
-                let FilesEvent::InsertPath(path) = event;
-                if let Some(chat) = &this.active_chat {
-                    let edit = PluginEvent::ComposerInsert {
-                        text: format!("{path} "),
-                        replace_last: false,
-                        space_before: true,
-                    };
-                    chat.update(cx, |chat, cx| chat.apply_plugin_edit(&edit, cx));
-                    this.focus_active_chat = true;
-                    cx.notify();
+            |this: &mut Self, _, event: &FilesEvent, cx| match event {
+                FilesEvent::InsertPath(path) => {
+                    if let Some(chat) = &this.active_chat {
+                        let edit = PluginEvent::ComposerInsert {
+                            text: format!("{path} "),
+                            replace_last: false,
+                            space_before: true,
+                        };
+                        chat.update(cx, |chat, cx| chat.apply_plugin_edit(&edit, cx));
+                        this.focus_active_chat = true;
+                        cx.notify();
+                    }
+                }
+                FilesEvent::OpenPath(path, title) => {
+                    this.open_file_viewer(path.clone(), title.clone(), cx);
                 }
             },
         )
@@ -489,6 +499,8 @@ impl HubView {
             docks,
             diff_panel,
             files_panel,
+            file_viewer: None,
+            focus_files: false,
             panel_menu: None,
             resizing_dock: None,
             panels_follow: None,
@@ -1759,7 +1771,7 @@ impl HubView {
                 .id("session-tabs")
                 .flex_none()
                 .w_full()
-                .h(px(TAB_BAR_HEIGHT))
+                .h(ui_px(cx, TAB_BAR_HEIGHT))
                 .bg(colors.panel_background)
                 .overflow_x_scroll()
                 .children(close_all)
@@ -1960,7 +1972,7 @@ impl HubView {
                         h_flex()
                             .id(ElementId::Name(format!("dock-tab:{kind:?}").into()))
                             .flex_none()
-                            .h(px(24.))
+                            .h(ui_px(cx, 24.))
                             .px(px(6.))
                             .gap(px(5.))
                             .rounded(px(5.))
@@ -2012,7 +2024,7 @@ impl HubView {
                 DockSide::Right => "right-dock-header",
             })
             .flex_none()
-            .h(px(40.))
+            .h(ui_px(cx, 40.))
             .pl(px(if tabbed { 8. } else { 12. }))
             .pr(px(8.))
             .gap(px(4.))
@@ -2046,7 +2058,7 @@ impl HubView {
         let item = |id: &'static str, icon: IconName, label: &'static str| {
             h_flex()
                 .id(id)
-                .h(px(28.))
+                .h(ui_px(cx, 28.))
                 .px(px(8.))
                 .gap(px(8.))
                 .rounded(px(5.))
@@ -2101,7 +2113,7 @@ impl HubView {
             |id: &'static str, label: &'static str, keys: Option<&'static str>, enabled: bool| {
                 h_flex()
                     .id(id)
-                    .h(px(28.))
+                    .h(ui_px(cx, 28.))
                     .px(px(8.))
                     .gap(px(8.))
                     .rounded(px(5.))
@@ -2152,7 +2164,8 @@ impl HubView {
                 cx.notify();
             },
         ));
-        let quit = item("app-menu-quit", "Quit", Some("⌘Q"), true).on_click(|_, _, cx| cx.quit());
+        let quit = item("app-menu-quit", "Quit", Some("⌘Q"), true)
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::Quit), cx));
         deferred(
             anchored()
                 .position(position)
@@ -2423,7 +2436,7 @@ impl HubView {
                 rows.push(
                     div()
                         .id(("sessions-placeholder", index))
-                        .h(px(26.))
+                        .h(ui_px(cx, 26.))
                         .pl(px(26.))
                         .flex()
                         .items_center()
@@ -2481,10 +2494,11 @@ impl HubView {
                     file: view.session_file().map(Path::to_path_buf),
                     age: None,
                     hidden: false,
+                    depth: 0,
                 });
             }
         }
-        for summary in &entry.sessions {
+        for (summary, depth) in fork_tree(&entry.sessions) {
             let open = entry
                 .chats
                 .iter()
@@ -2503,6 +2517,7 @@ impl HubView {
                 age: Some(sessions::relative_age(summary.modified)),
                 // The session being worked on stays visible even if hidden.
                 hidden: self.hidden_sessions.contains(&summary.path) && !is_active,
+                depth,
             });
         }
         rows
@@ -2666,6 +2681,17 @@ impl HubView {
                 .children(close_button),
         };
 
+        // A fork is offset by about two characters per nesting level.
+        let title = if row.depth > 0 {
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .pl(LabelSize::Small.pixels(cx) * row.depth as f32)
+                .child(title)
+                .into_any_element()
+        } else {
+            title
+        };
         let item = ListItem::new(row.id.clone())
             .indent_level(1)
             .toggle_state(is_active)
@@ -2698,7 +2724,7 @@ impl HubView {
             |id: &'static str, icon: IconName, label: &'static str, color: Color, enabled: bool| {
                 h_flex()
                     .id(id)
-                    .h(px(28.))
+                    .h(ui_px(cx, 28.))
                     .px(px(8.))
                     .gap(px(8.))
                     .rounded(px(5.))
@@ -3324,8 +3350,8 @@ impl HubView {
                             .gap(px(6.))
                             .child(
                                 div()
-                                    .text_size(px(20.))
-                                    .line_height(px(28.))
+                                    .text_size(px(20.) * Settings::get(cx).ui_scale())
+                                    .line_height((px(28.) * Settings::get(cx).ui_scale()).round())
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(title),
                             )
@@ -3526,7 +3552,7 @@ impl HubView {
                 let selected = current.theme == value;
                 div()
                     .id(ElementId::Name(format!("theme-{value}").into()))
-                    .h(px(24.))
+                    .h(ui_px(cx, 24.))
                     .px(px(10.))
                     .flex()
                     .items_center()
@@ -3585,7 +3611,7 @@ impl HubView {
                     let selected = current.theme.eq_ignore_ascii_case(&name);
                     div()
                         .id(ElementId::Name(format!("user-theme-{name}").into()))
-                        .h(px(24.))
+                        .h(ui_px(cx, 24.))
                         .px(px(10.))
                         .flex()
                         .items_center()
@@ -3667,10 +3693,10 @@ impl HubView {
                 }))
         });
 
-        let stepper = |key: &'static str, value: f32, cx: &mut Context<Self>| {
+        let stepper = |key: &'static str, value: f32, range: (f32, f32), cx: &mut Context<Self>| {
             let step = |delta: f32| {
                 move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-                    let next = (value + delta).clamp(8., 32.);
+                    let next = (value + delta).clamp(range.0, range.1);
                     settings::set(cx, key, json!(next as u64));
                 }
             };
@@ -3742,8 +3768,8 @@ impl HubView {
                     .gap(px(2.))
                     .child(
                         div()
-                            .text_size(px(20.))
-                            .line_height(px(28.))
+                            .text_size(px(20.) * Settings::get(cx).ui_scale())
+                            .line_height((px(28.) * Settings::get(cx).ui_scale()).round())
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Settings"),
                     )
@@ -3824,9 +3850,19 @@ impl HubView {
                         field("ui_font_family", &page.ui_font, cx),
                     ))
                     .child(row(
+                        "Interface size".into(),
+                        "Text size of the title bar, sidebar, panels and tool cards.".into(),
+                        stepper(
+                            "ui_font_size",
+                            current.ui_font_size,
+                            settings::UI_FONT_SIZE_RANGE,
+                            cx,
+                        ),
+                    ))
+                    .child(row(
                         "Message size".into(),
                         "Text size of your messages and the agent's answers.".into(),
-                        stepper("agent_font_size", current.agent_font_size, cx),
+                        stepper("agent_font_size", current.agent_font_size, (8., 32.), cx),
                     ))
                     .child(row(
                         "Code font".into(),
@@ -3836,7 +3872,7 @@ impl HubView {
                     .child(row(
                         "Code size".into(),
                         "Text size of code blocks and tool output.".into(),
-                        stepper("buffer_font_size", current.buffer_font_size, cx),
+                        stepper("buffer_font_size", current.buffer_font_size, (8., 32.), cx),
                     ))
                     .children(plugin_rows),
             )
@@ -3901,7 +3937,7 @@ impl HubView {
                         .id(ElementId::Name(
                             format!("plugin-setting:{key}:{index}").into(),
                         ))
-                        .h(px(24.))
+                        .h(ui_px(cx, 24.))
                         .px(px(10.))
                         .flex()
                         .items_center()
@@ -4103,7 +4139,7 @@ impl HubView {
             let open = self.update_popover == Some(popover);
             h_flex()
                 .id(id)
-                .h(px(20.))
+                .h(ui_px(cx, 20.))
                 .px(px(6.))
                 .gap(px(3.))
                 .rounded(px(5.))
@@ -4724,15 +4760,33 @@ impl Focusable for HubView {
     }
 }
 
+impl HubView {
+    fn open_file_viewer(&mut self, path: PathBuf, title: String, cx: &mut Context<Self>) {
+        let viewer = cx.new(|cx| FileViewer::new(path, title, cx));
+        cx.subscribe(&viewer, |this: &mut Self, _, _: &FileViewerEvent, cx| {
+            this.file_viewer = None;
+            this.focus_files = true;
+            cx.notify();
+        })
+        .detach();
+        self.file_viewer = Some(viewer);
+        cx.notify();
+    }
+}
+
 impl Render for HubView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let corners = crate::window_frame::content_corners(window);
+        let ui_scale = Settings::get(cx).ui_scale();
         if std::mem::take(&mut self.focus_active_chat) {
             match &self.active_chat {
                 Some(chat) => window.focus(&chat.read(cx).composer_focus_handle(cx)),
                 // Keep hub shortcuts (⌘N, ⌘1…) working without a chat.
                 None => window.focus(&self.focus_handle),
             }
+        }
+        if std::mem::take(&mut self.focus_files) {
+            window.focus(&self.files_panel.read(cx).focus_handle());
         }
 
         // Panels follow the active session, wherever it was switched.
@@ -4860,8 +4914,8 @@ impl Render for HubView {
             .rounded_bl(corners.bottom_left)
             .rounded_br(corners.bottom_right)
             .text_color(colors.text)
-            .text_size(px(14.))
-            .line_height(px(21.))
+            .text_size(px(14.) * ui_scale)
+            .line_height((px(21.) * ui_scale).round())
             .child(self.render_title_bar(window, cx))
             .child(
                 div()
@@ -4878,7 +4932,12 @@ impl Render for HubView {
                             .children(notice)
                             .child(main),
                     )
-                    .children(self.render_dock(DockSide::Right, corners, cx)),
+                    .children(self.render_dock(DockSide::Right, corners, cx))
+                    .children(
+                        self.file_viewer
+                            .as_ref()
+                            .map(|viewer| viewer.clone().into_any_element()),
+                    ),
             )
             .children(
                 self.session_menu
@@ -4944,7 +5003,10 @@ fn render_window_controls(window: &Window) -> Option<AnyElement> {
             .child(
                 IconButton::new("window-close", IconName::Close)
                     .tooltip(Tooltip::text("Close"))
-                    .on_click(|_, window, _| window.remove_window()),
+                    .on_click(|_, window, cx| {
+                        crate::window_state::save_now(window, cx);
+                        window.remove_window();
+                    }),
             )
             .into_any_element(),
     )
@@ -4953,6 +5015,52 @@ fn render_window_controls(window: &Window) -> Option<AnyElement> {
 struct PanelMenu {
     kind: PanelKind,
     position: Point<Pixels>,
+}
+
+/// The listing (newest first) with every fork right under the session it was
+/// forked from, and its nesting depth. A tree sits where its newest session
+/// would; a fork whose parent is not listed stays at the top level.
+fn fork_tree(sessions: &[SessionSummary]) -> Vec<(&SessionSummary, usize)> {
+    let parents: Vec<Option<usize>> = sessions
+        .iter()
+        .enumerate()
+        .map(|(index, summary)| {
+            let parent = summary.parent.as_deref()?;
+            sessions
+                .iter()
+                .position(|other| other.path == parent)
+                .filter(|&position| position != index)
+        })
+        .collect();
+    let mut placed = vec![false; sessions.len()];
+    let mut ordered = Vec::with_capacity(sessions.len());
+    for start in 0..sessions.len() {
+        if placed[start] {
+            continue;
+        }
+        // The step limit guards against a parent cycle.
+        let mut root = start;
+        for _ in 0..sessions.len() {
+            match parents[root] {
+                Some(parent) => root = parent,
+                None => break,
+            }
+        }
+        let mut stack = vec![(root, 0)];
+        while let Some((index, depth)) = stack.pop() {
+            if std::mem::replace(&mut placed[index], true) {
+                continue;
+            }
+            ordered.push((&sessions[index], depth));
+            // Reversed, so the newest fork comes out first.
+            for child in (0..sessions.len()).rev() {
+                if parents[child] == Some(index) && !placed[child] {
+                    stack.push((child, depth + 1));
+                }
+            }
+        }
+    }
+    ordered
 }
 
 fn load_docks(path: &Path) -> Docks {
@@ -5015,7 +5123,7 @@ fn load_expand_details(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn write_atomically(path: &Path, value: &Value) -> Result<(), String> {
+pub(crate) fn write_atomically(path: &Path, value: &Value) -> Result<(), String> {
     let directory = path.parent().ok_or("no parent folder")?;
     fs::create_dir_all(directory).map_err(|error| error.to_string())?;
     let temporary = path.with_extension("json.tmp");

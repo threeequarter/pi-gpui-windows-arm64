@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use gpui::{App, Global, SharedString, Task};
+use gpui::{App, Global, Pixels, SharedString, Task, px};
 use serde_json::Value;
 
 use crate::platform;
@@ -18,6 +18,10 @@ pub const THEME_SYSTEM: &str = "system";
 pub const THEME_DARK: &str = "Ayu Dark";
 pub const THEME_LIGHT: &str = "Ayu Light";
 const DEFAULT_BUFFER_FONT: &str = "JetBrains Mono NL";
+/// Interface text size the layout was drawn for; other sizes scale it.
+const UI_FONT_SIZE: f32 = 14.;
+/// Sizes the interface layout still works with.
+pub const UI_FONT_SIZE_RANGE: (f32, f32) = (10., 20.);
 /// Ships with macOS; used when the configured code font is missing.
 const FALLBACK_BUFFER_FONT: &str = "Menlo";
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -37,6 +41,10 @@ const DEFAULT_FILE: &str = r#"// Pi GPUI settings.
 
   // Font of the interface. ".SystemUIFont" is the system font.
   "ui_font_family": ".SystemUIFont",
+
+  // Text size of the interface (title bar, sidebar, panels, tool cards), in
+  // pixels, from 10 to 20.
+  "ui_font_size": 14,
 
   // Text size of messages and answers, in pixels.
   "agent_font_size": 14,
@@ -61,6 +69,7 @@ const DEFAULT_FILE: &str = r#"// Pi GPUI settings.
 pub struct Settings {
     pub theme: String,
     pub ui_font_family: SharedString,
+    pub ui_font_size: f32,
     pub agent_font_size: f32,
     pub buffer_font_family: SharedString,
     pub buffer_font_size: f32,
@@ -77,6 +86,7 @@ impl Default for Settings {
         Self {
             theme: THEME_SYSTEM.to_string(),
             ui_font_family: ".SystemUIFont".into(),
+            ui_font_size: UI_FONT_SIZE,
             agent_font_size: 14.,
             buffer_font_family: DEFAULT_BUFFER_FONT.into(),
             buffer_font_size: 12.,
@@ -88,6 +98,11 @@ impl Default for Settings {
 }
 
 impl Global for Settings {}
+
+/// A fixed interface length (a row height) scaled with the interface size.
+pub fn ui_px(cx: &App, value: f32) -> Pixels {
+    px((value * Settings::get(cx).ui_scale()).round())
+}
 
 impl Settings {
     pub fn get(cx: &App) -> &Settings {
@@ -119,6 +134,8 @@ impl Settings {
                 .filter(|theme| !theme.is_empty())
                 .map_or(defaults.theme, str::to_string),
             ui_font_family: text("ui_font_family", defaults.ui_font_family),
+            ui_font_size: size("ui_font_size", defaults.ui_font_size)
+                .clamp(UI_FONT_SIZE_RANGE.0, UI_FONT_SIZE_RANGE.1),
             agent_font_size: size("agent_font_size", defaults.agent_font_size),
             buffer_font_family: text("buffer_font_family", defaults.buffer_font_family),
             buffer_font_size: size("buffer_font_size", defaults.buffer_font_size),
@@ -142,6 +159,11 @@ impl Settings {
         }
     }
 
+    /// Interface text and rows relative to the default size.
+    pub fn ui_scale(&self) -> f32 {
+        self.ui_font_size / UI_FONT_SIZE
+    }
+
     /// Line height for transcript text.
     pub fn agent_line_height(&self) -> f32 {
         (self.agent_font_size * 1.5).round()
@@ -149,6 +171,12 @@ impl Settings {
 
     pub fn buffer_line_height(&self) -> f32 {
         (self.buffer_font_size * 1.618).round()
+    }
+
+    /// Tool output, logs and diffs: a step below the code size, set tighter.
+    pub fn dense_code_size(&self) -> (f32, f32) {
+        let size = self.buffer_font_size - 1.;
+        (size, (size * 1.4).round())
     }
 }
 

@@ -17,7 +17,7 @@ use gpui::{
 use crate::git::{self, GitError, RepoStatus, StatusEntry, git};
 use crate::pi::{self, Installation};
 use crate::sessions;
-use crate::settings::Settings;
+use crate::settings::{Settings, ui_px};
 use crate::text_input::TextInput;
 use crate::ui::prelude::*;
 use crate::ui::{AnimationTicker, SyntaxColors};
@@ -513,7 +513,7 @@ impl DiffPanel {
         });
         h_flex()
             .flex_none()
-            .h(px(30.))
+            .h(ui_px(cx, 30.))
             .pl(px(12.))
             .pr(px(6.))
             .gap(px(6.))
@@ -601,7 +601,7 @@ impl DiffPanel {
         });
         h_flex()
             .flex_none()
-            .h(px(30.))
+            .h(ui_px(cx, 30.))
             .pl(px(12.))
             .pr(px(6.))
             .gap(px(6.))
@@ -701,7 +701,7 @@ impl DiffPanel {
 
         let header = h_flex()
             .id(ElementId::Name(format!("diff-file:{}", file.path).into()))
-            .h(px(28.))
+            .h(ui_px(cx, 28.))
             .pl(px(4.))
             .pr(px(8.))
             .gap(px(6.))
@@ -770,6 +770,7 @@ impl DiffPanel {
     fn render_file_lines(&self, file: &FileDiff, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
         let font = Settings::get(cx).buffer_font_family.clone();
+        let (code_size, code_line) = Settings::get(cx).dense_code_size();
         if file.binary {
             return div()
                 .px(px(28.))
@@ -857,8 +858,8 @@ impl DiffPanel {
             .border_1()
             .border_color(colors.border_variant)
             .font_family(font)
-            .text_size(px(11.5))
-            .line_height(px(17.))
+            .text_size(px(code_size))
+            .line_height(px(code_line))
             .children(lines)
             .when(hidden > 0, |this| {
                 this.child(

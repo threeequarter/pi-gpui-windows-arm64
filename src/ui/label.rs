@@ -17,7 +17,16 @@ pub enum LabelSize {
 }
 
 impl LabelSize {
-    pub fn pixels(self) -> Pixels {
+    /// Scaled by the interface size setting.
+    pub fn pixels(self, cx: &App) -> Pixels {
+        self.base_pixels() * crate::settings::Settings::get(cx).ui_scale()
+    }
+
+    pub(crate) fn line_height(self, cx: &App) -> Pixels {
+        (self.base_line_height() * crate::settings::Settings::get(cx).ui_scale()).round()
+    }
+
+    fn base_pixels(self) -> Pixels {
         match self {
             LabelSize::Large => px(16.),
             LabelSize::Default => px(14.),
@@ -26,7 +35,7 @@ impl LabelSize {
         }
     }
 
-    pub(crate) fn line_height(self) -> Pixels {
+    fn base_line_height(self) -> Pixels {
         match self {
             LabelSize::Large => px(22.),
             LabelSize::Default => px(20.),
@@ -96,8 +105,8 @@ impl Label {
 impl RenderOnce for Label {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         div()
-            .text_size(self.size.pixels())
-            .line_height(self.size.line_height())
+            .text_size(self.size.pixels(cx))
+            .line_height(self.size.line_height(cx))
             .text_color(self.color.text(cx))
             .when_some(self.weight, |this, weight| this.font_weight(weight))
             .when(self.italic, |this| this.italic())

@@ -6,6 +6,7 @@ mod chat;
 mod diff;
 mod dock;
 mod file_tree;
+mod file_viewer;
 mod git;
 mod highlight;
 mod hub;
@@ -27,6 +28,7 @@ mod text_input;
 mod ui;
 mod updater;
 mod window_frame;
+mod window_state;
 
 use std::path::PathBuf;
 
@@ -109,6 +111,7 @@ fn main() {
         text_input::bind_keys(cx);
         chat::bind_keys(cx);
         file_tree::bind_keys(cx);
+        file_viewer::bind_keys(cx);
         diff::bind_keys(cx);
         hub::bind_keys(cx);
         cx.bind_keys([KeyBinding::new(&crate::keys::binding("cmd-q"), Quit, None)]);
@@ -123,7 +126,14 @@ fn main() {
         cx.on_action(|_: &About, cx| {
             cx.open_url("https://github.com/bytesbay/pi-gpui");
         });
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_action(|_: &Quit, cx| {
+            for window in cx.windows() {
+                window
+                    .update(cx, |_, window, cx| window_state::save_now(window, cx))
+                    .ok();
+            }
+            cx.quit();
+        });
         #[cfg(windows)]
         cx.on_app_quit(|_| {
             single_instance::release();
@@ -143,9 +153,17 @@ fn main() {
         })
         .detach();
 
-        let bounds = Bounds::centered(None, size(px(1180.), px(800.)), cx);
+        // Where the window was last, or centered on the main display.
+        let (window_bounds, display_id) = match window_state::restore(cx) {
+            Some((bounds, display)) => (bounds, Some(display)),
+            None => (
+                WindowBounds::Windowed(Bounds::centered(None, size(px(1180.), px(800.)), cx)),
+                None,
+            ),
+        };
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_bounds: Some(window_bounds),
+            display_id,
             // Draw our own title bar; macOS keeps the traffic lights.
             titlebar: Some(TitlebarOptions {
                 title: Some("Pi GPUI".into()),
@@ -172,6 +190,7 @@ fn main() {
         };
 
         let focused = window.update(cx, |view, window, cx| {
+            window_state::track(window, cx);
             window.focus(&view.focus_handle(cx));
             cx.activate(true);
         });

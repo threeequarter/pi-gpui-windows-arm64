@@ -1740,6 +1740,13 @@ impl Render for TextInput {
         } else {
             (15., 12., 9., 18.)
         };
+        // Fields inside the interface follow its size; the composer keeps its own.
+        let scale = if self.single_line || self.compact {
+            crate::settings::Settings::get(cx).ui_scale()
+        } else {
+            1.
+        };
+        let (text_size, line_height) = (text_size * scale, (line_height * scale).round());
         let preview = self.render_chip_preview(cx);
         div()
             .id("text-input")

@@ -4,6 +4,7 @@ use gpui::{
 
 use super::label::{Label, LabelSize};
 use super::theme::{ActiveTheme as _, Color};
+use crate::settings::ui_px;
 
 const ROW_HEIGHT: f32 = 28.;
 const INDENT_WIDTH: f32 = 14.;
@@ -99,7 +100,7 @@ impl RenderOnce for ListItem {
             .items_center()
             .gap(px(6.))
             .w_full()
-            .h(px(ROW_HEIGHT))
+            .h(ui_px(cx, ROW_HEIGHT))
             .pl(px(6. + self.indent_level as f32 * INDENT_WIDTH))
             .pr(px(4.))
             .rounded(px(5.))

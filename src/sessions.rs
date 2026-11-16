@@ -24,6 +24,8 @@ pub struct SessionSummary {
     pub path: PathBuf,
     pub title: String,
     pub modified: SystemTime,
+    /// The session this one was forked from (the header's `parentSession`).
+    pub parent: Option<PathBuf>,
 }
 
 /// The most recently modified sessions whose header `cwd` is `workspace`.
@@ -57,11 +59,12 @@ pub fn list_sessions(workspace: &Path, limit: usize) -> Vec<SessionSummary> {
     candidates
         .into_iter()
         .filter_map(|(path, modified)| {
-            let title = read_title(&path, workspace)?;
+            let (title, parent) = read_title(&path, workspace)?;
             Some(SessionSummary {
                 path,
                 title,
                 modified,
+                parent,
             })
         })
         .take(limit)
@@ -110,9 +113,10 @@ fn encode_workspace(workspace: &Path) -> String {
     format!("--{}--", trimmed.replace(['/', '\\', ':'], "-"))
 }
 
-/// Session name if one was set, otherwise the first user message. Only lines
-/// that can matter are parsed as JSON, so large sessions stay cheap to scan.
-fn read_title(path: &Path, workspace: &Path) -> Option<String> {
+/// Session name if one was set, otherwise the first user message, and the
+/// parent session of a fork. Only lines that can matter are parsed as JSON,
+/// so large sessions stay cheap to scan.
+fn read_title(path: &Path, workspace: &Path) -> Option<(String, Option<PathBuf>)> {
     let mut reader = BufReader::new(File::open(path).ok()?);
     let mut line = Vec::new();
 
@@ -121,6 +125,10 @@ fn read_title(path: &Path, workspace: &Path) -> Option<String> {
     if header["type"] != "session" || !same_directory(header["cwd"].as_str()?, workspace) {
         return None;
     }
+    let parent = header["parentSession"]
+        .as_str()
+        .filter(|parent| !parent.is_empty())
+        .map(PathBuf::from);
 
     let mut first_user_text: Option<String> = None;
     let mut session_name: Option<String> = None;
@@ -152,9 +160,9 @@ fn read_title(path: &Path, workspace: &Path) -> Option<String> {
     }
 
     let title = session_name.or(first_user_text)?;
-    Some(one_line(
-        &crate::attachments::display_text(&title),
-        TITLE_MAX_CHARS,
+    Some((
+        one_line(&crate::attachments::display_text(&title), TITLE_MAX_CHARS),
+        parent,
     ))
 }
 
@@ -340,15 +348,15 @@ mod tests {
         let mut file = File::create(&session).expect("session file");
         writeln!(
             file,
-            r#"{{"type":"session","version":3,"id":"x","cwd":"{}"}}"#,
-            workspace.display()
+            r#"{{"type":"session","version":3,"id":"x","cwd":{}}}"#,
+            serde_json::to_string(&workspace).expect("json")
         )
         .expect("write");
         writeln!(file, r#"{{"type":"message","id":"a","message":{{"role":"user","content":"  \nFirst question\nsecond line"}}}}"#).expect("write");
         drop(file);
         assert_eq!(
-            read_title(&session, &workspace).as_deref(),
-            Some("First question")
+            read_title(&session, &workspace),
+            Some(("First question".to_string(), None))
         );
 
         let mut file = fs::OpenOptions::new()
@@ -362,8 +370,26 @@ mod tests {
         .expect("write");
         drop(file);
         assert_eq!(
-            read_title(&session, &workspace).as_deref(),
+            read_title(&session, &workspace)
+                .map(|(title, _)| title)
+                .as_deref(),
             Some("Refactoring")
+        );
+
+        let fork = workspace.join("fork.jsonl");
+        let mut file = File::create(&fork).expect("fork file");
+        writeln!(
+            file,
+            r#"{{"type":"session","version":3,"id":"y","cwd":{},"parentSession":{}}}"#,
+            serde_json::to_string(&workspace).expect("json"),
+            serde_json::to_string(&session).expect("json")
+        )
+        .expect("write");
+        writeln!(file, r#"{{"type":"session_info","id":"c","name":"Fork"}}"#).expect("write");
+        drop(file);
+        assert_eq!(
+            read_title(&fork, &workspace),
+            Some(("Fork".to_string(), Some(session.clone())))
         );
 
         assert_eq!(read_title(&session, Path::new("/elsewhere")), None);

@@ -206,7 +206,7 @@ impl SelectableText {
         }
         let (font_size, line_height) = match (self.text_size, self.size) {
             (Some(text_size), _) => text_size,
-            (None, Some(size)) => (size.pixels(), size.line_height()),
+            (None, Some(size)) => (size.pixels(cx), size.line_height(cx)),
             (None, None) => (
                 style.font_size.to_pixels(window.rem_size()),
                 window.line_height(),

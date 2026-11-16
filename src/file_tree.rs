@@ -15,6 +15,7 @@ use gpui::{
 
 use crate::diff::FileStatus;
 use crate::platform::ConsoleWindow as _;
+use crate::settings::ui_px;
 use crate::ui::prelude::*;
 
 actions!(
@@ -47,6 +48,8 @@ pub fn bind_keys(cx: &mut gpui::App) {
 pub enum FilesEvent {
     /// "Add to message": a path relative to the project.
     InsertPath(String),
+    /// A file clicked: the path, and the same relative to the project.
+    OpenPath(PathBuf, String),
 }
 
 #[derive(Clone)]
@@ -352,7 +355,8 @@ impl FilesPanel {
             let expanded = self.expanded.contains(&entry.path);
             self.set_expanded(entry.path, !expanded, cx);
         } else {
-            crate::hub::open_in_editor(&entry.path);
+            let relative = self.relative_path(&entry.path);
+            cx.emit(FilesEvent::OpenPath(entry.path, relative));
         }
     }
 
@@ -368,10 +372,15 @@ impl FilesPanel {
         if entry.is_dir {
             let expanded = self.expanded.contains(&entry.path);
             self.set_expanded(entry.path.clone(), !expanded, cx);
-        } else if event.click_count() >= 2 {
-            crate::hub::open_in_editor(&entry.path);
+        } else if event.click_count() == 1 {
+            let relative = self.relative_path(&entry.path);
+            cx.emit(FilesEvent::OpenPath(entry.path.clone(), relative));
         }
         cx.notify();
+    }
+
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus_handle.clone()
     }
 
     fn relative_path(&self, path: &Path) -> String {
@@ -430,7 +439,7 @@ impl FilesPanel {
                 Some(
                     h_flex()
                         .id(("file-row", index))
-                        .h(px(ROW_HEIGHT))
+                        .h(ui_px(cx, ROW_HEIGHT))
                         .pl(px(8. + row.depth as f32 * INDENT))
                         .pr(px(8.))
                         .gap(px(4.))
@@ -489,7 +498,7 @@ impl FilesPanel {
         let item = |id: &'static str, icon: IconName, label: &'static str| {
             h_flex()
                 .id(id)
-                .h(px(28.))
+                .h(ui_px(cx, 28.))
                 .px(px(8.))
                 .gap(px(8.))
                 .rounded(px(5.))
@@ -621,7 +630,7 @@ impl Render for FilesPanel {
                 .unwrap_or_else(|| workspace.display().to_string());
             h_flex()
                 .flex_none()
-                .h(px(30.))
+                .h(ui_px(cx, 30.))
                 .pl(px(12.))
                 .pr(px(6.))
                 .gap(px(6.))

@@ -21,7 +21,7 @@ impl ChatView {
             let active = position == highlighted;
             h_flex()
                 .id(("slash-command", index))
-                .h(px(30.))
+                .h(ui_px(cx, 30.))
                 .px(px(10.))
                 .gap(px(8.))
                 .rounded(px(5.))
@@ -170,8 +170,8 @@ impl ChatView {
                 )
                 .child(
                     div()
-                        .text_size(px(13.))
-                        .line_height(px(19.))
+                        .text_size(px(13.) * crate::settings::Settings::get(cx).ui_scale())
+                        .line_height(ui_px(cx, 19.))
                         .text_color(colors.text)
                         .child(truncate_chars(text, 3_000)),
                 )

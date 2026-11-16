@@ -146,7 +146,7 @@ impl ButtonLike {
     fn render(self, children: Vec<gpui::AnyElement>, cx: &App) -> impl IntoElement + use<> {
         let colors = self.style.colors(cx);
         let theme = &cx.theme().colors;
-        let height = self.size.height();
+        let height = crate::settings::ui_px(cx, f32::from(self.size.height()));
         let interactive = !self.disabled && !self.loading;
         let background = if self.selected {
             theme.element_selected

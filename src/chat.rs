@@ -35,6 +35,7 @@ use crate::pi::{self, Installation};
 use crate::plugins::{self, CommandContext, PluginEvent, PluginRegistry};
 use crate::selectable::{SelectableText, TextSelection};
 use crate::sessions;
+use crate::settings::ui_px;
 use crate::text_input::{self, TextInput};
 use crate::ui::AnimationTicker;
 use crate::ui::prelude::*;
@@ -70,6 +71,7 @@ actions!(
         DialogCancel,
         ReleasePluginView,
         PromptCancel,
+        CancelEdit,
     ]
 );
 
@@ -77,6 +79,7 @@ const KEY_CONTEXT: &str = "Chat";
 const MODEL_PICKER_CONTEXT: &str = "ModelPicker";
 const TREE_CONTEXT: &str = "SessionTree";
 const SLASH_CONTEXT: &str = "SlashMenu";
+const EDIT_CONTEXT: &str = "MessageEdit";
 const COMPOSER_PLACEHOLDER: &str = "Message pi…";
 /// Ignore the chip click that arrives right after a click outside closed the picker.
 const PICKER_REOPEN_GUARD: Duration = Duration::from_millis(250);
@@ -96,6 +99,7 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("enter", Submit, Some(text_input::KEY_CONTEXT)),
         KeyBinding::new("escape", CancelRun, Some(KEY_CONTEXT)),
+        KeyBinding::new("escape", CancelEdit, Some(EDIT_CONTEXT)),
         KeyBinding::new(
             &crate::keys::binding("cmd-shift-m"),
             ToggleModelPicker,
@@ -363,11 +367,20 @@ enum Forking {
         /// Position among user messages, counted from the last one.
         from_end: usize,
         text: String,
-        /// Put the message back in the composer (a fork from that message).
-        edit: bool,
+        then: AfterFork,
     },
     /// `fork` or `clone` was sent.
-    Switching { edit: bool },
+    Switching { then: AfterFork },
+}
+
+/// What happens once the fork runs.
+enum AfterFork {
+    /// The composer is cleared.
+    Clear,
+    /// The message the fork started from returns to the composer (pi's `/fork`).
+    Compose,
+    /// An edited message is sent in the new session.
+    Send(String),
 }
 
 pub struct ChatView {
@@ -393,6 +406,10 @@ pub struct ChatView {
     /// `set_model` was sent and not answered yet.
     switching_model: bool,
     forking: Option<Forking>,
+    /// A user message being edited in place: its row and the field.
+    editing: Option<(usize, Entity<TextInput>)>,
+    /// An edited message to send once the fork's transcript is loaded.
+    send_after_reload: Option<String>,
     /// The session switched to a fork; the sidebar should reload its list.
     forked: bool,
     /// Built-in commands plus pi's (`get_commands`).
@@ -529,6 +546,8 @@ impl ChatView {
             connection: Connection::Failed(String::new()),
             loading_history: false,
             forking: None,
+            editing: None,
+            send_after_reload: None,
             forked: false,
             slash_commands: slash::builtin(),
             slash_highlight: 0,
@@ -670,6 +689,8 @@ impl ChatView {
         self.pending_prompt = false;
         self.switching_model = false;
         self.forking = None;
+        self.editing = None;
+        self.send_after_reload = None;
         self.forked = false;
         self.compacting = false;
         self.navigating = None;
@@ -781,6 +802,14 @@ impl ChatView {
             }
         }
 
+        if self.send_prompt(message, cx) {
+            self.composer.update(cx, |composer, cx| composer.clear(cx));
+        }
+        cx.notify();
+    }
+
+    /// Sends a user message (steering while pi runs) and shows it.
+    fn send_prompt(&mut self, message: &str, cx: &mut Context<Self>) -> bool {
         let steering = self.running;
         let mut command = json!({ "type": "prompt", "message": message });
         if steering {
@@ -800,17 +829,17 @@ impl ChatView {
                         .collect(),
                 });
                 self.pending_prompt = true;
-                self.composer.update(cx, |composer, cx| composer.clear(cx));
                 // Sending is an explicit "show me the latest": re-enter follow mode.
                 self.list_state.reset(self.rows.len());
                 cx.emit(ChatEvent::Changed);
+                true
             }
             Err(error) => {
                 self.push_notice(Tone::Error, error);
                 self.sync_list(previous_len, Vec::new());
+                false
             }
         }
-        cx.notify();
     }
 
     fn cancel_run(&mut self, _: &CancelRun, _window: &mut Window, cx: &mut Context<Self>) {
@@ -892,6 +921,14 @@ impl ChatView {
             "agent_start" => {
                 self.running = true;
                 self.pending_prompt = false;
+            }
+            // A rename by pi itself or an extension (`pi.setSessionName`).
+            "session_info_changed" => {
+                self.session_name = record["name"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string);
             }
             "agent_settled" => {
                 self.running = false;
@@ -1097,7 +1134,12 @@ impl ChatView {
             .is_some_and(|(id, _)| record["id"].as_str() == Some(id.as_str()));
         if record["success"].as_bool() == Some(false) {
             if matches!(command, "get_fork_messages" | "fork" | "clone") {
-                self.forking = None;
+                self.abandon_fork(cx);
+            }
+            if command == "get_messages"
+                && let Some(message) = self.send_after_reload.take()
+            {
+                self.restore_edit(AfterFork::Send(message), cx);
             }
             if is_navigation {
                 self.navigating = None;
@@ -1138,6 +1180,9 @@ impl ChatView {
                 self.rows = rows;
                 self.needs_list_reset = true;
                 self.request_stats();
+                if let Some(message) = self.send_after_reload.take() {
+                    self.send_prompt(&message, cx);
+                }
             }
             "get_available_models" => {
                 let mut models: Vec<ModelInfo> = data["models"]
@@ -1172,7 +1217,7 @@ impl ChatView {
                     .collect();
             }
             "set_thinking_level" => self.send_all([json!({ "type": "get_state" })]),
-            "get_fork_messages" => self.continue_fork(data),
+            "get_fork_messages" => self.continue_fork(data, cx),
             "fork" | "clone" => self.finish_fork(data, cx),
             "prompt" if is_navigation => {
                 if let Some((_, text)) = self.navigating.take() {
@@ -1401,7 +1446,9 @@ impl ChatView {
             "tree" | "fork" => self.open_tree(window, cx),
             "clone" => {
                 if self.can_fork() {
-                    self.forking = Some(Forking::Switching { edit: false });
+                    self.forking = Some(Forking::Switching {
+                        then: AfterFork::Clear,
+                    });
                     if let Err(error) = self.send(json!({ "type": "clone" })) {
                         self.forking = None;
                         self.push_notice(Tone::Error, error);
@@ -1539,6 +1586,7 @@ impl ChatView {
         self.loading_history = true;
         self.needs_list_reset = true;
         self.forked = true;
+        self.editing = None;
         self.send_all([
             json!({ "type": "get_state" }),
             json!({ "type": "get_messages" }),
@@ -1716,7 +1764,9 @@ impl ChatView {
         if line.kind != tree::NodeKind::User || !self.can_fork() {
             return;
         }
-        self.forking = Some(Forking::Switching { edit: true });
+        self.forking = Some(Forking::Switching {
+            then: AfterFork::Compose,
+        });
         if let Err(error) = self.send(json!({ "type": "fork", "entryId": line.id })) {
             self.forking = None;
             let previous_len = self.rows.len();
@@ -1739,8 +1789,9 @@ impl ChatView {
     /// Starts a fork at `row`: from a user message, the new session ends just
     /// before it and the message returns to the composer, like pi's `/fork`.
     /// From any other item, the new session keeps everything up to the end of
-    /// that item's turn.
-    fn fork_from_row(&mut self, row: usize, cx: &mut Context<Self>) {
+    /// that item's turn. With `send`, a user message is replaced by that
+    /// text, sent in the new session.
+    fn fork_from_row(&mut self, row: usize, send: Option<String>, cx: &mut Context<Self>) {
         if !self.can_fork() {
             return;
         }
@@ -1762,21 +1813,28 @@ impl ChatView {
                     return;
                 };
                 let position = user_rows.iter().position(|index| *index == target);
+                let then = match (edit, send) {
+                    (true, Some(message)) => AfterFork::Send(message),
+                    (true, None) => AfterFork::Compose,
+                    (false, _) => AfterFork::Clear,
+                };
                 self.forking = Some(Forking::Resolving {
                     from_end: user_rows.len() - 1 - position.unwrap_or_default(),
                     text: text.to_string(),
-                    edit,
+                    then,
                 });
                 json!({ "type": "get_fork_messages" })
             }
             // The last turn: the fork is a copy of the whole branch.
             None => {
-                self.forking = Some(Forking::Switching { edit: false });
+                self.forking = Some(Forking::Switching {
+                    then: AfterFork::Clear,
+                });
                 json!({ "type": "clone" })
             }
         };
         if let Err(error) = self.send(command) {
-            self.forking = None;
+            self.abandon_fork(cx);
             let previous_len = self.rows.len();
             self.push_notice(Tone::Error, error);
             self.sync_list(previous_len, Vec::new());
@@ -1784,14 +1842,39 @@ impl ChatView {
         cx.notify();
     }
 
+    /// A fork that did not happen: an edited message goes back to the
+    /// composer, so the text is not lost.
+    fn abandon_fork(&mut self, cx: &mut Context<Self>) {
+        if let Some(Forking::Resolving { then, .. } | Forking::Switching { then }) =
+            self.forking.take()
+        {
+            self.restore_edit(then, cx);
+        }
+    }
+
+    fn restore_edit(&mut self, then: AfterFork, cx: &mut Context<Self>) {
+        let AfterFork::Send(message) = then else {
+            return;
+        };
+        self.composer.update(cx, |composer, cx| {
+            let draft = composer.text();
+            let text = if draft.trim().is_empty() {
+                message
+            } else {
+                format!("{draft}\n\n{message}")
+            };
+            composer.set_text(text, cx);
+        });
+    }
+
     /// Maps the chosen user row to pi's entry id and sends `fork`. Rows are
     /// matched from the end (history before a compaction is not in the
     /// transcript) and checked by text.
-    fn continue_fork(&mut self, data: &Value) {
+    fn continue_fork(&mut self, data: &Value, cx: &mut Context<Self>) {
         let Some(Forking::Resolving {
             from_end,
             text,
-            edit,
+            then,
         }) = self.forking.take()
         else {
             return;
@@ -1821,18 +1904,19 @@ impl ChatView {
                 Tone::Error,
                 "Could not fork: pi does not list this message as a fork point.".to_string(),
             );
+            self.restore_edit(then, cx);
             return;
         };
-        self.forking = Some(Forking::Switching { edit });
+        self.forking = Some(Forking::Switching { then });
         if let Err(error) = self.send(json!({ "type": "fork", "entryId": entry })) {
-            self.forking = None;
+            self.abandon_fork(cx);
             self.push_notice(Tone::Error, error);
         }
     }
 
     /// pi now runs the new session: reload its transcript and state.
     fn finish_fork(&mut self, data: &Value, cx: &mut Context<Self>) {
-        let Some(Forking::Switching { edit }) = self.forking.take() else {
+        let Some(Forking::Switching { then }) = self.forking.take() else {
             return;
         };
         if data["cancelled"].as_bool() == Some(true) {
@@ -1840,17 +1924,78 @@ impl ChatView {
                 Tone::Warning,
                 "An extension cancelled the fork.".to_string(),
             );
+            self.restore_edit(then, cx);
             return;
         }
         let text = data["text"].as_str().unwrap_or_default().to_string();
-        self.composer.update(cx, |composer, cx| {
-            if edit && !text.is_empty() {
-                composer.set_text(text, cx);
-            } else {
-                composer.clear(cx);
+        match then {
+            // The composer keeps its draft.
+            AfterFork::Send(message) => self.send_after_reload = Some(message),
+            AfterFork::Compose if !text.is_empty() => {
+                self.composer
+                    .update(cx, |composer, cx| composer.set_text(text, cx));
             }
-        });
+            AfterFork::Compose | AfterFork::Clear => {
+                self.composer.update(cx, |composer, cx| composer.clear(cx));
+            }
+        }
         self.reload_transcript(cx);
+    }
+
+    /// Opens a user message for editing; sending it forks the session there.
+    fn start_edit(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Row::User { text, .. }) = self.rows.get(row) else {
+            return;
+        };
+        if !self.can_fork() {
+            return;
+        }
+        let text = text.clone();
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new("Message", cx).with_attachments();
+            input.set_text(text, cx);
+            input
+        });
+        window.focus(&input.read(cx).focus_handle(cx));
+        let previous = self
+            .editing
+            .replace((row, input))
+            .map(|(previous, _)| previous);
+        for row in previous.into_iter().chain([row]) {
+            self.list_state.splice(row..row + 1, 1);
+        }
+        cx.notify();
+    }
+
+    fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((row, _)) = self.editing.take() {
+            self.list_state.splice(row..row + 1, 1);
+            window.focus(&self.composer.read(cx).focus_handle(cx));
+            cx.notify();
+        }
+    }
+
+    /// Forks before the edited message and sends the new text there.
+    fn commit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((row, input)) = &self.editing else {
+            return;
+        };
+        let (row, message) = (*row, input.read(cx).submit_text().trim().to_string());
+        if message.is_empty() {
+            return;
+        }
+        if !self.can_fork() {
+            let previous_len = self.rows.len();
+            self.push_notice(
+                Tone::Info,
+                "Wait until pi is idle, then send the edit.".into(),
+            );
+            self.sync_list(previous_len, Vec::new());
+            cx.notify();
+            return;
+        }
+        self.cancel_edit(window, cx);
+        self.fork_from_row(row, Some(message), cx);
     }
 
     fn toggle_thought(&mut self, row: usize, thought: usize, cx: &mut Context<Self>) {
@@ -2287,18 +2432,83 @@ impl ChatView {
                     )
                 })
                 .child(
-                    div()
-                        .px(px(12.))
-                        .py(px(8.))
-                        .rounded(px(8.))
-                        .border_1()
-                        .border_color(colors.border)
-                        .bg(colors.panel_background)
-                        .child(SelectableText::new(
-                            key("user"),
-                            attachments::display_text(text),
-                            &self.selection,
-                        )),
+                    match self.editing.as_ref().filter(|(row, _)| *row == index) {
+                        Some((_, input)) => v_flex()
+                            .key_context(EDIT_CONTEXT)
+                            .on_action(cx.listener(|this, _: &Submit, window, cx| {
+                                this.commit_edit(window, cx)
+                            }))
+                            .on_action(cx.listener(|this, _: &CancelEdit, window, cx| {
+                                this.cancel_edit(window, cx)
+                            }))
+                            .gap(px(6.))
+                            .px(px(12.))
+                            .py(px(8.))
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(colors.border_focused)
+                            .bg(colors.panel_background)
+                            .child(input.clone())
+                            .child(
+                                h_flex()
+                                    .justify_end()
+                                    .gap(px(4.))
+                                    .child(
+                                        Button::new("edit-cancel", "Cancel")
+                                            .size(ButtonSize::Compact)
+                                            .tooltip(Tooltip::with_keys("Cancel", "Esc"))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.cancel_edit(window, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("edit-send", "Send")
+                                            .size(ButtonSize::Compact)
+                                            .style(ButtonStyle::Tinted(TintColor::Accent))
+                                            .tooltip(Tooltip::with_keys(
+                                                "Send in a fork of this session",
+                                                "Enter",
+                                            ))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.commit_edit(window, cx)
+                                            })),
+                                    ),
+                            ),
+                        None => h_flex()
+                            .items_start()
+                            .gap(px(4.))
+                            .pl(px(12.))
+                            .pr(px(4.))
+                            .py(px(8.))
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.panel_background)
+                            .child(div().flex_1().min_w(px(0.)).child(SelectableText::new(
+                                key("user"),
+                                attachments::display_text(text),
+                                &self.selection,
+                            )))
+                            .when(self.can_fork(), |this| {
+                                this.child(
+                                    div()
+                                        .my(px(-2.))
+                                        .opacity(0.)
+                                        .group_hover(ROW_GROUP, |style| style.opacity(1.))
+                                        .child(
+                                            IconButton::new(("edit", index), IconName::Pencil)
+                                                .size(ButtonSize::Compact)
+                                                .icon_size(IconSize::XSmall)
+                                                .tooltip(Tooltip::text("Edit and send in a fork"))
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.start_edit(index, window, cx)
+                                                    },
+                                                )),
+                                        ),
+                                )
+                            }),
+                    },
                 )
                 .when(!images.is_empty(), |this| {
                     this.child(thumbnails(index, images, &colors))
@@ -2378,6 +2588,7 @@ impl ChatView {
                     .map(|call_id| self.render_plugin_view(call_id, name, cx));
                 let plugin_prompt = self.render_plugin_prompt(index, window, cx);
                 let has_details = !output.is_empty() || !images.is_empty();
+                let (code_size, code_line) = crate::settings::Settings::get(cx).dense_code_size();
                 let running = *status == ToolStatus::Running;
                 // Output streams in open, unless the user closed this row.
                 let open = expanded.unwrap_or(default_open || (running && !output.is_empty()))
@@ -2409,7 +2620,7 @@ impl ChatView {
                     .child(
                         h_flex()
                             .gap(px(6.))
-                            .h(px(28.))
+                            .h(ui_px(cx, 28.))
                             .pl(px(8.))
                             .pr(px(4.))
                             .bg(colors.panel_background)
@@ -2462,7 +2673,7 @@ impl ChatView {
                                         SharedString::from(output.clone()),
                                         &self.selection,
                                     )
-                                    .size(LabelSize::XSmall)
+                                    .text_size(px(code_size), px(code_line))
                                     .color(Color::Muted)
                                     .monospace(),
                                 )
@@ -2680,7 +2891,7 @@ impl ChatView {
                                         .icon_size(IconSize::XSmall)
                                         .tooltip(Tooltip::text(fork_tooltip))
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.fork_from_row(index, cx)
+                                            this.fork_from_row(index, None, cx)
                                         })),
                                 ),
                         )
@@ -2726,7 +2937,7 @@ impl ChatView {
             .child(
                 h_flex()
                     .gap(px(6.))
-                    .h(px(28.))
+                    .h(ui_px(cx, 28.))
                     .pl(px(8.))
                     .pr(px(4.))
                     .bg(colors.panel_background)
@@ -2817,6 +3028,8 @@ impl ChatView {
             h_flex()
                 .items_start()
                 .gap(px(4.))
+                // The tool card's border and right padding, so the chevrons line up.
+                .pr(px(5.))
                 .child(div().flex_1().min_w(px(0.)).py(px(2.)).child(content))
                 .when(expandable, |this| {
                     this.child(disclosure_button(
@@ -3005,7 +3218,7 @@ impl ChatView {
         let chip = h_flex()
             .id("model-chip")
             .gap(px(4.))
-            .h(px(22.))
+            .h(ui_px(cx, 22.))
             .px(px(6.))
             .min_w(px(0.))
             .rounded(px(5.))
@@ -3072,7 +3285,7 @@ impl ChatView {
 
         // Fixed height, so the list does not jump when activity appears.
         let activity_line = h_flex()
-            .h(px(22.))
+            .h(ui_px(cx, 22.))
             .gap(px(6.))
             .when_some(self.activity(), |this, activity| {
                 this.child(Spinner::new().size(IconSize::XSmall).color(Color::Accent))

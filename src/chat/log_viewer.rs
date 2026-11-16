@@ -227,9 +227,9 @@ impl ChatView {
                 )
                 .into_any_element()
         } else {
-            let font = crate::settings::Settings::get(cx)
-                .buffer_font_family
-                .clone();
+            let settings = crate::settings::Settings::get(cx);
+            let font = settings.buffer_font_family.clone();
+            let (code_size, code_line) = settings.dense_code_size();
             list(
                 viewer.list.clone(),
                 cx.processor(move |this, index: usize, _, _| {
@@ -252,7 +252,7 @@ impl ChatView {
                                 },
                                 &this.selection,
                             )
-                            .size(LabelSize::XSmall)
+                            .text_size(px(code_size), px(code_line))
                             .monospace(),
                         )
                         .into_any_element()
