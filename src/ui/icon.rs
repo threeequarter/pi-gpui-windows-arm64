@@ -74,6 +74,8 @@ icons! {
     Refresh => "refresh",
     Restore => "restore",
     Sparkle => "sparkle",
+    Star => "star",
+    StarFilled => "star_filled",
     Stop => "stop",
     Terminal => "terminal",
     Tool => "tool",

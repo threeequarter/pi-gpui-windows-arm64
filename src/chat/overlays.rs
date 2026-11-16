@@ -426,6 +426,35 @@ fn hint(keys: &'static str, label: &'static str) -> AnyElement {
 }
 
 impl ChatView {
+    /// Session token totals and the last turn's cache hit rate, as in pi's
+    /// terminal footer.
+    pub(super) fn render_session_stats(&self) -> Option<AnyElement> {
+        let stats = self.usage_stats.as_ref()?;
+        let last_turn = self
+            .usage_extra
+            .as_ref()
+            .and_then(|extra| extra.last_turn.as_ref());
+        let summary = usage::session_summary(stats, last_turn);
+        (!summary.is_empty()).then(|| {
+            div()
+                .id("session-stats")
+                .min_w(px(0.))
+                // The model chip already pads its side; this evens the gaps.
+                .pr(px(4.))
+                .tooltip(Tooltip::text(
+                    "↑ input, ↓ output, R cache read, W cache write: session totals. \
+                     CH: share of the last prompt served from the cache.",
+                ))
+                .child(
+                    Label::new(summary)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+                .into_any_element()
+        })
+    }
+
     /// A small ring filled to the share of the context window in use; a click
     /// opens the usage popover.
     pub(super) fn render_usage_ring(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

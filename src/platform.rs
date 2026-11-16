@@ -381,6 +381,80 @@ pub fn open_in_editor(path: &std::path::Path) {
     }
 }
 
+/// Opens the system's terminal in `directory`: Windows Terminal (its default
+/// profile) or a console with the command shell on Windows, Terminal on
+/// macOS, and on Linux the first terminal found, starting with the desktop's
+/// choice (`xdg-terminal-exec`, `$TERMINAL`, Debian's `x-terminal-emulator`).
+pub fn open_terminal(directory: &std::path::Path) {
+    use std::process::Command;
+
+    let result = if cfg!(target_os = "macos") {
+        Command::new("open")
+            .args(["-a", "Terminal"])
+            .arg(directory)
+            .spawn()
+            .map(drop)
+    } else if cfg!(windows) {
+        Command::new("wt")
+            .arg("-d")
+            .arg(directory)
+            .spawn()
+            .or_else(|_| {
+                let shell = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
+                let mut command = Command::new(shell);
+                command.current_dir(directory);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt as _;
+                    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+                    command.creation_flags(CREATE_NEW_CONSOLE);
+                }
+                command.spawn()
+            })
+            .map(drop)
+    } else {
+        // Terminals open in the working directory they are started in.
+        let preferred = std::env::var("TERMINAL")
+            .ok()
+            .filter(|name| !name.is_empty());
+        let candidates = ["xdg-terminal-exec"]
+            .into_iter()
+            .map(str::to_string)
+            .chain(preferred)
+            .chain(
+                [
+                    "x-terminal-emulator",
+                    "gnome-terminal",
+                    "konsole",
+                    "xfce4-terminal",
+                    "kitty",
+                    "alacritty",
+                    "wezterm",
+                    "foot",
+                    "xterm",
+                ]
+                .map(str::to_string),
+            );
+        let mut result = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        for program in candidates {
+            result = Command::new(&program)
+                .current_dir(directory)
+                .spawn()
+                .map(drop);
+            if result.is_ok() {
+                break;
+            }
+        }
+        result
+    };
+    if let Err(error) = result {
+        eprintln!(
+            "pi-gpui: could not open a terminal in {}: {error}",
+            directory.display()
+        );
+    }
+}
+
 fn on_path(program: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|directory| {

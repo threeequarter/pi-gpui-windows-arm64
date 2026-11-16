@@ -119,12 +119,6 @@ pub struct Installation {
     pub version: Version,
 }
 
-impl Installation {
-    pub fn is_untested(&self) -> bool {
-        is_untested(self.version)
-    }
-}
-
 #[derive(Clone, Debug)]
 pub enum CheckError {
     NotFound,

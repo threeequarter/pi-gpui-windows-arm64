@@ -1,22 +1,25 @@
-//! A read-only view of one project file over the whole window, opened from
-//! the Files panel: markdown rendered, other text with syntax colors and
-//! line numbers, binary files only named.
+//! A read-only view of one project file in its own window, opened from the
+//! Files panel: markdown rendered, other text with syntax colors and line
+//! numbers, binary files only named.
 
 use std::io::Read as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyElement, Bounds, ClipboardItem, Context, CursorStyle, Entity, EventEmitter, FocusHandle,
-    FontWeight, Hsla, KeyBinding, ListAlignment, ListState, MouseButton, MouseDownEvent,
-    MouseMoveEvent, Pixels, Point, ScrollHandle, ScrollWheelEvent, SharedString, Size,
-    Subscription, Task, Window, actions, canvas, div, list, point, px, relative, size,
+    AnyElement, ClipboardItem, Context, Corners, Entity, FocusHandle, FontWeight, Hsla, KeyBinding,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, ScrollHandle,
+    ScrollWheelEvent, SharedString, Subscription, Task, Window, WindowControlArea, actions, div,
+    list, point, px,
 };
 
+use crate::hub::{TITLE_BAR_HEIGHT, TRAFFIC_LIGHT_PADDING, render_window_controls};
 use crate::markdown::{self, Node};
+use crate::platform;
 use crate::selectable::{SelectableText, SpanStyle, TextSelection};
 use crate::settings::Settings;
 use crate::ui::prelude::*;
+use crate::ui::scrollbar::{ScrollDrag, thumb_height};
 use crate::ui::{SyntaxColors, Tooltip};
 
 actions!(file_viewer, [Close, CopySelection]);
@@ -29,9 +32,6 @@ const MAX_BYTES: usize = 2 << 20;
 const MAX_MARKDOWN_BYTES: usize = 300 << 10;
 /// A NUL byte in this many leading bytes marks a binary file.
 const BINARY_PROBE_BYTES: usize = 8 << 10;
-/// The card cannot be resized below this.
-const MIN_WIDTH: Pixels = px(360.);
-const MIN_HEIGHT: Pixels = px(160.);
 
 pub fn bind_keys(cx: &mut gpui::App) {
     cx.bind_keys([
@@ -48,10 +48,6 @@ pub fn bind_keys(cx: &mut gpui::App) {
         CopySelection,
         Some(KEY_CONTEXT),
     )]);
-}
-
-pub enum FileViewerEvent {
-    Closed,
 }
 
 enum Content {
@@ -76,44 +72,6 @@ struct Loaded {
     markdown_as_text: bool,
 }
 
-/// A scrollbar thumb drag in progress.
-#[derive(Clone, Copy)]
-struct ScrollDrag {
-    mouse_y: Pixels,
-    scroll: Pixels,
-    content: Pixels,
-    track: Pixels,
-}
-
-/// The card edges a frame drag moves; none of them moves the whole card.
-#[derive(Clone, Copy, Default)]
-struct Edges {
-    left: bool,
-    right: bool,
-    top: bool,
-    bottom: bool,
-}
-
-impl Edges {
-    fn cursor(self) -> CursorStyle {
-        match (self.left || self.right, self.top || self.bottom) {
-            (true, false) => CursorStyle::ResizeLeftRight,
-            (false, true) => CursorStyle::ResizeUpDown,
-            (true, true) if self.left == self.top => CursorStyle::ResizeUpLeftDownRight,
-            (true, true) => CursorStyle::ResizeUpRightDownLeft,
-            (false, false) => CursorStyle::Arrow,
-        }
-    }
-}
-
-/// A move or resize of the card in progress.
-#[derive(Clone, Copy)]
-struct FrameDrag {
-    edges: Edges,
-    mouse: Point<Pixels>,
-    start: Bounds<Pixels>,
-}
-
 pub struct FileViewer {
     path: PathBuf,
     title: String,
@@ -124,13 +82,7 @@ pub struct FileViewer {
     list: ListState,
     markdown_scroll: ScrollHandle,
     scroll_drag: Option<ScrollDrag>,
-    /// The card position and size within the overlay once moved or
-    /// resized; centered at its default size before that.
-    frame: Option<Bounds<Pixels>>,
-    frame_drag: Option<FrameDrag>,
-    /// The overlay and the card as last laid out, in window coordinates.
-    area: Bounds<Pixels>,
-    card: Bounds<Pixels>,
+    title_bar_drag_pending: bool,
     selection: Entity<TextSelection>,
     focus: FocusHandle,
     focused: bool,
@@ -138,28 +90,64 @@ pub struct FileViewer {
     _load: Task<()>,
 }
 
-impl EventEmitter<FileViewerEvent> for FileViewer {}
-
 impl FileViewer {
-    /// `title` is the path shown, relative to the project; `frame` is where
-    /// the previous viewer was left, if anywhere.
-    pub fn new(
-        path: PathBuf,
-        title: String,
-        frame: Option<Bounds<Pixels>>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    /// `title` is the path shown, relative to the project.
+    pub fn new(path: PathBuf, title: String, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
-        let mut selection = TextSelection::new(focus.clone());
+        let selection = cx.new(|_| Self::selection_for(&path, focus.clone()));
+        let selection_subscription = cx.observe(&selection, |_, _, cx| cx.notify());
+        let mut this = Self {
+            path,
+            title,
+            content: Content::Loading,
+            cut: false,
+            markdown_as_text: false,
+            size: 0,
+            list: ListState::new(0, ListAlignment::Top, px(400.)),
+            markdown_scroll: ScrollHandle::new(),
+            scroll_drag: None,
+            title_bar_drag_pending: false,
+            selection,
+            focus,
+            focused: false,
+            _selection_subscription: selection_subscription,
+            _load: Task::ready(()),
+        };
+        this.start_load(cx);
+        this
+    }
+
+    /// Loads another file into the same window.
+    pub fn open(&mut self, path: PathBuf, title: String, cx: &mut Context<Self>) {
+        self.path = path;
+        self.title = title;
+        self.list = ListState::new(0, ListAlignment::Top, px(400.));
+        self.markdown_scroll = ScrollHandle::new();
+        self.scroll_drag = None;
+        // A fresh selection also clears the old one and re-points links.
+        self.selection = cx.new(|_| Self::selection_for(&self.path, self.focus.clone()));
+        self._selection_subscription = cx.observe(&self.selection, |_, _, cx| cx.notify());
+        self.start_load(cx);
+        cx.notify();
+    }
+
+    fn selection_for(path: &Path, focus: FocusHandle) -> TextSelection {
+        let mut selection = TextSelection::new(focus);
         if let Some(parent) = path.parent() {
             selection = selection.with_link_base(parent.to_path_buf());
         }
-        let selection = cx.new(|_| selection);
-        let selection_subscription = cx.observe(&selection, |_, _, cx| cx.notify());
+        selection
+    }
+
+    fn start_load(&mut self, cx: &mut Context<Self>) {
+        self.content = Content::Loading;
+        self.cut = false;
+        self.markdown_as_text = false;
+        self.size = 0;
         let syntax = cx.theme().colors.syntax;
-        let read_path = path.clone();
+        let read_path = self.path.clone();
         let read = cx.background_spawn(async move { load(&read_path, &syntax) });
-        let load_task = cx.spawn(async move |this, cx| {
+        self._load = cx.spawn(async move |this, cx| {
             let result = read.await;
             this.update(cx, |this, cx| {
                 match result {
@@ -178,157 +166,6 @@ impl FileViewer {
             })
             .ok();
         });
-        Self {
-            path,
-            title,
-            content: Content::Loading,
-            cut: false,
-            markdown_as_text: false,
-            size: 0,
-            list: ListState::new(0, ListAlignment::Top, px(400.)),
-            markdown_scroll: ScrollHandle::new(),
-            scroll_drag: None,
-            frame,
-            frame_drag: None,
-            area: Bounds::default(),
-            card: Bounds::default(),
-            selection,
-            focus,
-            focused: false,
-            _selection_subscription: selection_subscription,
-            _load: load_task,
-        }
-    }
-
-    fn close(&mut self, cx: &mut Context<Self>) {
-        cx.emit(FileViewerEvent::Closed);
-    }
-
-    /// Where the card was moved or resized to, for the next viewer.
-    pub fn frame(&self) -> Option<Bounds<Pixels>> {
-        self.frame
-    }
-
-    fn start_frame_drag(&mut self, edges: Edges, mouse: Point<Pixels>, cx: &mut Context<Self>) {
-        let start = match self.frame {
-            Some(frame) => fit(frame, self.area.size),
-            None if self.card.size.width > px(0.) => {
-                Bounds::new(self.card.origin - self.area.origin, self.card.size)
-            }
-            // Not laid out yet.
-            None => return,
-        };
-        self.frame_drag = Some(FrameDrag {
-            edges,
-            mouse,
-            start,
-        });
-        cx.notify();
-    }
-
-    fn drag_frame(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        let Some(drag) = self.frame_drag else {
-            return;
-        };
-        // Released outside the overlay: the move arrives without the button.
-        if event.pressed_button != Some(MouseButton::Left) {
-            self.frame_drag = None;
-            cx.notify();
-            return;
-        }
-        let delta = event.position - drag.mouse;
-        let area = self.area.size;
-        let start = drag.start;
-        let edges = drag.edges;
-        let frame = if !(edges.left || edges.right || edges.top || edges.bottom) {
-            fit(Bounds::new(start.origin + delta, start.size), area)
-        } else {
-            let mut left = start.left();
-            let mut right = start.right();
-            let mut top = start.top();
-            let mut bottom = start.bottom();
-            if edges.left {
-                left = (left + delta.x).clamp(px(0.), (right - MIN_WIDTH).max(px(0.)));
-            }
-            if edges.right {
-                right = (right + delta.x).clamp((left + MIN_WIDTH).min(area.width), area.width);
-            }
-            if edges.top {
-                top = (top + delta.y).clamp(px(0.), (bottom - MIN_HEIGHT).max(px(0.)));
-            }
-            if edges.bottom {
-                bottom = (bottom + delta.y).clamp((top + MIN_HEIGHT).min(area.height), area.height);
-            }
-            Bounds::new(point(left, top), size(right - left, bottom - top))
-        };
-        self.frame = Some(frame);
-        cx.notify();
-    }
-
-    fn end_frame_drag(&mut self, cx: &mut Context<Self>) {
-        if self.frame_drag.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    /// Invisible strips over the card edges and corners that resize it.
-    fn render_resize_handles(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        // Mostly outside the card, so the scrollbar keeps its whole width.
-        const OUTSIDE: Pixels = px(4.);
-        const THICKNESS: Pixels = px(6.);
-        const CORNER: Pixels = px(12.);
-        let edges = [
-            (false, false, true, false),
-            (false, false, false, true),
-            (true, false, false, false),
-            (false, true, false, false),
-            (true, false, true, false),
-            (false, true, true, false),
-            (true, false, false, true),
-            (false, true, false, true),
-        ];
-        edges
-            .into_iter()
-            .enumerate()
-            .map(|(index, (left, right, top, bottom))| {
-                let edges = Edges {
-                    left,
-                    right,
-                    top,
-                    bottom,
-                };
-                let corner = (left || right) && (top || bottom);
-                let mut handle = div().id(("file-viewer-resize", index)).absolute();
-                handle = match (left, right) {
-                    (true, _) => handle
-                        .left(-OUTSIDE)
-                        .w(if corner { CORNER } else { THICKNESS }),
-                    (_, true) => handle
-                        .right(-OUTSIDE)
-                        .w(if corner { CORNER } else { THICKNESS }),
-                    _ => handle.left(CORNER - OUTSIDE).right(CORNER - OUTSIDE),
-                };
-                handle = match (top, bottom) {
-                    (true, _) => handle
-                        .top(-OUTSIDE)
-                        .h(if corner { CORNER } else { THICKNESS }),
-                    (_, true) => handle
-                        .bottom(-OUTSIDE)
-                        .h(if corner { CORNER } else { THICKNESS }),
-                    _ => handle.top(CORNER - OUTSIDE).bottom(CORNER - OUTSIDE),
-                };
-                handle
-                    .cursor(edges.cursor())
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            this.start_frame_drag(edges, event.position, cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .into_any_element()
-            })
-            .collect()
     }
 
     fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
@@ -432,7 +269,7 @@ impl FileViewer {
         let Some(drag) = self.scroll_drag else {
             return;
         };
-        // Released outside the card: the move arrives without the button.
+        // Released outside the window: the move arrives without the button.
         if event.pressed_button != Some(MouseButton::Left) {
             self.end_drag(cx);
             return;
@@ -612,6 +449,132 @@ impl FileViewer {
             }
         }
     }
+
+    /// The file name strip doubles as the window's title bar, laid out like
+    /// the hub's: native caption drag on Windows, our own drag elsewhere.
+    fn render_title_bar(
+        &self,
+        window: &mut Window,
+        corners: Corners<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let facts = self.facts();
+        let path = self.path.clone();
+        h_flex()
+            .id("file-viewer-title-bar")
+            .flex_none()
+            .w_full()
+            .h(px(TITLE_BAR_HEIGHT))
+            .rounded_tl(corners.top_left)
+            .rounded_tr(corners.top_right)
+            .bg(if window.is_window_active() {
+                colors.title_bar_background
+            } else {
+                colors.title_bar_inactive_background
+            })
+            .border_b_1()
+            .border_color(colors.border_variant)
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, _| {
+                    this.title_bar_drag_pending = event.click_count == 1;
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.title_bar_drag_pending = false),
+            )
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, window, _| {
+                if std::mem::take(&mut this.title_bar_drag_pending) {
+                    platform::start_window_drag(window);
+                }
+            }))
+            // Double-click follows the user's macOS setting (zoom or minimize);
+            // on Linux it maximizes. On Windows the native caption consumes the
+            // double click, so it is handled on the second press below.
+            .on_click(|event, window, _| {
+                if event.click_count() >= 2 && !cfg!(windows) {
+                    if cfg!(target_os = "macos") {
+                        window.titlebar_double_click();
+                    } else {
+                        platform::toggle_maximized(window);
+                    }
+                }
+            })
+            .when(!cfg!(any(target_os = "macos", windows)), |this| {
+                this.on_mouse_down(MouseButton::Right, |event, window, _| {
+                    window.show_window_menu(event.position)
+                })
+            })
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    // The name starts right after the traffic lights, which
+                    // are hidden in full screen (and absent on Linux).
+                    .pl(px(
+                        if window.is_fullscreen() || !cfg!(target_os = "macos") {
+                            12.
+                        } else {
+                            TRAFFIC_LIGHT_PADDING
+                        },
+                    ))
+                    .pr(px(10.))
+                    .gap(px(8.))
+                    .child({
+                        let drag_area = h_flex()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .gap(px(8.))
+                            .child(
+                                Icon::new(IconName::File)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                div().flex_1().min_w(px(0.)).child(
+                                    Label::new(self.title.clone())
+                                        .size(LabelSize::Small)
+                                        .weight(FontWeight::MEDIUM)
+                                        .monospace()
+                                        .truncate(),
+                                ),
+                            )
+                            .child(
+                                Label::new(facts)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Placeholder),
+                            );
+                        if cfg!(windows) {
+                            // Scoped to the name area: the buttons are its
+                            // siblings, and a double click on them must not
+                            // maximize the window.
+                            drag_area.on_mouse_down(MouseButton::Left, |event, window, cx| {
+                                if event.click_count == 2 {
+                                    platform::toggle_maximized(window);
+                                    cx.stop_propagation();
+                                }
+                            })
+                        } else {
+                            drag_area
+                        }
+                    })
+                    .child(
+                        IconButton::new("file-viewer-open", IconName::FolderOpen)
+                            .size(ButtonSize::Compact)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Open in editor"))
+                            .on_click(move |_, _, _| crate::hub::open_in_editor(&path)),
+                    )
+                    .children(render_window_controls(window, |window, _| {
+                        window.remove_window()
+                    })),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for FileViewer {
@@ -619,209 +582,67 @@ impl Render for FileViewer {
         if !std::mem::replace(&mut self.focused, true) {
             window.focus(&self.focus);
         }
+        let (ui_scale, ui_font_family) = {
+            let settings = Settings::get(cx);
+            (settings.ui_scale(), settings.ui_font_family.clone())
+        };
         let colors = cx.theme().colors.clone();
+        let corners = crate::window_frame::content_corners(window);
         let note = self.note();
-        let facts = self.facts();
         let body = self.render_body(window, cx);
         let scrollbar = self.render_scrollbar(cx);
-        let resize_handles = self.render_resize_handles(cx);
-        let path = self.path.clone();
-        let frame = self.frame.map(|frame| fit(frame, self.area.size));
-        let drag_cursor = self
-            .frame_drag
-            .map(|drag| drag.edges.cursor())
-            .filter(|&cursor| cursor != CursorStyle::Arrow);
-        let entity = cx.entity();
-        let card_entity = entity.clone();
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .bottom_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::black().opacity(0.45))
-            .occlude()
-            .when_some(drag_cursor, |this, cursor| this.cursor(cursor))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.close(cx)),
-            )
-            // On the overlay, so drags keep going when the mouse leaves the card.
+        let content = v_flex()
+            .key_context(KEY_CONTEXT)
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|_, _: &Close, window, _| window.remove_window()))
+            .on_action(cx.listener(Self::copy_selection))
+            // On the root, so scrollbar drags keep going when the mouse
+            // leaves the body.
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 this.drag_scroll(event, cx);
-                this.drag_frame(event, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.end_drag(cx);
-                    this.end_frame_drag(cx);
-                }),
+                cx.listener(|this, _, _, cx| this.end_drag(cx)),
             )
-            .child(
-                canvas(
-                    move |bounds, _, cx| entity.update(cx, |this, _| this.area = bounds),
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .size_full(),
-            )
-            .child(
-                div()
-                    .key_context(KEY_CONTEXT)
-                    .track_focus(&self.focus)
-                    .on_action(cx.listener(|this, _: &Close, _, cx| this.close(cx)))
-                    .on_action(cx.listener(Self::copy_selection))
-                    .map(|this| match frame {
-                        Some(frame) => this
-                            .absolute()
-                            .left(frame.origin.x)
-                            .top(frame.origin.y)
-                            .w(frame.size.width)
-                            .h(frame.size.height),
-                        None => this
-                            .relative()
-                            .w(px(1100.))
-                            .max_w(relative(0.94))
-                            .h(relative(0.88)),
-                    })
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .size_full()
+            .font_family(ui_font_family)
+            .bg(colors.editor_background)
+            .rounded_tl(corners.top_left)
+            .rounded_tr(corners.top_right)
+            .rounded_bl(corners.bottom_left)
+            .rounded_br(corners.bottom_right)
+            .text_color(colors.text)
+            .text_size(px(14.) * ui_scale)
+            .line_height((px(21.) * ui_scale).round())
+            .child(self.render_title_bar(window, corners, cx))
+            .children(note.map(|note| {
+                h_flex()
+                    .flex_none()
+                    .gap(px(6.))
+                    .px(px(14.))
+                    .py(px(5.))
+                    .border_b_1()
+                    .border_color(colors.border_variant)
                     .child(
-                        canvas(
-                            move |bounds, _, cx| {
-                                card_entity.update(cx, |this, _| this.card = bounds)
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full(),
+                        Icon::new(IconName::Info)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
                     )
-                    .child(
-                        v_flex()
-                            .size_full()
-                            .rounded(px(10.))
-                            .border_1()
-                            .border_color(colors.border)
-                            .bg(colors.editor_background)
-                            .shadow_lg()
-                            .overflow_hidden()
-                            .child(
-                                h_flex()
-                                    .flex_none()
-                                    .gap(px(8.))
-                                    .px(px(14.))
-                                    .py(px(8.))
-                                    // overflow_hidden clips to a rectangle, so the header rounds itself.
-                                    .rounded_t(px(9.))
-                                    .border_b_1()
-                                    .border_color(colors.border_variant)
-                                    .bg(colors.panel_background)
-                                    .cursor(CursorStyle::Arrow)
-                                    // Drags the card; buttons prevent default on press.
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                            if !window.default_prevented() {
-                                                this.start_frame_drag(
-                                                    Edges::default(),
-                                                    event.position,
-                                                    cx,
-                                                );
-                                            }
-                                        }),
-                                    )
-                                    .child(
-                                        Icon::new(IconName::File)
-                                            .size(IconSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(
-                                        div().flex_1().min_w(px(0.)).child(
-                                            Label::new(self.title.clone())
-                                                .size(LabelSize::Small)
-                                                .weight(FontWeight::MEDIUM)
-                                                .monospace()
-                                                .truncate(),
-                                        ),
-                                    )
-                                    .child(
-                                        Label::new(facts)
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Placeholder),
-                                    )
-                                    .child(
-                                        IconButton::new("file-viewer-open", IconName::FolderOpen)
-                                            .size(ButtonSize::Compact)
-                                            .icon_size(IconSize::XSmall)
-                                            .tooltip(Tooltip::text("Open in editor"))
-                                            .on_click(move |_, _, _| {
-                                                crate::hub::open_in_editor(&path)
-                                            }),
-                                    )
-                                    .child(
-                                        IconButton::new("file-viewer-close", IconName::Close)
-                                            .size(ButtonSize::Compact)
-                                            .icon_size(IconSize::XSmall)
-                                            .tooltip(Tooltip::with_keys("Close", "Esc"))
-                                            .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
-                                    ),
-                            )
-                            .children(note.map(|note| {
-                                h_flex()
-                                    .flex_none()
-                                    .gap(px(6.))
-                                    .px(px(14.))
-                                    .py(px(5.))
-                                    .border_b_1()
-                                    .border_color(colors.border_variant)
-                                    .child(
-                                        Icon::new(IconName::Info)
-                                            .size(IconSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(
-                                        Label::new(note)
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                            }))
-                            .child(
-                                // Flex column: the body's flex_1 needs a flex parent
-                                // to get the viewport height.
-                                v_flex()
-                                    .relative()
-                                    .flex_1()
-                                    .min_h(px(0.))
-                                    .child(body)
-                                    .children(scrollbar),
-                            ),
-                    )
-                    .children(resize_handles),
-            )
+                    .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted))
+            }))
+            .child(
+                // Flex column: the body's flex_1 needs a flex parent
+                // to get the viewport height.
+                v_flex()
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(body)
+                    .children(scrollbar),
+            );
+        crate::window_frame::decorate(content, window, cx)
     }
-}
-
-/// `frame` shrunk and shifted to lie within an area of `area` size.
-fn fit(frame: Bounds<Pixels>, area: Size<Pixels>) -> Bounds<Pixels> {
-    if area.width <= px(0.) || area.height <= px(0.) {
-        return frame;
-    }
-    let width = frame.size.width.min(area.width);
-    let height = frame.size.height.min(area.height);
-    Bounds::new(
-        point(
-            frame.origin.x.clamp(px(0.), area.width - width),
-            frame.origin.y.clamp(px(0.), area.height - height),
-        ),
-        size(width, height),
-    )
-}
-
-fn thumb_height(track: Pixels, content: Pixels) -> Pixels {
-    (track * (f32::from(track) / f32::from(content))).max(px(24.))
 }
 
 fn load(path: &Path, syntax: &SyntaxColors) -> Result<Loaded, String> {
@@ -934,25 +755,6 @@ mod tests {
             vec![(0, "a"), (3, "bc"), (6, ""), (7, "d")]
         );
         assert!(split_lines("").is_empty());
-    }
-
-    #[test]
-    fn frames_fit_inside_the_overlay() {
-        let area = size(px(800.), px(600.));
-        let frame =
-            |x: f32, y: f32, w: f32, h: f32| Bounds::new(point(px(x), px(y)), size(px(w), px(h)));
-        assert_eq!(
-            fit(frame(700., -50., 400., 300.), area),
-            frame(400., 0., 400., 300.)
-        );
-        assert_eq!(
-            fit(frame(10., 10., 1000., 900.), area),
-            frame(0., 0., 800., 600.)
-        );
-        assert_eq!(
-            fit(frame(10., 20., 300., 200.), area),
-            frame(10., 20., 300., 200.)
-        );
     }
 
     #[test]

@@ -126,14 +126,6 @@ fn main() {
         cx.on_action(|_: &About, cx| {
             cx.open_url("https://github.com/bytesbay/pi-gpui");
         });
-        cx.on_action(|_: &Quit, cx| {
-            for window in cx.windows() {
-                window
-                    .update(cx, |_, window, cx| window_state::save_now(window, cx))
-                    .ok();
-            }
-            cx.quit();
-        });
         #[cfg(windows)]
         cx.on_app_quit(|_| {
             single_instance::release();
@@ -188,6 +180,15 @@ fn main() {
                 return;
             }
         };
+
+        // Only the hub window persists its bounds; a file viewer window
+        // always opens centered on the hub's display.
+        cx.on_action(move |_: &Quit, cx| {
+            window
+                .update(cx, |_, window, cx| window_state::save_now(window, cx))
+                .ok();
+            cx.quit();
+        });
 
         let focused = window.update(cx, |view, window, cx| {
             window_state::track(window, cx);

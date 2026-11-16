@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use gpui::{
     AnyElement, AnyView, App, Bounds, ClickEvent, Context, ElementId, Entity, FocusHandle,
     Focusable, FontWeight, KeyBinding, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, Pixels, Point, SharedString, StyleRefinement, Subscription, Task, Window,
-    WindowControlArea, actions, anchored, deferred, div, point, px,
+    MouseMoveEvent, Pixels, Point, SharedString, StyleRefinement, Subscription, Task,
+    TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowHandle, WindowOptions, actions,
+    anchored, deferred, div, point, px, size,
 };
 use serde_json::{Value, json};
 
@@ -20,7 +21,7 @@ use crate::chat::{ChatEvent, ChatStatus, ChatView, DetailsExpanded};
 use crate::diff::{DiffPanel, DiffPanelEvent};
 use crate::dock::{DockSide, Docks, PanelKind};
 use crate::file_tree::{FilesEvent, FilesPanel};
-use crate::file_viewer::{FileViewer, FileViewerEvent};
+use crate::file_viewer::FileViewer;
 use crate::pi::{self, Installation};
 use crate::pi_updates;
 use crate::platform;
@@ -72,7 +73,7 @@ const SESSIONS_PER_WORKSPACE: usize = 20;
 /// lights are placed at (12, 11) so they sit centered in this height.
 pub const TITLE_BAR_HEIGHT: f32 = 38.;
 /// Room for the macOS traffic lights, as in Zed's `TRAFFIC_LIGHT_PADDING`.
-const TRAFFIC_LIGHT_PADDING: f32 = 84.;
+pub(crate) const TRAFFIC_LIGHT_PADDING: f32 = 84.;
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -198,6 +199,7 @@ struct DraggedWorkspace {
     path: PathBuf,
     name: SharedString,
     index: usize,
+    favorite: bool,
 }
 
 impl Render for DraggedWorkspace {
@@ -257,6 +259,8 @@ struct WorkspaceEntry {
     path: PathBuf,
     name: SharedString,
     expanded: bool,
+    /// Favorites sit in their own group above the other projects.
+    favorite: bool,
     sessions: Vec<SessionSummary>,
     sessions_state: SessionsState,
     /// A listing is in flight; the previous list stays visible meanwhile.
@@ -275,6 +279,7 @@ impl WorkspaceEntry {
             path,
             name: name.into(),
             expanded,
+            favorite: false,
             sessions: Vec::new(),
             sessions_state: SessionsState::NotLoaded,
             refreshing: false,
@@ -323,9 +328,7 @@ pub struct HubView {
     docks: Docks,
     diff_panel: Entity<DiffPanel>,
     files_panel: Entity<FilesPanel>,
-    file_viewer: Option<Entity<FileViewer>>,
-    /// Where the last file viewer was moved or resized to, for this run.
-    file_viewer_frame: Option<Bounds<Pixels>>,
+    file_viewer: Option<WindowHandle<FileViewer>>,
     /// Focus returns to the Files panel after the viewer closes.
     focus_files: bool,
     /// Right-click menu of a side panel.
@@ -452,9 +455,10 @@ impl HubView {
         )
         .detach();
         let files_panel = cx.new(FilesPanel::new);
-        cx.subscribe(
+        cx.subscribe_in(
             &files_panel,
-            |this: &mut Self, _, event: &FilesEvent, cx| match event {
+            window,
+            |this: &mut Self, _, event: &FilesEvent, window, cx| match event {
                 FilesEvent::InsertPath(path) => {
                     if let Some(chat) = &this.active_chat {
                         let edit = PluginEvent::ComposerInsert {
@@ -468,7 +472,7 @@ impl HubView {
                     }
                 }
                 FilesEvent::OpenPath(path, title) => {
-                    this.open_file_viewer(path.clone(), title.clone(), cx);
+                    this.open_file_viewer(path.clone(), title.clone(), window, cx);
                 }
             },
         )
@@ -502,7 +506,6 @@ impl HubView {
             diff_panel,
             files_panel,
             file_viewer: None,
-            file_viewer_frame: None,
             focus_files: false,
             panel_menu: None,
             resizing_dock: None,
@@ -529,14 +532,18 @@ impl HubView {
         // The state file is tiny; reading it before the first frame avoids an
         // empty flash. Project folders are not touched here: they may need a
         // macOS permission prompt, which must not block startup.
-        for (path, expanded) in this
+        for (path, expanded, favorite) in this
             .state_path
             .as_deref()
             .map(load_state)
             .unwrap_or_default()
         {
-            this.workspaces.push(WorkspaceEntry::new(path, expanded));
+            let mut entry = WorkspaceEntry::new(path, expanded);
+            entry.favorite = favorite;
+            this.workspaces.push(entry);
         }
+        // Favorites first; the stable sort keeps each group's own order.
+        this.workspaces.sort_by_key(|entry| !entry.favorite);
         this.hidden_sessions = this
             .state_path
             .as_deref()
@@ -932,11 +939,34 @@ impl HubView {
             return;
         };
         let target = target.min(self.workspaces.len() - 1);
-        if from == target {
+        // Favorites and the other projects are ordered separately.
+        if from == target || self.workspaces[from].favorite != self.workspaces[target].favorite {
             return;
         }
         let entry = self.workspaces.remove(from);
         self.workspaces.insert(target, entry);
+        self.save(cx);
+        cx.notify();
+    }
+
+    /// Moves a project between the favorites and the other projects. It lands
+    /// next to the separator: last among favorites, first among the rest.
+    fn toggle_favorite(&mut self, workspace: &Path, cx: &mut Context<Self>) {
+        let Some(from) = self
+            .workspaces
+            .iter()
+            .position(|entry| entry.path == workspace)
+        else {
+            return;
+        };
+        let mut entry = self.workspaces.remove(from);
+        entry.favorite = !entry.favorite;
+        let boundary = self
+            .workspaces
+            .iter()
+            .take_while(|entry| entry.favorite)
+            .count();
+        self.workspaces.insert(boundary, entry);
         self.save(cx);
         cx.notify();
     }
@@ -1606,6 +1636,7 @@ impl HubView {
             "workspaces": self.workspaces.iter().map(|entry| json!({
                 "path": entry.path,
                 "expanded": entry.expanded,
+                "favorite": entry.favorite,
             })).collect::<Vec<_>>(),
         });
         let write = cx.background_spawn(async move { write_atomically(&state_path, &state) });
@@ -1643,8 +1674,19 @@ impl HubView {
 
     /// Projects and their sessions, in whichever dock holds them.
     fn render_sessions_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut workspaces = Vec::with_capacity(self.workspaces.len());
+        let separator = cx.theme().colors.border_variant;
+        let mut workspaces = Vec::with_capacity(self.workspaces.len() + 1);
         for (index, entry) in self.workspaces.iter().enumerate() {
+            if index > 0 && self.workspaces[index - 1].favorite && !entry.favorite {
+                workspaces.push(
+                    div()
+                        .mx(px(8.))
+                        .my(px(4.))
+                        .h(px(1.))
+                        .bg(separator)
+                        .into_any_element(),
+                );
+            }
             workspaces.push(self.render_workspace(index, entry, cx));
         }
         v_flex()
@@ -1966,54 +2008,50 @@ impl HubView {
         let dock = self.docks.dock(side);
         let active = dock.active;
         let tabbed = dock.panels.len() > 1;
-        let title =
-            if tabbed {
-                h_flex()
-                    .gap(px(2.))
-                    .children(dock.panels.iter().map(|&kind| {
-                        let selected = active == Some(kind);
-                        h_flex()
-                            .id(ElementId::Name(format!("dock-tab:{kind:?}").into()))
-                            .flex_none()
-                            .h(ui_px(cx, 24.))
-                            .px(px(6.))
-                            .gap(px(5.))
-                            .rounded(px(5.))
-                            .cursor_pointer()
-                            .when(selected, |this| this.bg(colors.ghost_element_selected))
-                            .hover(|style| style.bg(colors.ghost_element_hover))
-                            .when(!selected, |this| this.tooltip(Tooltip::text(kind.title())))
-                            .on_click(cx.listener(move |this, _, _, cx| this.show_panel(kind, cx)))
-                            .on_mouse_down(
-                                MouseButton::Right,
-                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                    cx.stop_propagation();
-                                    this.open_panel_menu(kind, event.position, cx);
-                                }),
-                            )
-                            .child(Icon::new(kind.icon()).size(IconSize::Small).color(
-                                if selected {
-                                    Color::Default
-                                } else {
-                                    Color::Muted
-                                },
-                            ))
-                            .when(selected, |this| {
-                                this.child(
-                                    Label::new(kind.title())
-                                        .size(LabelSize::Small)
-                                        .weight(FontWeight::MEDIUM),
-                                )
-                            })
-                    }))
-                    .into_any_element()
-            } else {
-                Label::new(active.map(PanelKind::title).unwrap_or_default())
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .weight(FontWeight::MEDIUM)
-                    .into_any_element()
-            };
+        let title = if tabbed {
+            h_flex()
+                .gap(px(2.))
+                .children(dock.panels.iter().map(|&kind| {
+                    let selected = active == Some(kind);
+                    let color = if selected {
+                        Color::Default
+                    } else {
+                        Color::Muted
+                    };
+                    h_flex()
+                        .id(ElementId::Name(format!("dock-tab:{kind:?}").into()))
+                        .flex_none()
+                        .h(ui_px(cx, 24.))
+                        .px(px(6.))
+                        .gap(px(5.))
+                        .rounded(px(5.))
+                        .cursor_pointer()
+                        .when(selected, |this| this.bg(colors.ghost_element_selected))
+                        .hover(|style| style.bg(colors.ghost_element_hover))
+                        .on_click(cx.listener(move |this, _, _, cx| this.show_panel(kind, cx)))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.open_panel_menu(kind, event.position, cx);
+                            }),
+                        )
+                        .child(Icon::new(kind.icon()).size(IconSize::Small).color(color))
+                        .child(
+                            Label::new(kind.title())
+                                .size(LabelSize::Small)
+                                .weight(FontWeight::MEDIUM)
+                                .color(color),
+                        )
+                }))
+                .into_any_element()
+        } else {
+            Label::new(active.map(PanelKind::title).unwrap_or_default())
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .weight(FontWeight::MEDIUM)
+                .into_any_element()
+        };
         let actions = (active == Some(PanelKind::Sessions)).then(|| {
             IconButton::new("add-workspace", IconName::Plus)
                 .tooltip(Tooltip::with_keys("Add project", "⌘O"))
@@ -2321,8 +2359,30 @@ impl HubView {
             (IconName::ChevronRight, IconName::Folder)
         };
 
+        let favorite = entry.favorite;
         let row_actions = h_flex()
             .gap(px(2.))
+            .child(
+                IconButton::new(
+                    ("favorite-workspace", index),
+                    if favorite {
+                        IconName::StarFilled
+                    } else {
+                        IconName::Star
+                    },
+                )
+                .size(ButtonSize::Compact)
+                .icon_size(IconSize::XSmall)
+                .tooltip(Tooltip::text(if favorite {
+                    "Remove from favorites"
+                } else {
+                    "Add to favorites"
+                }))
+                .on_click(cx.listener({
+                    let path = path.clone();
+                    move |this, _, _, cx| this.toggle_favorite(&path, cx)
+                })),
+            )
             .child(
                 IconButton::new(("new-chat", index), IconName::Plus)
                     .size(ButtonSize::Compact)
@@ -2453,6 +2513,7 @@ impl HubView {
             path: path.clone(),
             name: entry.name.clone(),
             index,
+            favorite,
         };
         let header = div()
             .id(workspace_id("workspace-drag"))
@@ -2465,7 +2526,7 @@ impl HubView {
             .mb(px(2.))
             .rounded(px(5.))
             .drag_over::<DraggedWorkspace>(move |style, dragged, _, _| {
-                if dragged.index == index {
+                if dragged.index == index || dragged.favorite != favorite {
                     style
                 } else {
                     style.bg(drop_target)
@@ -3110,16 +3171,13 @@ impl HubView {
                     .child(Spinner::new().size(IconSize::XSmall))
                     .child(LoadingLabel::new("Checking pi…").size(LabelSize::Small)),
             ),
-            InstallationState::Ready(installation) => {
-                let untested = installation.is_untested();
+            InstallationState::Ready(_) => {
                 let buttons = self.render_update_buttons(cx);
-                footer.child(
-                    h_flex()
-                        .gap(px(6.))
-                        .child(self.render_pi_version(installation, untested))
-                        .child(div().flex_1())
-                        .children(buttons),
-                )
+                // Nothing to report: no footer at all, not an empty strip.
+                if buttons.is_empty() {
+                    return div();
+                }
+                footer.child(h_flex().gap(px(6.)).child(div().flex_1()).children(buttons))
             }
             InstallationState::Failed(error) => {
                 let (color, label) = match error {
@@ -4092,35 +4150,7 @@ impl HubView {
         cx.notify();
     }
 
-    fn render_pi_version(&self, installation: &Installation, untested: bool) -> AnyElement {
-        h_flex()
-            .id("pi-version")
-            .gap(px(6.))
-            .child(Indicator::dot(if untested {
-                Color::Warning
-            } else {
-                Color::Success
-            }))
-            .child(
-                Label::new(if untested {
-                    format!("pi {} · not tested yet", installation.version)
-                } else {
-                    format!("pi {}", installation.version)
-                })
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-            )
-            .when(untested, |this| {
-                this.tooltip(Tooltip::text(format!(
-                    "This app was tested with pi up to {}.{}.x. It should work; check for app updates.",
-                    pi::TESTED_PI.major,
-                    pi::TESTED_PI.minor
-                )))
-            })
-            .into_any_element()
-    }
-
-    /// Buttons next to the pi version: a pi update and package updates.
+    /// Sidebar footer buttons: a pi update and package updates.
     fn render_update_buttons(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut buttons = Vec::new();
         if let Some(label) = &self.pi_updating {
@@ -4393,30 +4423,38 @@ impl HubView {
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| workspace.display().to_string());
+                // As tall as the dock toggle beside it, so both snap to the
+                // same pixel rows and their icons line up.
                 let breadcrumb = h_flex()
                     .id("title-breadcrumb")
+                    .h(ui_px(cx, 22.))
                     .gap(px(6.))
                     .min_w(px(0.))
                     .tooltip(Tooltip::text(sessions::display_path(workspace)))
                     .child(
                         Icon::new(IconName::Folder)
-                            .size(IconSize::XSmall)
+                            .size(IconSize::Small)
                             .color(Color::Muted),
                     )
+                    // Labels and the chevron sit a pixel down: Segoe UI and SF
+                    // set capitals above the line box's middle, and the 12 px
+                    // chevron rounds a pixel high. Measured at 125% scale.
                     .child(
-                        div().flex_none().child(
+                        div().flex_none().relative().top(px(1.)).child(
                             Label::new(workspace_name)
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
                         ),
                     )
                     .child(
-                        Icon::new(IconName::ChevronRight)
-                            .size(IconSize::XSmall)
-                            .color(Color::Placeholder),
+                        div().relative().top(px(1.)).child(
+                            Icon::new(IconName::ChevronRight)
+                                .size(IconSize::XSmall)
+                                .color(Color::Placeholder),
+                        ),
                     )
                     .child(
-                        div().min_w(px(0.)).child(
+                        div().min_w(px(0.)).relative().top(px(1.)).child(
                             Label::new(chat.title())
                                 .size(LabelSize::Small)
                                 .weight(FontWeight::MEDIUM)
@@ -4649,7 +4687,10 @@ impl HubView {
                                 })),
                         )
                     })
-                    .children(render_window_controls(window)),
+                    .children(render_window_controls(window, |window, cx| {
+                        crate::window_state::save_now(window, cx);
+                        window.remove_window();
+                    })),
             )
     }
 
@@ -4764,21 +4805,66 @@ impl Focusable for HubView {
 }
 
 impl HubView {
-    fn open_file_viewer(&mut self, path: PathBuf, title: String, cx: &mut Context<Self>) {
-        let frame = self.file_viewer_frame;
-        let viewer = cx.new(|cx| FileViewer::new(path, title, frame, cx));
-        cx.subscribe(
-            &viewer,
-            |this: &mut Self, viewer, _: &FileViewerEvent, cx| {
-                this.file_viewer_frame = viewer.read(cx).frame();
+    /// Opens the file in the viewer window, reusing the open one. A new
+    /// window opens at the default size, centered on the hub's display.
+    fn open_file_viewer(
+        &mut self,
+        path: PathBuf,
+        title: String,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(viewer) = self.file_viewer {
+            let reused = viewer.update(cx, |viewer, window, cx| {
+                viewer.open(path.clone(), title.clone(), cx);
+                window.set_window_title(&title);
+                window.activate_window();
+            });
+            if reused.is_ok() {
+                return;
+            }
+            self.file_viewer = None;
+        }
+        // gpui creates the window on `display_id` and replaces the given
+        // bounds with that display's defaults when their center lies on
+        // another display, so both name the hub's display.
+        let display_id = window.display(cx).map(|display| display.id());
+        let bounds =
+            WindowBounds::Windowed(Bounds::centered(display_id, size(px(1100.), px(760.)), cx));
+        let options = WindowOptions {
+            window_bounds: Some(bounds),
+            display_id,
+            // Draw our own title bar, as in the hub window.
+            titlebar: Some(TitlebarOptions {
+                title: Some(title.clone().into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(12.), px(11.))),
+            }),
+            window_decorations: (!cfg!(target_os = "macos"))
+                .then_some(gpui::WindowDecorations::Client),
+            app_id: Some("pi-gpui".into()),
+            window_min_size: Some(size(px(360.), px(160.))),
+            ..Default::default()
+        };
+        let viewer = match cx.open_window(options, |_, cx| {
+            cx.new(|cx| FileViewer::new(path, title, cx))
+        }) {
+            Ok(viewer) => viewer,
+            Err(error) => {
+                eprintln!("pi-gpui: could not open the file viewer: {error:#}");
+                return;
+            }
+        };
+        // Closing the window releases its root view, however it was closed.
+        if let Ok(entity) = viewer.entity(cx) {
+            cx.observe_release(&entity, |this, _, cx| {
                 this.file_viewer = None;
                 this.focus_files = true;
                 cx.notify();
-            },
-        )
-        .detach();
+            })
+            .detach();
+        }
         self.file_viewer = Some(viewer);
-        cx.notify();
     }
 }
 
@@ -4940,12 +5026,7 @@ impl Render for HubView {
                             .children(notice)
                             .child(main),
                     )
-                    .children(self.render_dock(DockSide::Right, corners, cx))
-                    .children(
-                        self.file_viewer
-                            .as_ref()
-                            .map(|viewer| viewer.clone().into_any_element()),
-                    ),
+                    .children(self.render_dock(DockSide::Right, corners, cx)),
             )
             .children(
                 self.session_menu
@@ -4968,7 +5049,12 @@ impl Render for HubView {
 /// Minimize, maximize and close, when the app draws its own frame (Linux
 /// without server-side decorations, and Windows, where the custom title bar
 /// replaces the system one). The window manager draws them otherwise.
-fn render_window_controls(window: &Window) -> Option<AnyElement> {
+/// `on_close` runs instead of the default close, so the hub can save its
+/// window state first.
+pub(crate) fn render_window_controls(
+    window: &Window,
+    on_close: impl Fn(&mut Window, &mut App) + 'static,
+) -> Option<AnyElement> {
     let draws_own_frame = matches!(
         window.window_decorations(),
         gpui::Decorations::Client { .. }
@@ -5011,10 +5097,7 @@ fn render_window_controls(window: &Window) -> Option<AnyElement> {
             .child(
                 IconButton::new("window-close", IconName::Close)
                     .tooltip(Tooltip::text("Close"))
-                    .on_click(|_, window, cx| {
-                        crate::window_state::save_now(window, cx);
-                        window.remove_window();
-                    }),
+                    .on_click(move |_, window, cx| on_close(window, cx)),
             )
             .into_any_element(),
     )
@@ -5085,7 +5168,8 @@ fn state_file_path() -> Option<PathBuf> {
     Some(sessions::app_data_directory()?.join("state.json"))
 }
 
-fn load_state(path: &Path) -> Vec<(PathBuf, bool)> {
+/// Projects as `(path, expanded, favorite)`, in saved order.
+fn load_state(path: &Path) -> Vec<(PathBuf, bool, bool)> {
     let Ok(bytes) = fs::read(path) else {
         return Vec::new();
     };
@@ -5102,7 +5186,11 @@ fn load_state(path: &Path) -> Vec<(PathBuf, bool)> {
         .flatten()
         .filter_map(|workspace| {
             let path = PathBuf::from(workspace["path"].as_str()?);
-            Some((path, workspace["expanded"].as_bool().unwrap_or(true)))
+            Some((
+                path,
+                workspace["expanded"].as_bool().unwrap_or(true),
+                workspace["favorite"].as_bool().unwrap_or(false),
+            ))
         })
         .collect()
 }

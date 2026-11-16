@@ -645,6 +645,16 @@ impl Render for FilesPanel {
                     ),
                 )
                 .child(
+                    IconButton::new("open-terminal", IconName::Terminal)
+                        .size(ButtonSize::Compact)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Open terminal here"))
+                        .on_click({
+                            let workspace = workspace.clone();
+                            move |_, _, _| crate::platform::open_terminal(&workspace)
+                        }),
+                )
+                .child(
                     IconButton::new("refresh-files", IconName::Refresh)
                         .size(ButtonSize::Compact)
                         .icon_size(IconSize::XSmall)

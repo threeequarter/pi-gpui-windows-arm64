@@ -8,6 +8,7 @@ mod overlays;
 mod plugin_prompt;
 mod plugin_view;
 mod remote;
+mod scrollbar;
 mod slash;
 mod tree;
 mod usage;
@@ -40,6 +41,7 @@ use crate::settings::ui_px;
 use crate::text_input::{self, TextInput};
 use crate::ui::AnimationTicker;
 use crate::ui::prelude::*;
+use crate::ui::scrollbar::ScrollDrag;
 
 actions!(
     chat,
@@ -448,6 +450,7 @@ pub struct ChatView {
     running: bool,
     rows: Vec<Row>,
     list_state: ListState,
+    scroll_drag: Option<ScrollDrag>,
     active_assistant: Option<usize>,
     tool_rows: HashMap<String, usize>,
     /// A memory-bootstrap signal asked for the `get_entries` in flight.
@@ -592,7 +595,9 @@ impl ChatView {
             picker_closed_at: None,
             running: false,
             rows: Vec::new(),
-            list_state: ListState::new(0, ListAlignment::Bottom, px(LIST_OVERDRAW)),
+            // Every row measured, so the scrollbar reflects the whole session.
+            list_state: ListState::new(0, ListAlignment::Bottom, px(LIST_OVERDRAW)).measure_all(),
+            scroll_drag: None,
             active_assistant: None,
             tool_rows: HashMap::new(),
             next_request_id: 0,
@@ -975,6 +980,8 @@ impl ChatView {
             }
             "message_end" if record["message"]["role"] == "assistant" => {
                 self.apply_assistant_end(&record["message"], changed);
+                // Session totals follow each answer, as in pi's footer.
+                self.request_stats();
             }
             "message_end" if is_displayed_custom(&record["message"]) => {
                 self.rows.push(message_row(&record["message"]));
@@ -3340,18 +3347,6 @@ impl ChatView {
             .when_some(self.activity(), |this, activity| {
                 this.child(Spinner::new().size(IconSize::XSmall).color(Color::Accent))
                     .child(LoadingLabel::new(activity).size(LabelSize::Small))
-            })
-            .when(self.running, |this| {
-                this.child(div().flex_1()).child(
-                    h_flex()
-                        .gap(px(4.))
-                        .child(
-                            Label::new("to stop")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Placeholder),
-                        )
-                        .child(KeyHint::new("Esc")),
-                )
             });
 
         let send_tooltip = if self.running {
@@ -3477,6 +3472,7 @@ impl ChatView {
                                             .min_w(px(0.))
                                             .gap(px(2.))
                                             .child(self.render_model_chip(cx))
+                                            .children(self.render_session_stats())
                                             .children(self.render_usage_ring(cx))
                                             .child(
                                                 IconButton::new("compact", IconName::Compact)
@@ -3546,6 +3542,7 @@ impl Render for ChatView {
                 .into_any_element()
         } else {
             div()
+                .relative()
                 .flex_1()
                 .min_h(px(0.))
                 .child(
@@ -3555,6 +3552,7 @@ impl Render for ChatView {
                     )
                     .size_full(),
                 )
+                .children(self.render_scrollbar(cx))
                 .into_any_element()
         };
 
@@ -3623,6 +3621,15 @@ impl Render for ChatView {
             .on_action(cx.listener(Self::cancel_run))
             .on_action(cx.listener(Self::toggle_model_picker))
             .on_action(cx.listener(Self::copy_selection))
+            // On the root, so scrollbar drags keep going when the mouse
+            // leaves the list.
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                this.drag_scroll(event, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_scroll_drag(cx)),
+            )
             .size_full()
             .bg(colors.editor_background)
             .text_color(colors.text)
