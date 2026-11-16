@@ -519,6 +519,10 @@ impl TextInput {
         self
     }
 
+    pub fn placeholder(&self) -> &SharedString {
+        &self.placeholder
+    }
+
     pub fn set_placeholder(
         &mut self,
         placeholder: impl Into<SharedString>,

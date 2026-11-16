@@ -6,6 +6,9 @@ use gpui::{Focusable, MouseButton};
 use super::*;
 use crate::git::CommitMode;
 
+/// The message box's hint when no message is suggested.
+pub(super) const COMMIT_PLACEHOLDER: &str = "Commit message";
+
 /// What a commit would do right now, from the commit matrix. The single place the
 /// git command, the Commit button and the Generate input are decided.
 struct CommitPlan {
@@ -13,6 +16,8 @@ struct CommitPlan {
     /// The mode has something to take, which is also what Generate describes.
     has_input: bool,
     conflicted: bool,
+    /// Used when the message box is left empty (Zed's "Update a.rs").
+    suggested_message: Option<String>,
 }
 
 impl CommitPlan {
@@ -29,6 +34,7 @@ impl CommitPlan {
             mode,
             has_input,
             conflicted: status.has_conflicts(),
+            suggested_message: status.suggested_commit_message(mode),
         }
     }
 
@@ -65,7 +71,10 @@ impl DiffPanel {
                 "Nothing to commit: stage files or change tracked ones \
                  (untracked files are never committed automatically)",
             )
-        } else if message_empty && plan.mode != CommitMode::Amend {
+        } else if message_empty
+            && plan.mode != CommitMode::Amend
+            && plan.suggested_message.is_none()
+        {
             Some("Write a commit message first")
         } else {
             None
@@ -97,7 +106,7 @@ impl DiffPanel {
             return;
         };
         let plan = CommitPlan::new(status, self.amend);
-        let message = self.commit_input.read(cx).text().to_string();
+        let mut message = self.commit_input.read(cx).text().to_string();
         if let Some(reason) = self.commit_blocker(&plan, message.trim().is_empty()) {
             // ⌘Enter has no disabled state to look at, so say why.
             if self.busy.is_none() {
@@ -105,6 +114,11 @@ impl DiffPanel {
                 cx.notify();
             }
             return;
+        }
+        if message.trim().is_empty()
+            && let Some(suggested) = plan.suggested_message
+        {
+            message = suggested;
         }
         let mode = plan.mode;
         self.run_git(
@@ -233,6 +247,14 @@ impl DiffPanel {
     ) -> AnyElement {
         let colors = cx.theme().colors.clone();
         let plan = CommitPlan::new(status, self.amend);
+        let placeholder = plan
+            .suggested_message
+            .clone()
+            .unwrap_or_else(|| COMMIT_PLACEHOLDER.to_string());
+        if *self.commit_input.read(cx).placeholder() != placeholder {
+            self.commit_input
+                .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+        }
         let message_empty = self.commit_input.read(cx).text().trim().is_empty();
         let commit_blocker = self.commit_blocker(&plan, message_empty);
         let generate_blocker = self.generate_blocker(&plan);

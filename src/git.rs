@@ -80,6 +80,9 @@ pub struct StatusEntry {
     pub path: String,
     /// The source of a rename or copy.
     pub original_path: Option<String>,
+    /// Porcelain XY: the index letter, then the work tree one (`.` is
+    /// unchanged, `A` added, `D` deleted, `M` modified); `??` when untracked.
+    pub code: [char; 2],
     /// The index column differs from HEAD.
     pub staged: bool,
     /// The worktree column differs from the index.
@@ -121,6 +124,31 @@ impl RepoStatus {
         self.entries
             .iter()
             .any(|entry| entry.unstaged && !entry.untracked)
+    }
+
+    /// Zed's default message when a commit takes exactly one file: "Create
+    /// a.rs", "Update a.rs" or "Delete a.rs". `None` for an amend (an empty
+    /// message keeps the last one), several files, or a rename or copy.
+    pub fn suggested_commit_message(&self, mode: CommitMode) -> Option<String> {
+        let mut taken = self.entries.iter().filter_map(|entry| match mode {
+            CommitMode::Staged => entry.staged.then_some((entry, entry.code[0])),
+            CommitMode::AllTracked => {
+                (entry.unstaged && !entry.untracked).then_some((entry, entry.code[1]))
+            }
+            CommitMode::Amend => None,
+        });
+        let (entry, letter) = taken.next()?;
+        if taken.next().is_some() || entry.conflicted {
+            return None;
+        }
+        let verb = match letter {
+            'A' => "Create",
+            'D' => "Delete",
+            'M' | 'T' => "Update",
+            _ => return None,
+        };
+        let name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+        Some(format!("{verb} {name}"))
     }
 
     /// Amend wins over the index, and the index wins over "everything tracked".
@@ -186,9 +214,11 @@ fn parse_status(output: &str) -> RepoStatus {
                 } else {
                     None
                 };
+                let mut letters = columns.chars();
                 status.entries.push(StatusEntry {
                     path: path.to_string(),
                     original_path,
+                    code: [letters.next().unwrap_or('.'), letters.next().unwrap_or('.')],
                     staged: !columns.starts_with('.'),
                     unstaged: !columns.ends_with('.'),
                     untracked: false,
@@ -200,6 +230,7 @@ fn parse_status(output: &str) -> RepoStatus {
             "?" => status.entries.push(StatusEntry {
                 path: rest.to_string(),
                 original_path: None,
+                code: ['?', '?'],
                 staged: false,
                 unstaged: true,
                 untracked: true,
@@ -462,6 +493,7 @@ mod tests {
             vec![StatusEntry {
                 path: "src/main.rs".to_string(),
                 original_path: None,
+                code: ['M', 'M'],
                 staged: true,
                 unstaged: true,
                 untracked: false,
@@ -491,6 +523,7 @@ mod tests {
             StatusEntry {
                 path: "renamed dir/ren copy.txt".to_string(),
                 original_path: Some("ren.txt".to_string()),
+                code: ['R', 'M'],
                 staged: true,
                 unstaged: true,
                 untracked: false,
@@ -513,6 +546,7 @@ mod tests {
             StatusEntry {
                 path: "cp-dest.txt".to_string(),
                 original_path: Some("cp-src.txt".to_string()),
+                code: ['C', '.'],
                 staged: true,
                 // The 'C' column is the index side only; the work tree matches.
                 unstaged: false,
@@ -530,6 +564,7 @@ mod tests {
             vec![StatusEntry {
                 path: "notes/un tracked 名.txt".to_string(),
                 original_path: None,
+                code: ['?', '?'],
                 staged: false,
                 unstaged: true,
                 untracked: true,
@@ -620,5 +655,44 @@ mod tests {
             status.entries[1].original_path.as_deref(),
             Some("old 名.txt")
         );
+    }
+
+    #[test]
+    fn suggests_a_message_for_a_single_file() {
+        let status = parse_status(&porcelain(&[
+            HEAD,
+            BRANCH,
+            "1 .M N... 100644 100644 100644 bab081fdb7372d4e bab081fdb7372d4e src/diff.rs",
+            "? notes.txt",
+        ]));
+        // Untracked files stay out of `commit -a`, so one file is taken.
+        assert_eq!(
+            status
+                .suggested_commit_message(CommitMode::AllTracked)
+                .as_deref(),
+            Some("Update diff.rs")
+        );
+        assert_eq!(status.suggested_commit_message(CommitMode::Amend), None);
+
+        let status = parse_status(&porcelain(&[
+            HEAD,
+            BRANCH,
+            "1 A. N... 000000 100644 100644 0000000000000000 eb0abdacb2006de4 new.rs",
+            "1 .M N... 100644 100644 100644 bab081fdb7372d4e bab081fdb7372d4e old.rs",
+        ]));
+        assert_eq!(
+            status
+                .suggested_commit_message(CommitMode::Staged)
+                .as_deref(),
+            Some("Create new.rs")
+        );
+
+        let status = parse_status(&porcelain(&[
+            HEAD,
+            BRANCH,
+            "1 D. N... 100644 000000 000000 bab081fdb7372d4e 0000000000000000 a.rs",
+            "1 D. N... 100644 000000 000000 bab081fdb7372d4e 0000000000000000 b.rs",
+        ]));
+        assert_eq!(status.suggested_commit_message(CommitMode::Staged), None);
     }
 }

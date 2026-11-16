@@ -23,6 +23,16 @@ const GENERATION_TIMEOUT: Duration = Duration::from_secs(120);
 /// cut, with a note, to keep the prompt in a sane size.
 const MAX_COMMIT_DIFF_CHARS: usize = 120_000;
 
+/// Replaces pi's coding-agent system prompt, which describes tools: with
+/// `--no-tools` some models (DeepSeek) then write tool calls as plain text.
+const COMMIT_SYSTEM_PROMPT: &str = "You write git commit messages. You have no tools and \
+need none: the user message holds the instructions and the complete diff. Answer with \
+the commit message only, as plain text.";
+
+/// Tool-call markup that models print as text when they reach for a tool
+/// they do not have.
+const TOOL_CALL_MARKERS: [&str; 4] = ["DSML", "<tool_call>", "<function_calls>", "<invoke "];
+
 /// Field order makes the derived ordering compare major, then minor, then patch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version {
@@ -321,6 +331,8 @@ pub fn generate_commit_message(
             "--no-extensions",
             "--no-skills",
             "--no-context-files",
+            "--system-prompt",
+            COMMIT_SYSTEM_PROMPT,
         ])
         .current_dir(root)
         .env("PATH", path_with_executable_dir(&installation.executable));
@@ -360,6 +372,16 @@ fn clean_commit_message(output: &str) -> Result<String, String> {
     let message = strip_code_fence(output.trim()).trim();
     if message.is_empty() {
         return Err("pi returned an empty message".to_string());
+    }
+    if TOOL_CALL_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+    {
+        return Err(
+            "the model tried to call a tool instead of writing the message; \
+             try again or set another commit message model"
+                .to_string(),
+        );
     }
     Ok(message.to_string())
 }
@@ -597,5 +619,13 @@ mod tests {
             clean_commit_message("```\nfix the panel"),
             Ok("```\nfix the panel".to_string())
         );
+    }
+
+    #[test]
+    fn a_tool_call_written_as_text_is_an_error() {
+        let answer =
+            "<\u{ff5c}DSML\u{ff5c}function_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"bash\">";
+        assert!(clean_commit_message(answer).is_err());
+        assert!(clean_commit_message("<tool_call>{}</tool_call>").is_err());
     }
 }
