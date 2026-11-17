@@ -9,9 +9,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyElement, AnyView, App, Bounds, ClickEvent, Context, ElementId, Entity, FocusHandle,
+    AnyElement, AnyView, App, Bounds, ClickEvent, Context, Div, ElementId, Entity, FocusHandle,
     Focusable, FontWeight, KeyBinding, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, Pixels, Point, SharedString, StyleRefinement, Subscription, Task,
+    MouseMoveEvent, Pixels, Point, SharedString, Stateful, StyleRefinement, Subscription, Task,
     TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowHandle, WindowOptions, actions,
     anchored, deferred, div, point, px, size,
 };
@@ -4383,6 +4383,37 @@ impl HubView {
             .into_any_element()
     }
 
+    /// Folder icon and project name, the title bar's first breadcrumb.
+    fn project_crumb(workspace: &Path, cx: &App) -> Stateful<Div> {
+        let workspace_name = workspace
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| workspace.display().to_string());
+        // As tall as the dock toggle beside it, so both snap to the
+        // same pixel rows and their icons line up.
+        h_flex()
+            .id("title-breadcrumb")
+            .h(ui_px(cx, 22.))
+            .gap(px(6.))
+            .min_w(px(0.))
+            .tooltip(Tooltip::text(sessions::display_path(workspace)))
+            .child(
+                Icon::new(IconName::Folder)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            // Labels and the chevron sit a pixel down: Segoe UI and SF
+            // set capitals above the line box's middle, and the 12 px
+            // chevron rounds a pixel high. Measured at 125% scale.
+            .child(
+                div().flex_none().relative().top(px(1.)).child(
+                    Label::new(workspace_name)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+            )
+    }
+
     fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
         let is_active = window.is_window_active();
@@ -4395,34 +4426,7 @@ impl HubView {
         let (breadcrumb, status) = match &self.active_chat {
             Some(chat) => {
                 let chat = chat.read(cx);
-                let workspace = chat.workspace();
-                let workspace_name = workspace
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| workspace.display().to_string());
-                // As tall as the dock toggle beside it, so both snap to the
-                // same pixel rows and their icons line up.
-                let breadcrumb = h_flex()
-                    .id("title-breadcrumb")
-                    .h(ui_px(cx, 22.))
-                    .gap(px(6.))
-                    .min_w(px(0.))
-                    .tooltip(Tooltip::text(sessions::display_path(workspace)))
-                    .child(
-                        Icon::new(IconName::Folder)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    // Labels and the chevron sit a pixel down: Segoe UI and SF
-                    // set capitals above the line box's middle, and the 12 px
-                    // chevron rounds a pixel high. Measured at 125% scale.
-                    .child(
-                        div().flex_none().relative().top(px(1.)).child(
-                            Label::new(workspace_name)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
-                    )
+                let breadcrumb = Self::project_crumb(chat.workspace(), cx)
                     .child(
                         div().relative().top(px(1.)).child(
                             Icon::new(IconName::ChevronRight)
@@ -4464,13 +4468,16 @@ impl HubView {
                 };
                 (breadcrumb, Some(status))
             }
-            None => (
-                Label::new("Pi GPUI")
-                    .size(LabelSize::Small)
-                    .color(Color::Placeholder)
-                    .into_any_element(),
-                None,
-            ),
+            None => match &self.selected_project {
+                Some(workspace) => (Self::project_crumb(workspace, cx).into_any_element(), None),
+                None => (
+                    Label::new("Pi GPUI")
+                        .size(LabelSize::Small)
+                        .color(Color::Placeholder)
+                        .into_any_element(),
+                    None,
+                ),
+            },
         };
         let (breadcrumb, status) = if self.settings_page.is_some() {
             (
