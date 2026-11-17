@@ -340,8 +340,6 @@ pub struct HubView {
     panel_menu: Option<PanelMenu>,
     /// A dock edge is being dragged.
     resizing_dock: Option<DockSide>,
-    /// The chat the panels last followed; they catch up in the next render.
-    panels_follow: Option<gpui::EntityId>,
     /// Tab order set by dragging; open sessions missing here go last.
     tab_order: Vec<gpui::EntityId>,
 
@@ -523,7 +521,6 @@ impl HubView {
             focus_files: false,
             panel_menu: None,
             resizing_dock: None,
-            panels_follow: None,
             tab_order: Vec::new(),
 
             pi_updates: pi_updates::Updates::default(),
@@ -1623,9 +1620,13 @@ impl HubView {
 
     fn activate(&mut self, view: Entity<ChatView>, cx: &mut Context<Self>) {
         self.settings_page = None;
-        self.active_chat = Some(view);
+        self.active_chat = Some(view.clone());
         self.focus_active_chat = true;
         self.notice = None;
+        // The panels follow the session being shown, even when it is already
+        // active: a project header click may have pointed them elsewhere.
+        let workspace = view.read(cx).workspace().to_path_buf();
+        self.select_project(&workspace, cx);
         cx.notify();
     }
 
@@ -4857,16 +4858,6 @@ impl Render for HubView {
             window.focus(&self.files_panel.read(cx).focus_handle());
         }
 
-        // Panels follow the selected project; activating a session selects
-        // its project, closing the last one keeps the selection.
-        let active_id = self.active_chat.as_ref().map(|chat| chat.entity_id());
-        if self.panels_follow != active_id {
-            self.panels_follow = active_id;
-            if let Some(chat) = &self.active_chat {
-                self.selected_project = Some(chat.read(cx).workspace().to_path_buf());
-            }
-            cx.defer_in(window, |this, _, cx| this.refresh_visible_panels(cx));
-        }
         let colors = cx.theme().colors.clone();
         self.animation.set_active(self.sidebar_is_animating(cx), cx);
 

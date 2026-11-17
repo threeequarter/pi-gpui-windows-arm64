@@ -786,7 +786,7 @@ impl DiffPanel {
                                             Label::new(branch)
                                                 .size(LabelSize::XSmall)
                                                 .weight(FontWeight::MEDIUM)
-                                                .truncate(),
+                                                .truncate_start(),
                                         ),
                                     )
                                     .child(
@@ -889,7 +889,7 @@ impl DiffPanel {
                                         Label::new(name)
                                             .size(LabelSize::XSmall)
                                             .weight(FontWeight::MEDIUM)
-                                            .truncate(),
+                                            .truncate_start(),
                                     ),
                                 )
                                 .child(
@@ -902,11 +902,6 @@ impl DiffPanel {
                             self.repository_menu
                                 .then(|| self.render_repository_menu(cx)),
                         ),
-                )
-                .child(
-                    Label::new("/")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Placeholder),
                 )
                 .into_any_element(),
         )

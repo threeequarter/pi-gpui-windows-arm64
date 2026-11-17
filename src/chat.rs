@@ -25,8 +25,8 @@ use futures::channel::mpsc;
 use gpui::{
     AnyElement, App, AsyncApp, Context, Corner, ElementId, Entity, EventEmitter, FocusHandle,
     Focusable, FontWeight, Global, KeyBinding, ListAlignment, ListState, MouseButton, ScrollHandle,
-    SharedString, Subscription, Task, WeakEntity, Window, actions, anchored, deferred, div, list,
-    px,
+    SharedString, Subscription, Task, WeakEntity, Window, actions, anchored, canvas, deferred, div,
+    list, px,
 };
 use serde_json::{Value, json};
 
@@ -454,6 +454,7 @@ pub struct ChatView {
     rows: Vec<Row>,
     list_state: ListState,
     scroll_drag: Option<ScrollDrag>,
+    scroll_snapshot: Option<scrollbar::ScrollSnapshot>,
     active_assistant: Option<usize>,
     tool_rows: HashMap<String, usize>,
     /// A memory-bootstrap signal asked for the `get_entries` in flight.
@@ -602,6 +603,7 @@ impl ChatView {
             // Every row measured, so the scrollbar reflects the whole session.
             list_state: ListState::new(0, ListAlignment::Bottom, px(LIST_OVERDRAW)).measure_all(),
             scroll_drag: None,
+            scroll_snapshot: None,
             active_assistant: None,
             tool_rows: HashMap::new(),
             next_request_id: 0,
@@ -3563,6 +3565,7 @@ impl Render for ChatView {
                     )
                     .size_full(),
                 )
+                .child(self.render_scroll_probe(cx))
                 .children(self.render_scrollbar(cx))
                 .into_any_element()
         };

@@ -1,6 +1,12 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
-use gpui::{App, FontWeight, Pixels, SharedString, Window, div, prelude::*, pulsating_between, px};
+use gpui::{
+    App, AvailableSpace, Bounds, Element, ElementId, FontWeight, GlobalElementId,
+    InspectorElementId, LayoutId, Pixels, SharedString, Size, Window, WrappedLine, div, prelude::*,
+    pulsating_between, px,
+};
 
 use super::animation::phase;
 use super::theme::Color;
@@ -54,6 +60,7 @@ pub struct Label {
     weight: Option<FontWeight>,
     italic: bool,
     truncate: bool,
+    truncate_start: bool,
     monospace: bool,
 }
 
@@ -66,6 +73,7 @@ impl Label {
             weight: None,
             italic: false,
             truncate: false,
+            truncate_start: false,
             monospace: false,
         }
     }
@@ -96,6 +104,15 @@ impl Label {
         self
     }
 
+    /// Single line that keeps its end visible: when the text does not fit,
+    /// the beginning is clipped instead of the end, without a marker. Names
+    /// that read from the right (repositories, branches) stay recognizable
+    /// when narrow. The parent must allow shrinking (`min_w(px(0.))`).
+    pub fn truncate_start(mut self) -> Self {
+        self.truncate_start = true;
+        self
+    }
+
     pub fn monospace(mut self) -> Self {
         self.monospace = true;
         self
@@ -104,6 +121,15 @@ impl Label {
 
 impl RenderOnce for Label {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let content = if self.truncate_start {
+            StartTruncatedText {
+                text: self.text.clone(),
+                state: Rc::new(RefCell::new(None)),
+            }
+            .into_any_element()
+        } else {
+            self.text.clone().into_any_element()
+        };
         div()
             .text_size(self.size.pixels(cx))
             .line_height(self.size.line_height(cx))
@@ -118,7 +144,165 @@ impl RenderOnce for Label {
                 )
             })
             .when(self.truncate, |this| this.min_w(px(0.)).truncate())
-            .child(self.text)
+            .when(self.truncate_start, |this| {
+                this.min_w(px(0.)).overflow_hidden()
+            })
+            .child(content)
+    }
+}
+
+/// Single-line text measured against the width it is given: when the full
+/// text does not fit, the widest suffix that fits is shaped and painted
+/// instead, without a marker. GPUI's own truncation only cuts the end.
+struct StartTruncatedText {
+    text: SharedString,
+    state: Rc<RefCell<Option<StartTruncateState>>>,
+}
+
+struct StartTruncateState {
+    line: WrappedLine,
+    line_height: Pixels,
+    width: Option<Pixels>,
+    bounds: Option<Bounds<Pixels>>,
+}
+
+impl IntoElement for StartTruncatedText {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for StartTruncatedText {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let text_style = window.text_style();
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let line_height = text_style
+            .line_height
+            .to_pixels(font_size.into(), window.rem_size());
+        let text = self.text.clone();
+        let state = self.state.clone();
+        let layout_id = window.request_measured_layout(
+            Default::default(),
+            move |known_dimensions, available_space, window, _cx| {
+                let width = known_dimensions.width.or(match available_space.width {
+                    AvailableSpace::Definite(width) => Some(width),
+                    _ => None,
+                });
+                // The measure runs several times per frame; shape once per width.
+                if let Some(inner) = state.borrow().as_ref()
+                    && inner.width == width
+                {
+                    return Size {
+                        width: inner.line.width(),
+                        height: inner.line_height,
+                    };
+                }
+                let shape = |content: SharedString| {
+                    let runs = vec![text_style.to_run(content.len())];
+                    window
+                        .text_system()
+                        .shape_text(content, font_size, &runs, None, None)
+                        .ok()
+                        .and_then(|mut lines| lines.pop())
+                };
+                let Some(mut line) = shape(text.clone()) else {
+                    return Size::default();
+                };
+                if let Some(width) = width
+                    && line.width() > width
+                {
+                    // Suffix widths shrink monotonically as the cut moves
+                    // right, so binary-search the first one that fits.
+                    let boundaries: Vec<usize> =
+                        text.char_indices().map(|(index, _)| index).collect();
+                    let (mut low, mut high) = (0, boundaries.len());
+                    let mut fitted = None;
+                    while low < high {
+                        let middle = (low + high) / 2;
+                        let candidate = SharedString::from(text[boundaries[middle]..].to_string());
+                        match shape(candidate.clone()) {
+                            Some(candidate_line) if candidate_line.width() <= width => {
+                                fitted = Some(candidate_line);
+                                high = middle;
+                            }
+                            _ => low = middle + 1,
+                        }
+                    }
+                    line = fitted
+                        .unwrap_or_else(|| shape(SharedString::from("")).unwrap_or(line.clone()));
+                }
+                let size = Size {
+                    width: line.width().min(width.unwrap_or(line.width())),
+                    height: line_height,
+                };
+                *state.borrow_mut() = Some(StartTruncateState {
+                    line,
+                    line_height,
+                    width,
+                    bounds: None,
+                });
+                size
+            },
+        );
+        (layout_id, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+        if let Some(inner) = self.state.borrow_mut().as_mut() {
+            inner.bounds = Some(bounds);
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        _prepaint: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let state = self.state.borrow();
+        if let Some(inner) = state.as_ref()
+            && let Some(bounds) = inner.bounds
+        {
+            let _ = inner.line.paint(
+                bounds.origin,
+                inner.line_height,
+                Default::default(),
+                Some(bounds),
+                window,
+                cx,
+            );
+        }
     }
 }
 

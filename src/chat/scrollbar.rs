@@ -7,6 +7,15 @@ use gpui::{MouseDownEvent, MouseMoveEvent, Pixels, ScrollWheelEvent, point};
 use super::*;
 use crate::ui::scrollbar::{ScrollDrag, thumb_height};
 
+/// Scroll metrics captured after the list measured its rows, together with
+/// the row count they belong to.
+pub(super) struct ScrollSnapshot {
+    pub rows: usize,
+    pub track: Pixels,
+    pub content: Pixels,
+    pub offset: Pixels,
+}
+
 impl ChatView {
     /// Track height, whole content height and the current offset, or `None`
     /// when the rows fit and need no scrollbar.
@@ -60,8 +69,42 @@ impl ChatView {
         cx.notify();
     }
 
+    /// Captures the metrics once the list has measured its rows for this
+    /// frame. The probe sits right after the list, so its prepaint runs after
+    /// the list's; render itself runs before it, when a row spliced by the
+    /// latest streaming batch is still unmeasured and contributes no height.
+    /// Reading live metrics there collapses the content height (and the thumb
+    /// to full track height) on every batch, which flickers the scrollbar.
+    pub(super) fn render_scroll_probe(&self, cx: &mut Context<Self>) -> AnyElement {
+        let entity = cx.entity();
+        canvas(
+            move |_, _, cx| {
+                entity.update(cx, |this, _| {
+                    this.scroll_snapshot =
+                        this.scroll_metrics()
+                            .map(|(track, content, offset)| ScrollSnapshot {
+                                rows: this.rows.len(),
+                                track,
+                                content,
+                                offset,
+                            });
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0()
+        .into_any_element()
+    }
+
     pub(super) fn render_scrollbar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (track, content, offset) = self.scroll_metrics()?;
+        // A frame old, but always measured; a reset changes the row count and
+        // drops the stale snapshot instead of drawing it for one frame.
+        let snapshot = self.scroll_snapshot.as_ref()?;
+        if snapshot.rows != self.rows.len() {
+            return None;
+        }
+        let (track, content, offset) = (snapshot.track, snapshot.content, snapshot.offset);
         let colors = cx.theme().colors.clone();
         let thumb = thumb_height(track, content);
         let thumb_y = (track - thumb) * (f32::from(offset) / f32::from(content - track));

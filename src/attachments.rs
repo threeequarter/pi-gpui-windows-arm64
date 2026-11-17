@@ -176,6 +176,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "image_paths_in scans /-prefixed paths; Windows paths use backslashes"
+    )]
     fn finds_existing_image_paths_even_with_spaces() {
         let directory = std::env::temp_dir().join(format!("pi gpui images {}", unique_id()));
         std::fs::create_dir_all(&directory).unwrap();
