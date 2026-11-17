@@ -1,6 +1,6 @@
 //! A read-only view of one project file in its own window, opened from the
 //! Files and Changes panels: markdown rendered, other text with syntax colors
-//! and line numbers, binary files only named. A file changed against HEAD can
+//! and line numbers, binary files left blank. A file changed against HEAD can
 //! also be shown as an inline or a side-by-side diff. The view follows
 //! changes made to the file on disk.
 
@@ -221,7 +221,7 @@ impl FileViewer {
     }
 
     fn selection_for(path: &Path, focus: FocusHandle) -> TextSelection {
-        let mut selection = TextSelection::new(focus);
+        let mut selection = TextSelection::new(focus).with_copy_on_select();
         if let Some(parent) = path.parent() {
             selection = selection.with_link_base(parent.to_path_buf());
         }
@@ -264,7 +264,7 @@ impl FileViewer {
                     this.selection
                         .update(cx, |selection, cx| selection.clear(cx));
                 }
-                this.update_list(reload);
+                this.update_list(reload, cx);
                 cx.notify();
             })
             .ok();
@@ -291,7 +291,7 @@ impl FileViewer {
                 if this.mode.is_diff() && !matches!(this.diff, DiffState::Changed(_)) {
                     this.mode = ViewMode::File;
                 }
-                this.update_list(reload);
+                this.update_list(reload, cx);
                 cx.notify();
             })
             .ok();
@@ -305,6 +305,7 @@ impl FileViewer {
         self.mode = mode;
         self.scroll_drag = None;
         self.reset_list();
+        self.sync_selection_blocks(cx);
         cx.notify();
     }
 
@@ -324,12 +325,34 @@ impl FileViewer {
     }
 
     /// Resets the list for new rows; a reload keeps the scroll position.
-    fn update_list(&mut self, reload: bool) {
+    fn update_list(&mut self, reload: bool, cx: &mut Context<Self>) {
         let top = self.list.logical_scroll_top();
         self.reset_list();
         if reload {
             self.list.scroll_to(top);
         }
+        self.sync_selection_blocks(cx);
+    }
+
+    /// Registers the current mode's selectable lines, so a drag can cross
+    /// them; markdown keeps selection inside one block.
+    fn sync_selection_blocks(&mut self, cx: &mut Context<Self>) {
+        let groups = match (self.mode, &self.content, &self.diff) {
+            (ViewMode::File, Content::Text { lines, .. }, _) => vec![
+                lines
+                    .iter()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        (SharedString::from(format!("file:{index}")), line.clone())
+                    })
+                    .collect(),
+            ],
+            (ViewMode::InlineDiff, _, DiffState::Changed(view)) => vec![view.inline_blocks()],
+            (ViewMode::SplitDiff, _, DiffState::Changed(view)) => view.split_blocks(),
+            _ => Vec::new(),
+        };
+        self.selection
+            .update(cx, |selection, cx| selection.set_blocks(groups, cx));
     }
 
     fn shows_markdown(&self) -> bool {
@@ -527,7 +550,7 @@ impl FileViewer {
         }
         match &self.content {
             Content::Loading => render_message("Loading…".to_string()),
-            Content::Binary => render_message("Binary file: open it in an editor.".to_string()),
+            Content::Binary => div().flex_1().into_any_element(),
             Content::Failed(error) => render_message(format!("Could not read the file: {error}")),
             Content::Text { lines, .. } if lines.is_empty() => {
                 render_message("Empty file.".to_string())
@@ -628,7 +651,7 @@ impl FileViewer {
             return render_message("Loading…".to_string());
         };
         if view.binary {
-            return render_message("Binary file: no text diff.".to_string());
+            return div().flex_1().into_any_element();
         }
         if view.is_empty() {
             return render_message("No text changes.".to_string());

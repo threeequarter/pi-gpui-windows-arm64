@@ -2,20 +2,23 @@
 //! thoughts and tool output in the transcript. Plain GPUI text cannot be
 //! selected, so this element shapes and paints its text itself.
 //!
-//! A selection lives inside one block (one message, one thought...). It is
-//! stored in a shared [`TextSelection`] entity rather than in the element, so
-//! it survives the virtualized list re-creating rows while scrolling.
+//! A selection lives inside one block (one message, one thought...) unless
+//! the owner registers ordered blocks with [`TextSelection::set_blocks`], as
+//! the file viewer does for its lines. It is stored in a shared
+//! [`TextSelection`] entity rather than in the element, so it survives the
+//! virtualized list re-creating rows while scrolling.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{
-    App, AvailableSpace, Bounds, Context, CursorStyle, DispatchPhase, ElementId, Entity,
-    FocusHandle, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, SharedString,
-    StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, point, prelude::*,
-    px, relative, size,
+    App, AvailableSpace, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, ElementId,
+    Entity, FocusHandle, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels,
+    SharedString, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill,
+    point, prelude::*, px, relative, size,
 };
 
 use crate::text_input::{TextLayout, paragraph_range_at, word_range_at};
@@ -44,6 +47,40 @@ pub struct TextSelection {
     copy_focus: FocusHandle,
     /// Relative file links resolve against this folder (the session's project).
     link_base: Option<PathBuf>,
+    /// Ordered blocks the selection may cross; `None` keeps it in one block.
+    blocks: Option<Blocks>,
+    /// Copy every finished selection to the clipboard on mouse release.
+    copy_on_select: bool,
+}
+
+/// Ordered text blocks selected as one document: the file viewer's lines.
+/// Each group selects on its own (the split diff's old and new sides).
+#[derive(PartialEq)]
+struct Blocks {
+    /// Block key → (group, start in the group's text, byte length).
+    map: HashMap<SharedString, (usize, usize, usize)>,
+    /// The groups' texts, their blocks joined with '\n'.
+    groups: Vec<SharedString>,
+}
+
+impl Blocks {
+    fn new(groups: Vec<Vec<(SharedString, SharedString)>>) -> Option<Self> {
+        let mut map = HashMap::new();
+        let mut texts = Vec::new();
+        for (group, blocks) in groups.iter().enumerate() {
+            let mut text = String::new();
+            for (index, (key, block)) in blocks.iter().enumerate() {
+                if index > 0 {
+                    text.push('\n');
+                }
+                let start = text.len();
+                text.push_str(block);
+                map.insert(key.clone(), (group, start, block.len()));
+            }
+            texts.push(SharedString::from(text));
+        }
+        (!map.is_empty()).then_some(Self { map, groups: texts })
+    }
 }
 
 impl TextSelection {
@@ -56,12 +93,35 @@ impl TextSelection {
             dragging: false,
             copy_focus,
             link_base: None,
+            blocks: None,
+            copy_on_select: false,
         }
     }
 
     pub fn with_link_base(mut self, base: PathBuf) -> Self {
         self.link_base = Some(base);
         self
+    }
+
+    pub fn with_copy_on_select(mut self) -> Self {
+        self.copy_on_select = true;
+        self
+    }
+
+    /// Ordered blocks selectable across, one group per independent column;
+    /// an empty list returns to selection inside one block. A changed
+    /// registry clears the selection, whose offsets point into the old text.
+    pub fn set_blocks(
+        &mut self,
+        groups: Vec<Vec<(SharedString, SharedString)>>,
+        cx: &mut Context<Self>,
+    ) {
+        let blocks = Blocks::new(groups);
+        if blocks == self.blocks {
+            return;
+        }
+        self.blocks = blocks;
+        self.clear(cx);
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -83,19 +143,104 @@ impl TextSelection {
     }
 
     fn range_in(&self, key: &SharedString) -> Option<Range<usize>> {
+        if let Some(blocks) = &self.blocks
+            && let Some(&(group, start, len)) = blocks.map.get(key)
+        {
+            if self.anchor_group(blocks) != Some(group) {
+                return None;
+            }
+            let range = self.range();
+            // An empty line renders as one space; highlight it when covered.
+            if len == 0 {
+                return (range.start <= start && start < range.end).then_some(0..1);
+            }
+            let local = range.start.max(start)..range.end.min(start + len);
+            return (!local.is_empty()).then(|| local.start - start..local.end - start);
+        }
         (self.block.as_ref() == Some(key)).then(|| self.range())
     }
 
+    /// Whether the selection starts before this block and ends past it, so
+    /// the highlight spans the full width at the block's edges.
+    fn edges(&self, key: &SharedString) -> (bool, bool) {
+        if let Some(blocks) = &self.blocks
+            && let Some(&(group, start, len)) = blocks.map.get(key)
+            && self.anchor_group(blocks) == Some(group)
+        {
+            let range = self.range();
+            return (range.start < start, range.end > start + len);
+        }
+        (false, false)
+    }
+
+    fn anchor_group(&self, blocks: &Blocks) -> Option<usize> {
+        self.block
+            .as_ref()
+            .and_then(|key| blocks.map.get(key))
+            .map(|&(group, ..)| group)
+    }
+
+    /// Whether a drag may move the head into this block.
+    fn drag_reaches(&self, key: &SharedString) -> bool {
+        if !self.dragging {
+            return false;
+        }
+        match &self.blocks {
+            Some(blocks) => {
+                let group = blocks.map.get(key).map(|&(group, ..)| group);
+                group.is_some() && group == self.anchor_group(blocks)
+            }
+            None => self.block.as_ref() == Some(key),
+        }
+    }
+
+    fn extend(&mut self, key: &SharedString, offset: usize, cx: &mut Context<Self>) {
+        let head = match &self.blocks {
+            Some(blocks) => {
+                let Some(&(group, start, len)) = blocks.map.get(key) else {
+                    return;
+                };
+                if self.anchor_group(blocks) != Some(group) {
+                    return;
+                }
+                start + offset.min(len)
+            }
+            None => offset,
+        };
+        if self.head != head {
+            self.head = head;
+            cx.notify();
+        }
+    }
+
+    /// The mouse button was released over this block: ends a drag and
+    /// reports the text to copy when copy-on-select is on.
+    fn released(&mut self, owned: bool, clicks: usize) -> Option<String> {
+        if !owned && self.blocks.is_none() {
+            return None;
+        }
+        let dragging = std::mem::replace(&mut self.dragging, false);
+        (self.copy_on_select && (dragging || owned && clicks >= 2))
+            .then(|| self.selected_text())
+            .flatten()
+    }
+
     fn begin(&mut self, key: SharedString, text: SharedString, offset: usize, clicks: usize) {
+        let placed = self.blocks.as_ref().and_then(|blocks| {
+            let &(group, start, len) = blocks.map.get(&key)?;
+            Some((blocks.groups[group].clone(), start, len))
+        });
+        let (document, start, len) = placed.unwrap_or_else(|| (text.clone(), 0, text.len()));
+        let offset = offset.min(len);
         let range = match clicks {
             2 => word_range_at(&text, offset),
             3.. => paragraph_range_at(&text, offset),
             _ => offset..offset,
         };
         self.block = Some(key);
-        self.text = text;
-        self.anchor = range.start;
-        self.head = range.end;
+        self.text = document;
+        self.anchor = start + range.start.min(len);
+        self.head = start + range.end.min(len);
         self.dragging = clicks == 1;
     }
 }
@@ -377,18 +522,23 @@ impl Element for SelectableText {
         let wrap_width = (!self.no_wrap).then_some(bounds.size.width);
         let layout = self.shape(wrap_width, window, cx).map(Rc::new);
         let mut selections = Vec::new();
-        if let (Some(layout), Some(range)) = (&layout, self.selection.read(cx).range_in(&self.key))
-        {
+        let selection = self.selection.read(cx);
+        if let (Some(layout), Some(range)) = (&layout, selection.range_in(&self.key)) {
             let range = range.start.min(self.text.len())..range.end.min(self.text.len());
             if !range.is_empty() {
+                let (before, beyond) = selection.edges(&self.key);
                 let start = layout.position_for_offset(range.start);
                 let end = layout.position_for_offset(range.end);
                 let color = cx.theme().colors.info.opacity(0.3);
                 let line_height = layout.line_height;
                 let mut row_top = start.y;
                 while row_top <= end.y {
-                    let left = if row_top == start.y { start.x } else { px(0.) };
-                    let right = if row_top == end.y {
+                    let left = if row_top == start.y && !before {
+                        start.x
+                    } else {
+                        px(0.)
+                    };
+                    let right = if row_top == end.y && !beyond {
                         end.x
                     } else {
                         bounds.size.width
@@ -492,23 +642,36 @@ impl Element for SelectableText {
             let layout = layout.clone();
             let selection = selection.clone();
             let key = key.clone();
-            move |event: &MouseMoveEvent, phase, _window, cx| {
+            let hitbox = prepaint.hitbox.clone();
+            move |event: &MouseMoveEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
                 }
-                let dragging_here = {
+                let (reaches, cross_block) = {
                     let selection = selection.read(cx);
-                    selection.dragging && selection.block.as_ref() == Some(&key)
+                    (selection.drag_reaches(&key), selection.blocks.is_some())
                 };
-                if dragging_here {
-                    let offset = layout.offset_for_position(event.position - origin);
-                    selection.update(cx, |selection, cx| {
-                        if selection.head != offset {
-                            selection.head = offset;
-                            cx.notify();
-                        }
-                    });
+                if !reaches {
+                    return;
                 }
+                if cross_block {
+                    // Released outside the window: the move arrives without
+                    // the button.
+                    if event.pressed_button != Some(MouseButton::Left) {
+                        let copy = selection.update(cx, |selection, _| selection.released(true, 1));
+                        if let Some(text) = copy {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
+                        return;
+                    }
+                    // Every painted block receives the move; only the
+                    // hovered one may move the head.
+                    if !hitbox.is_hovered(window) {
+                        return;
+                    }
+                }
+                let offset = layout.offset_for_position(event.position - origin);
+                selection.update(cx, |selection, cx| selection.extend(&key, offset, cx));
             }
         });
         let links: Vec<(Range<usize>, SharedString)> = self
@@ -521,14 +684,14 @@ impl Element for SelectableText {
             if phase != DispatchPhase::Bubble {
                 return;
             }
-            let clicked = selection.update(cx, |selection, _| {
+            let (clicked, copy) = selection.update(cx, |selection, _| {
                 let owned = selection.block.as_ref() == Some(&key);
                 let clicked = owned && selection.dragging && selection.range().is_empty();
-                if owned {
-                    selection.dragging = false;
-                }
-                clicked
+                (clicked, selection.released(owned, event.click_count))
             });
+            if let Some(text) = copy {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
             // A click that selected nothing follows a link under the pointer.
             if clicked && !links.is_empty() && hitbox.is_hovered(window) {
                 let offset = layout.offset_for_position(event.position - origin);

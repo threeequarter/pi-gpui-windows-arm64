@@ -71,6 +71,45 @@ impl DiffView {
         self.split_rows.len()
     }
 
+    /// The inline layout's selectable blocks, in row order.
+    pub(super) fn inline_blocks(&self) -> Vec<(SharedString, SharedString)> {
+        self.lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.kind != LineKind::Hunk)
+            .map(|(index, _)| {
+                (
+                    SharedString::from(format!("diff:{index}")),
+                    self.texts[index].clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// The split layout's two sides, each selectable on its own top to bottom.
+    pub(super) fn split_blocks(&self) -> Vec<Vec<(SharedString, SharedString)>> {
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for row in &self.split_rows {
+            let SplitRow::Pair(old_index, new_index) = row else {
+                continue;
+            };
+            if let Some(index) = old_index {
+                old.push((
+                    SharedString::from(format!("old:{index}")),
+                    self.texts[*index].clone(),
+                ));
+            }
+            if let Some(index) = new_index {
+                new.push((
+                    SharedString::from(format!("new:{index}")),
+                    self.texts[*index].clone(),
+                ));
+            }
+        }
+        vec![old, new]
+    }
+
     /// Digits of the largest line number, for the gutter width.
     pub(super) fn number_digits(&self) -> usize {
         self.numbers
