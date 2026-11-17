@@ -46,7 +46,7 @@ impl ProjectWatcher {
                 }
             })
             .detach();
-        let (sender, mut receiver) = mpsc::unbounded::<()>();
+        let (sender, receiver) = mpsc::unbounded::<()>();
         let watch_root = root.clone();
         let mut watcher =
             notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
@@ -81,35 +81,44 @@ impl ProjectWatcher {
         watcher
             .watch(&root, RecursiveMode::Recursive)
             .map_err(|error| error.to_string())?;
-        let task = cx.spawn(async move |this, cx| {
-            while receiver.next().await.is_some() {
-                // Let the burst settle, then take everything that queued up.
-                let started = Instant::now();
-                loop {
-                    cx.background_executor().timer(SETTLE_DELAY).await;
-                    let mut more = false;
-                    while let Ok(Some(())) = receiver.try_next() {
-                        more = true;
-                    }
-                    if !more || started.elapsed() >= MAX_DELAY {
-                        break;
-                    }
-                }
-                if this.update(cx, |this, cx| on_change(this, cx)).is_err() {
-                    break;
-                }
-            }
-        });
         Ok(Self {
             root,
             _watcher: watcher,
-            _task: task,
+            _task: when_settled(receiver, on_change, cx),
         })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
+}
+
+/// Calls `on_change` on the foreground once a burst of signals from a
+/// watcher settles.
+pub fn when_settled<T: 'static>(
+    mut receiver: mpsc::UnboundedReceiver<()>,
+    on_change: impl Fn(&mut T, &mut Context<T>) + 'static,
+    cx: &mut Context<T>,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        while receiver.next().await.is_some() {
+            // Let the burst settle, then take everything that queued up.
+            let started = Instant::now();
+            loop {
+                cx.background_executor().timer(SETTLE_DELAY).await;
+                let mut more = false;
+                while let Ok(Some(())) = receiver.try_next() {
+                    more = true;
+                }
+                if !more || started.elapsed() >= MAX_DELAY {
+                    break;
+                }
+            }
+            if this.update(cx, |this, cx| on_change(this, cx)).is_err() {
+                break;
+            }
+        }
+    })
 }
 
 fn is_gitignore(path: &Path) -> bool {

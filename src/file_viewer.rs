@@ -1,23 +1,27 @@
 //! A read-only view of one project file in its own window, opened from the
 //! Files and Changes panels: markdown rendered, other text with syntax colors
 //! and line numbers, binary files only named. A file changed against HEAD can
-//! also be shown as an inline or a side-by-side diff.
+//! also be shown as an inline or a side-by-side diff. The view follows
+//! changes made to the file on disk.
 
 use std::io::Read as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use futures::channel::mpsc;
 use gpui::{
     AnyElement, ClipboardItem, Context, Corners, Entity, FocusHandle, FontWeight, Hsla, KeyBinding,
     ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, ScrollHandle,
     ScrollWheelEvent, SharedString, Subscription, Task, Window, WindowControlArea, actions, div,
     list, point, px,
 };
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 
 use crate::diff;
 use crate::hub::{TITLE_BAR_HEIGHT, TRAFFIC_LIGHT_PADDING, render_window_controls};
 use crate::markdown::{self, Node};
 use crate::platform;
+use crate::project_watcher;
 use crate::selectable::{SelectableText, SpanStyle, TextSelection};
 use crate::settings::Settings;
 use crate::ui::prelude::*;
@@ -119,6 +123,8 @@ pub struct FileViewer {
     _selection_subscription: Subscription,
     _load: Task<()>,
     _diff_load: Task<()>,
+    _watcher: Option<RecommendedWatcher>,
+    _watch: Task<()>,
 }
 
 impl FileViewer {
@@ -147,8 +153,11 @@ impl FileViewer {
             _selection_subscription: selection_subscription,
             _load: Task::ready(()),
             _diff_load: Task::ready(()),
+            _watcher: None,
+            _watch: Task::ready(()),
         };
         this.start_load(cx);
+        this.watch_file(cx);
         this
     }
 
@@ -164,7 +173,51 @@ impl FileViewer {
         self.selection = cx.new(|_| Self::selection_for(&self.path, self.focus.clone()));
         self._selection_subscription = cx.observe(&self.selection, |_, _, cx| cx.notify());
         self.start_load(cx);
+        self.watch_file(cx);
         cx.notify();
+    }
+
+    /// Reads the file again after it changes on disk. The folder is watched,
+    /// not the file: editors often save by renaming a new file over the old
+    /// one, which ends a watch on the file itself.
+    fn watch_file(&mut self, cx: &mut Context<Self>) {
+        self._watcher = None;
+        self._watch = Task::ready(());
+        let (Some(folder), Some(name)) = (self.path.parent(), self.path.file_name()) else {
+            return;
+        };
+        let name = name.to_os_string();
+        let (sender, receiver) = mpsc::unbounded::<()>();
+        let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+            let Ok(event) = result else {
+                return;
+            };
+            // Our own reads arrive as access events.
+            if matches!(event.kind, EventKind::Access(_)) {
+                return;
+            }
+            if event
+                .paths
+                .iter()
+                .any(|path| path.file_name() == Some(name.as_os_str()))
+            {
+                sender.unbounded_send(()).ok();
+            }
+        })
+        .and_then(|mut watcher| {
+            watcher
+                .watch(folder, RecursiveMode::NonRecursive)
+                .map(|()| watcher)
+        });
+        match watcher {
+            Ok(watcher) => {
+                self._watcher = Some(watcher);
+                self._watch = project_watcher::when_settled(receiver, Self::reload, cx);
+            }
+            Err(error) => {
+                eprintln!("pi-gpui: cannot watch {}: {error}", self.path.display());
+            }
+        }
     }
 
     fn selection_for(path: &Path, focus: FocusHandle) -> TextSelection {
@@ -181,6 +234,16 @@ impl FileViewer {
         self.markdown_as_text = false;
         self.size = 0;
         self.diff = DiffState::Loading;
+        self.read(false, cx);
+    }
+
+    /// Keeps the shown content and the scroll position until the new content
+    /// arrives.
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        self.read(true, cx);
+    }
+
+    fn read(&mut self, reload: bool, cx: &mut Context<Self>) {
         let syntax = cx.theme().colors.syntax;
         let read_path = self.path.clone();
         let read = cx.background_spawn(async move { load(&read_path, &syntax) });
@@ -196,7 +259,12 @@ impl FileViewer {
                     }
                     Err(error) => this.content = Content::Failed(error),
                 }
-                this.reset_list();
+                if reload {
+                    // The selected offsets point into the old text.
+                    this.selection
+                        .update(cx, |selection, cx| selection.clear(cx));
+                }
+                this.update_list(reload);
                 cx.notify();
             })
             .ok();
@@ -223,7 +291,7 @@ impl FileViewer {
                 if this.mode.is_diff() && !matches!(this.diff, DiffState::Changed(_)) {
                     this.mode = ViewMode::File;
                 }
-                this.reset_list();
+                this.update_list(reload);
                 cx.notify();
             })
             .ok();
@@ -253,6 +321,15 @@ impl FileViewer {
 
     fn reset_list(&mut self) {
         self.list.reset(self.list_rows().unwrap_or(0));
+    }
+
+    /// Resets the list for new rows; a reload keeps the scroll position.
+    fn update_list(&mut self, reload: bool) {
+        let top = self.list.logical_scroll_top();
+        self.reset_list();
+        if reload {
+            self.list.scroll_to(top);
+        }
     }
 
     fn shows_markdown(&self) -> bool {
