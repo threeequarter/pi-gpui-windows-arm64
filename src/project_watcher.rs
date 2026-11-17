@@ -60,6 +60,13 @@ impl ProjectWatcher {
                 if matches!(event.kind, EventKind::Access(_)) {
                     return;
                 }
+                if event
+                    .paths
+                    .iter()
+                    .any(|path| changes_repositories(path, &event.kind))
+                {
+                    crate::git::forget_repositories(&watch_root);
+                }
                 if event.paths.iter().any(|path| is_gitignore(path)) {
                     let folders = ignored_folders(&watch_root);
                     if let Ok(mut ignored) = ignored.write() {
@@ -125,16 +132,27 @@ fn is_gitignore(path: &Path) -> bool {
     path.file_name().is_some_and(|name| name == ".gitignore")
 }
 
+/// A repository appeared or went away, or what decides the nested ones
+/// changed: ignore rules and submodules. Git's own writes only modify a
+/// `.git` folder, so those do not count.
+fn changes_repositories(path: &Path, kind: &EventKind) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let created_or_removed = matches!(kind, EventKind::Create(_) | EventKind::Remove(_));
+    (name == ".git" && created_or_removed) || name == ".gitmodules" || name == ".gitignore"
+}
+
 /// Worth a refresh: a project file outside ignored folders, or the git state
-/// the panels show (index, HEAD, branches). Object writes and lock files
-/// inside `.git` come with every git command and are noise.
+/// the panels show (index, HEAD, branches) of any repository in the project.
+/// Object writes and lock files inside `.git` come with every git command
+/// and are noise.
 fn is_relevant(path: &Path, root: &Path, ignored: &[PathBuf]) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return true;
     };
     let mut components = relative.components();
-    let first = components.next();
-    if first.is_some_and(|component| component.as_os_str() == ".git") {
+    if components.any(|component| component.as_os_str() == ".git") {
         let rest = components.as_path();
         if rest
             .extension()
@@ -150,9 +168,19 @@ fn is_relevant(path: &Path, root: &Path, ignored: &[PathBuf]) -> bool {
     !ignored.iter().any(|folder| path.starts_with(folder))
 }
 
-/// Ignored folders and files under `root`, as git reports them (whole
-/// folders where it can). Empty outside a git work tree.
+/// Ignored folders and files under `root`, as each repository in it reports
+/// them (whole folders where it can). A repository one of them ignores
+/// still counts. Empty outside a git work tree.
 fn ignored_folders(root: &Path) -> Vec<PathBuf> {
+    let repositories = crate::git::repositories(root).unwrap_or_default();
+    crate::git::for_each_repository(&repositories, ignored_in)
+        .into_iter()
+        .flatten()
+        .filter(|path| path.starts_with(root) && !repositories.contains(path))
+        .collect()
+}
+
+fn ignored_in(root: &Path) -> Vec<PathBuf> {
     let output = Command::new("git")
         .without_console_window()
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -195,5 +223,20 @@ mod tests {
         assert!(!relevant(".git/index.lock"));
         assert!(!relevant(".git/objects/ab/cdef"));
         assert!(!relevant("target/debug/pi-gpui.exe"));
+        assert!(relevant("code/app/.git/index"));
+        assert!(!relevant("code/app/.git/objects/ab/cdef"));
+    }
+
+    #[test]
+    fn repositories_change_with_a_new_git_folder_or_ignore_rules() {
+        let create = EventKind::Create(notify::event::CreateKind::Folder);
+        let modify = EventKind::Modify(notify::event::ModifyKind::Any);
+        assert!(changes_repositories(Path::new("code/app/.git"), &create));
+        assert!(!changes_repositories(Path::new("code/app/.git"), &modify));
+        assert!(changes_repositories(Path::new("code/.gitignore"), &modify));
+        assert!(!changes_repositories(
+            Path::new("code/app/main.rs"),
+            &create
+        ));
     }
 }

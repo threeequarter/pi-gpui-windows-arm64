@@ -1,9 +1,11 @@
 //! The Changes panel: `git diff` of the selected project against
 //! HEAD, untracked files included, with the git client around it: staging
 //! from the index, discarding a file's changes, commit and amend, branch
-//! switching, fetch/pull/push and a commit message written by pi. A file's
-//! diff opens in the file viewer. Git is run directly with separate arguments, never
-//! through a shell; every git and pi call runs in the background.
+//! switching, fetch/pull/push and a commit message written by pi. A project
+//! holding nested repositories shows one at a time, picked as in Zed's git
+//! panel. A file's diff opens in the file viewer. Git is run directly with
+//! separate arguments, never through a shell; every git and pi call runs in
+//! the background.
 
 use std::collections::HashMap;
 use std::fs;
@@ -190,6 +192,7 @@ impl GitAction {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Popover {
+    Repositories,
     Branches,
     Remotes(GitAction),
 }
@@ -205,6 +208,15 @@ fn stage_state(entry: &StatusEntry) -> ToggleState {
 
 pub struct DiffPanel {
     workspace: Option<PathBuf>,
+    /// The project's repository first, then the nested ones.
+    repositories: Vec<PathBuf>,
+    /// The repository shown; `None` until the first load picks one.
+    repository: Option<PathBuf>,
+    /// The repository shown in each other project.
+    chosen_repositories: HashMap<PathBuf, PathBuf>,
+    /// The repositories shown before, by root, as last read.
+    stashed: HashMap<PathBuf, (Changes, RepoStatus)>,
+    repository_menu: bool,
     state: State,
     /// A refresh is in flight while the previous result stays on screen.
     refreshing: bool,
@@ -217,7 +229,7 @@ pub struct DiffPanel {
     /// The popover a click outside closed last, and when.
     closed_popover: Option<(Popover, Instant)>,
     commit_input: Entity<TextInput>,
-    /// Unsent commit messages of the other projects, by workspace.
+    /// Unsent commit messages of the other repositories, by root.
     drafts: HashMap<PathBuf, String>,
     amend: bool,
     busy: Option<GitAction>,
@@ -244,6 +256,11 @@ impl DiffPanel {
         let subscriptions = vec![cx.observe(&commit_input, |_, _, cx| cx.notify())];
         Self {
             workspace: None,
+            repositories: Vec::new(),
+            repository: None,
+            chosen_repositories: HashMap::new(),
+            stashed: HashMap::new(),
+            repository_menu: false,
             state: State::NoProject,
             refreshing: false,
             refresh_pending: false,
@@ -271,39 +288,104 @@ impl DiffPanel {
         if self.workspace == workspace {
             return false;
         }
-        if let Some(previous) = self.workspace.take() {
-            let draft = self.commit_input.read(cx).text().to_string();
-            if draft.trim().is_empty() {
-                self.drafts.remove(&previous);
-            } else {
-                self.drafts.insert(previous, draft);
-            }
+        self.save_draft(cx);
+        self.stash_loaded();
+        if let Some(previous) = self.workspace.take()
+            && let Some(repository) = self.repository.take()
+        {
+            self.chosen_repositories.insert(previous, repository);
         }
         self.workspace = workspace;
-        let draft = self
+        self.repository = self
             .workspace
             .as_ref()
-            .and_then(|workspace| self.drafts.remove(workspace))
+            .and_then(|workspace| self.chosen_repositories.get(workspace).cloned());
+        self.restore_draft(cx);
+        self.repositories = self
+            .workspace
+            .as_deref()
+            .map(git::known_repositories)
             .unwrap_or_default();
-        self.commit_input
-            .update(cx, |input, cx| input.set_text(draft, cx));
-        self.branch_picker = None;
-        self.remote_menu = None;
         self.state = if self.workspace.is_some() {
-            State::Loading
+            self.unstash_loaded()
         } else {
             State::NoProject
         };
+        self.drop_repository_work();
+        cx.notify();
+        true
+    }
+
+    /// Shows another repository of the project.
+    fn select_repository(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        self.repository_menu = false;
+        if self.repository.as_ref() == Some(&root) {
+            cx.notify();
+            return;
+        }
+        self.save_draft(cx);
+        self.stash_loaded();
+        self.repository = Some(root);
+        self.restore_draft(cx);
+        self.state = self.unstash_loaded();
+        self.drop_repository_work();
+        self.refresh(cx);
+    }
+
+    /// Keeps the repository shown as it was last read, to show it at once
+    /// on coming back while the refresh reads it again.
+    fn stash_loaded(&mut self) {
+        if let State::Loaded(changes, status) = std::mem::replace(&mut self.state, State::Loading) {
+            self.stashed.insert(changes.root.clone(), (changes, status));
+        }
+    }
+
+    /// The stashed state of the repository picked now, or `Loading`.
+    fn unstash_loaded(&mut self) -> State {
+        self.repository
+            .as_ref()
+            .and_then(|repository| self.stashed.remove(repository))
+            .map_or(State::Loading, |(changes, status)| {
+                State::Loaded(changes, status)
+            })
+    }
+
+    /// Forgets the popovers, the load and the action in flight: they belong
+    /// to the repository shown before, and their results are dropped.
+    fn drop_repository_work(&mut self) {
+        self.branch_picker = None;
+        self.remote_menu = None;
+        self.repository_menu = false;
         self._task = Task::ready(());
         self.refreshing = false;
         self.refresh_pending = false;
-        // A running action belongs to the old project; its result is dropped.
         self._action_task = Task::ready(());
         self.busy = None;
         self.action_error = None;
         self.amend = false;
-        cx.notify();
-        true
+    }
+
+    /// Keeps the unsent commit message of the repository shown.
+    fn save_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository.clone() else {
+            return;
+        };
+        let draft = self.commit_input.read(cx).text().to_string();
+        if draft.trim().is_empty() {
+            self.drafts.remove(&repository);
+        } else {
+            self.drafts.insert(repository, draft);
+        }
+    }
+
+    fn restore_draft(&mut self, cx: &mut Context<Self>) {
+        let draft = self
+            .repository
+            .as_ref()
+            .and_then(|repository| self.drafts.remove(repository))
+            .unwrap_or_default();
+        self.commit_input
+            .update(cx, |input, cx| input.set_text(draft, cx));
     }
 
     pub fn workspace(&self) -> Option<&Path> {
@@ -360,14 +442,28 @@ impl DiffPanel {
             return;
         }
         self.refreshing = true;
-        let load = cx.background_spawn(async move { load_repository(&workspace) });
+        let preferred = self.repository.clone();
+        let load =
+            cx.background_spawn(async move { load_repository(&workspace, preferred.as_deref()) });
         self._task = cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
                 this.refreshing = false;
                 this.state = match result {
-                    Ok(Some((changes, status))) => State::Loaded(changes, status),
-                    Ok(None) => State::NotARepository,
+                    Ok(Some((repositories, changes, status))) => {
+                        this.repositories = repositories;
+                        // The first load, or the one shown before is gone.
+                        if this.repository.as_ref() != Some(&changes.root) {
+                            this.save_draft(cx);
+                            this.repository = Some(changes.root.clone());
+                            this.restore_draft(cx);
+                        }
+                        State::Loaded(changes, status)
+                    }
+                    Ok(None) => {
+                        this.repositories.clear();
+                        State::NotARepository
+                    }
                     Err(error) => {
                         eprintln!("pi-gpui: git diff failed: {error}");
                         State::Failed(error)
@@ -484,7 +580,13 @@ impl DiffPanel {
     fn stage_all(&mut self, cx: &mut Context<Self>) {
         self.run_git(
             GitAction::StageAll,
-            |root| git::stage_all(root).map_err(GitError::message),
+            {
+                let nested = self
+                    .status()
+                    .map(|status| status.nested.clone())
+                    .unwrap_or_default();
+                move |root| git::stage_all(root, &nested).map_err(GitError::message)
+            },
             cx,
         );
     }
@@ -506,6 +608,7 @@ impl DiffPanel {
         if has_choice {
             if !self.popover_just_closed(Popover::Remotes(action)) {
                 self.branch_picker = None;
+                self.repository_menu = false;
                 self.remote_menu = Some(action);
                 cx.notify();
             }
@@ -523,6 +626,7 @@ impl DiffPanel {
     fn dismiss_popover(&mut self, popover: Popover, cx: &mut Context<Self>) {
         self.branch_picker = None;
         self.remote_menu = None;
+        self.repository_menu = false;
         self.closed_popover = Some((popover, Instant::now()));
         cx.notify();
     }
@@ -653,6 +757,7 @@ impl DiffPanel {
                     .flex_1()
                     .min_w(px(0.))
                     .gap(px(6.))
+                    .children(self.render_repository_switcher(cx))
                     // The picker is a sibling of the name, not its child, so
                     // clicks inside it never reach the name's toggle.
                     .child(
@@ -738,6 +843,160 @@ impl DiffPanel {
                 "Push",
                 cx,
             ))
+            .into_any_element()
+    }
+
+    /// The repository shown and its menu, with a slash before the branch;
+    /// `None` when the project has only one repository.
+    fn render_repository_switcher(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.repositories.len() < 2 {
+            return None;
+        }
+        let colors = cx.theme().colors.clone();
+        let name = self
+            .repository
+            .as_deref()
+            .map(|root| self.repository_name(root))
+            .unwrap_or_default();
+        Some(
+            h_flex()
+                .flex_shrink()
+                .min_w(px(0.))
+                .gap(px(4.))
+                .child(
+                    div()
+                        .relative()
+                        .min_w(px(0.))
+                        .child(
+                            h_flex()
+                                .id("repository-name")
+                                .min_w(px(0.))
+                                .h(ui_px(cx, 22.))
+                                .px(px(4.))
+                                .gap(px(2.))
+                                .rounded(px(4.))
+                                .cursor_pointer()
+                                .when(self.repository_menu, |this| {
+                                    this.bg(colors.ghost_element_selected)
+                                })
+                                .hover(|style| style.bg(colors.ghost_element_hover))
+                                .tooltip(Tooltip::text("Switch repository"))
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.toggle_repository_menu(cx)),
+                                )
+                                .child(
+                                    div().min_w(px(0.)).child(
+                                        Label::new(name)
+                                            .size(LabelSize::XSmall)
+                                            .weight(FontWeight::MEDIUM)
+                                            .truncate(),
+                                    ),
+                                )
+                                .child(
+                                    Icon::new(IconName::ChevronDown)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Placeholder),
+                                ),
+                        )
+                        .children(
+                            self.repository_menu
+                                .then(|| self.render_repository_menu(cx)),
+                        ),
+                )
+                .child(
+                    Label::new("/")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Placeholder),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn toggle_repository_menu(&mut self, cx: &mut Context<Self>) {
+        if self.popover_just_closed(Popover::Repositories) {
+            return;
+        }
+        self.branch_picker = None;
+        self.remote_menu = None;
+        self.repository_menu = true;
+        cx.notify();
+    }
+
+    /// A repository as the project sees it: its folder relative to the
+    /// project, or its own name for the one holding the project.
+    fn repository_name(&self, root: &Path) -> String {
+        self.workspace
+            .as_deref()
+            .and_then(|workspace| root.strip_prefix(workspace).ok())
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            .or_else(|| {
+                root.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| root.display().to_string())
+    }
+
+    /// The project's repositories, under the repository name.
+    fn render_repository_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let rows = self.repositories.iter().enumerate().map(|(index, root)| {
+            let is_current = self.repository.as_ref() == Some(root);
+            let root = root.clone();
+            ListItem::new(("repository", index))
+                .start_slot(
+                    div()
+                        .w(px(14.))
+                        .flex()
+                        .justify_center()
+                        .when(is_current, |this| {
+                            this.child(
+                                Icon::new(IconName::Check)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Accent),
+                            )
+                        }),
+                )
+                .child(
+                    Label::new(self.repository_name(&root))
+                        .size(LabelSize::Small)
+                        .truncate(),
+                )
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.select_repository(root.clone(), cx)),
+                )
+        });
+        div()
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .child(
+                deferred(
+                    anchored()
+                        .anchor(Corner::TopLeft)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(
+                            v_flex()
+                                .id("repository-menu")
+                                .w(px(260.))
+                                .max_h(px(320.))
+                                .overflow_y_scroll()
+                                .mt(px(4.))
+                                .p(px(4.))
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(colors.border)
+                                .bg(colors.elevated_surface_background)
+                                .shadow_lg()
+                                .occlude()
+                                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                    this.dismiss_popover(Popover::Repositories, cx)
+                                }))
+                                .children(rows),
+                        ),
+                )
+                .with_priority(1),
+            )
             .into_any_element()
     }
 
@@ -1097,47 +1356,67 @@ impl Render for DiffPanel {
     }
 }
 
-/// The diff and the status of the repository, read in one background job.
-/// `Ok(None)` when the folder is not inside a git work tree.
-fn load_repository(workspace: &Path) -> Result<Option<(Changes, RepoStatus)>, String> {
-    let Some(changes) = load_changes(workspace)? else {
+/// The project's repositories, then the diff and the status of the
+/// `preferred` one (the first when it is gone), read in one background job.
+/// `Ok(None)` when the project holds no git work tree.
+fn load_repository(
+    workspace: &Path,
+    preferred: Option<&Path>,
+) -> Result<Option<(Vec<PathBuf>, Changes, RepoStatus)>, String> {
+    let repositories = git::repositories(workspace).map_err(GitError::message)?;
+    let Some(root) = preferred
+        .and_then(|preferred| repositories.iter().find(|root| *root == preferred))
+        .or(repositories.first())
+        .cloned()
+    else {
         return Ok(None);
     };
-    let mut status = git::status(&changes.root).map_err(GitError::message)?;
+    // Every git run here is independent, so they all run at once.
+    let (changes, status, remotes) = std::thread::scope(|scope| {
+        let status = scope.spawn(|| git::status(&root));
+        let remotes = scope.spawn(|| git::remotes(&root));
+        let changes = load_changes(root.clone());
+        (changes, git::joined(status), git::joined(remotes))
+    });
+    let changes = changes?;
+    let mut status = status.map_err(GitError::message)?;
     // The remotes only feed the remote picker; the panel works without them.
-    status.remotes = git::remotes(&changes.root).unwrap_or_default();
-    Ok(Some((changes, status)))
+    status.remotes = remotes.unwrap_or_default();
+    Ok(Some((repositories, changes, status)))
 }
 
-/// `Ok(None)` when the folder is not inside a git work tree.
-fn load_changes(workspace: &Path) -> Result<Option<Changes>, String> {
-    let root = match git(workspace, &["rev-parse", "--show-toplevel"]) {
-        Ok(output) => PathBuf::from(output.trim_end_matches(['\n', '\r'])),
-        Err(GitError::Failed(_)) => return Ok(None),
-        Err(GitError::Spawn(error)) => return Err(error),
-    };
-    let base = diff_base(&root)?;
-    let diff = git(
-        &root,
-        &[
-            "-c",
-            "core.quotePath=false",
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "--find-renames",
-            &base,
-        ],
-    )
-    .map_err(GitError::message)?;
-    let mut files = parse_diff(&diff);
-    let untracked = git(&root, &["ls-files", "--others", "--exclude-standard", "-z"])
-        .map_err(GitError::message)?;
-    for path in untracked.split('\0').filter(|path| !path.is_empty()) {
+fn load_changes(root: PathBuf) -> Result<Changes, String> {
+    let (diff, untracked) = std::thread::scope(|scope| {
+        let untracked =
+            scope.spawn(|| git(&root, &["ls-files", "--others", "--exclude-standard", "-z"]));
+        let diff = diff_base(&root).and_then(|base| {
+            git(
+                &root,
+                &[
+                    "-c",
+                    "core.quotePath=false",
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--find-renames",
+                    &base,
+                ],
+            )
+            .map_err(GitError::message)
+        });
+        (diff, git::joined(untracked))
+    });
+    let mut files = parse_diff(&diff?);
+    let untracked = untracked.map_err(GitError::message)?;
+    // A folder is a nested repository, which keeps its own changes.
+    for path in untracked
+        .split('\0')
+        .filter(|path| !path.is_empty() && !path.ends_with('/'))
+    {
         files.push(untracked_file(&root, path));
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(Some(Changes { root, files }))
+    Ok(Changes { root, files })
 }
 
 /// HEAD, or the empty tree in a fresh repository that has no HEAD yet.

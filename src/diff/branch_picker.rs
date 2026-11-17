@@ -74,6 +74,7 @@ impl DiffPanel {
             .ok();
         });
         self.remote_menu = None;
+        self.repository_menu = false;
         self.branch_picker = Some(BranchPicker {
             filter,
             branches: None,

@@ -1,5 +1,7 @@
 //! The Files panel: the selected project as a tree, colored by git
-//! status like Zed's project panel. Folders are read lazily when expanded.
+//! status like Zed's project panel, each file by the innermost repository
+//! holding it. Folders are read lazily when expanded; a chain of folders
+//! that each hold only the next one shows as a single row, as Zed folds them.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -14,6 +16,7 @@ use gpui::{
 };
 
 use crate::diff::FileStatus;
+use crate::git;
 use crate::platform::ConsoleWindow as _;
 use crate::settings::ui_px;
 use crate::ui::prelude::*;
@@ -34,6 +37,9 @@ const ROW_HEIGHT: f32 = 24.;
 const INDENT: f32 = 14.;
 /// Not worth showing: git's own data and Finder's folder metadata.
 const SKIPPED_NAMES: [&str; 2] = [".git", ".DS_Store"];
+/// Longest chain of folders one row stands for; a link back up a chain
+/// would otherwise never end.
+const MAX_FOLDED: usize = 64;
 
 pub fn bind_keys(cx: &mut gpui::App) {
     cx.bind_keys([
@@ -57,6 +63,16 @@ struct Entry {
     name: SharedString,
     path: PathBuf,
     is_dir: bool,
+    /// The folders a folded row stands for above `path`, outermost first;
+    /// each holds nothing but the next.
+    folded: Vec<PathBuf>,
+}
+
+impl Entry {
+    /// The folder listing this entry.
+    fn parent(&self) -> Option<&Path> {
+        self.folded.first().unwrap_or(&self.path).parent()
+    }
 }
 
 #[derive(Clone)]
@@ -67,6 +83,8 @@ struct VisibleRow {
 
 #[derive(Default)]
 struct GitState {
+    /// The project's repository first, then the nested ones.
+    repositories: Vec<PathBuf>,
     status: HashMap<PathBuf, FileStatus>,
     /// Untracked folders git reports as a whole (`?? dir/`).
     untracked_dirs: Vec<PathBuf>,
@@ -87,12 +105,24 @@ impl GitState {
         }
         self.untracked_dirs
             .iter()
-            .any(|dir| path.starts_with(dir))
+            .any(|dir| self.covers(dir, path))
             .then_some(FileStatus::Untracked)
     }
 
     fn is_ignored(&self, path: &Path) -> bool {
-        self.ignored.iter().any(|ignored| path.starts_with(ignored))
+        self.ignored
+            .iter()
+            .any(|ignored| self.covers(ignored, path))
+    }
+
+    /// Whether a folder one repository reported answers for `path`: a
+    /// repository nested in between answers for its own files.
+    fn covers(&self, folder: &Path, path: &Path) -> bool {
+        path.starts_with(folder)
+            && !self
+                .repositories
+                .iter()
+                .any(|root| root.starts_with(folder) && path.starts_with(root))
     }
 }
 
@@ -101,12 +131,19 @@ struct FileMenu {
     position: Point<Pixels>,
 }
 
+/// A project shown before, put back at once on coming back while the
+/// refresh reads the disk and git again.
+struct Remembered {
+    expanded: HashSet<PathBuf>,
+    children: HashMap<PathBuf, Vec<Entry>>,
+    git: GitState,
+}
+
 pub struct FilesPanel {
     workspace: Option<PathBuf>,
     children: HashMap<PathBuf, Vec<Entry>>,
     expanded: HashSet<PathBuf>,
-    /// Expanded folders of projects shown before, restored on coming back.
-    remembered: HashMap<PathBuf, HashSet<PathBuf>>,
+    remembered: HashMap<PathBuf, Remembered>,
     selected: Option<PathBuf>,
     git: GitState,
     error: Option<String>,
@@ -153,27 +190,35 @@ impl FilesPanel {
             return;
         }
         if let Some(previous) = self.workspace.take() {
-            self.remembered
-                .insert(previous, std::mem::take(&mut self.expanded));
+            self.remembered.insert(
+                previous,
+                Remembered {
+                    expanded: std::mem::take(&mut self.expanded),
+                    children: std::mem::take(&mut self.children),
+                    git: std::mem::take(&mut self.git),
+                },
+            );
         }
-        self.expanded = workspace
+        let remembered = workspace
             .as_ref()
-            .and_then(|path| self.remembered.get(path).cloned())
-            .unwrap_or_default();
+            .and_then(|path| self.remembered.remove(path));
+        (self.expanded, self.children, self.git) = match remembered {
+            Some(remembered) => (remembered.expanded, remembered.children, remembered.git),
+            None => Default::default(),
+        };
         self.workspace = workspace;
-        self.children.clear();
-        self.git = GitState::default();
         self.selected = None;
         self.error = None;
         self.menu = None;
-        self.rows.clear();
+        self.rebuild_rows();
         self.refreshing = false;
         self.refresh_pending = false;
         self._refresh_task = Task::ready(());
         cx.notify();
     }
 
-    /// Re-reads the root, every expanded folder and git status.
+    /// Re-reads the root, every expanded folder and git status. The tree
+    /// shows as soon as the folders are read; git colors it when it answers.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.workspace.clone() else {
             return;
@@ -186,19 +231,18 @@ impl FilesPanel {
         let mut directories = vec![root.clone()];
         directories.extend(self.expanded.iter().cloned());
         let load = cx.background_spawn(async move {
-            let listings: Vec<(PathBuf, Result<Vec<Entry>, String>)> = directories
+            directories
                 .into_iter()
                 .map(|directory| {
                     let listing = read_directory(&directory);
                     (directory, listing)
                 })
-                .collect();
-            (listings, git_state(&root))
+                .collect::<Vec<(PathBuf, Result<Vec<Entry>, String>)>>()
         });
+        let git = cx.background_spawn(async move { git_state(&root) });
         self._refresh_task = cx.spawn(async move |this, cx| {
-            let (listings, git) = load.await;
-            this.update(cx, |this, cx| {
-                this.refreshing = false;
+            let listings = load.await;
+            let listed = this.update(cx, |this, cx| {
                 this.children.clear();
                 this.error = None;
                 for (directory, listing) in listings {
@@ -215,8 +259,16 @@ impl FilesPanel {
                         }
                     }
                 }
-                this.git = git;
                 this.rebuild_rows();
+                cx.notify();
+            });
+            if listed.is_err() {
+                return;
+            }
+            let git = git.await;
+            this.update(cx, |this, cx| {
+                this.refreshing = false;
+                this.git = git;
                 if std::mem::take(&mut this.refresh_pending) {
                     this.refresh(cx);
                 }
@@ -250,13 +302,20 @@ impl FilesPanel {
         }
     }
 
-    fn set_expanded(&mut self, directory: PathBuf, expanded: bool, cx: &mut Context<Self>) {
+    /// A folded row opens and closes its whole chain, so the folders stay
+    /// open when a new file breaks the chain up.
+    fn set_expanded(&mut self, entry: &Entry, expanded: bool, cx: &mut Context<Self>) {
+        let directory = entry.path.clone();
         if !expanded {
             self.expanded.remove(&directory);
+            for folder in &entry.folded {
+                self.expanded.remove(folder);
+            }
             self.rebuild_rows();
             cx.notify();
             return;
         }
+        self.expanded.extend(entry.folded.iter().cloned());
         if !self.expanded.insert(directory.clone()) {
             return;
         }
@@ -324,10 +383,10 @@ impl FilesPanel {
         };
         let row = self.rows[index].clone();
         if row.entry.is_dir && self.expanded.contains(&row.entry.path) {
-            self.set_expanded(row.entry.path, false, cx);
+            self.set_expanded(&row.entry, false, cx);
             return;
         }
-        if let Some(parent) = row.entry.path.parent()
+        if let Some(parent) = row.entry.parent()
             && let Some(parent_index) = self.rows.iter().position(|row| row.entry.path == parent)
         {
             self.select_index(parent_index, cx);
@@ -351,7 +410,7 @@ impl FilesPanel {
                 self.select_index(index + 1, cx);
             }
         } else {
-            self.set_expanded(entry.path, true, cx);
+            self.set_expanded(&entry, true, cx);
         }
     }
 
@@ -362,7 +421,7 @@ impl FilesPanel {
         let entry = self.rows[index].entry.clone();
         if entry.is_dir {
             let expanded = self.expanded.contains(&entry.path);
-            self.set_expanded(entry.path, !expanded, cx);
+            self.set_expanded(&entry, !expanded, cx);
         } else {
             let relative = self.relative_path(&entry.path);
             cx.emit(FilesEvent::OpenPath(entry.path, relative));
@@ -380,7 +439,7 @@ impl FilesPanel {
         self.selected = Some(entry.path.clone());
         if entry.is_dir {
             let expanded = self.expanded.contains(&entry.path);
-            self.set_expanded(entry.path.clone(), !expanded, cx);
+            self.set_expanded(entry, !expanded, cx);
         } else if event.click_count() == 1 {
             let relative = self.relative_path(&entry.path);
             cx.emit(FilesEvent::OpenPath(entry.path.clone(), relative));
@@ -693,11 +752,15 @@ fn read_directory(directory: &Path) -> Result<Vec<Entry>, String> {
             let path = entry.path();
             // Follows symlinks, so a linked folder can be opened.
             let is_dir = fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir());
-            Some(Entry {
-                name: name.into(),
-                path,
-                is_dir,
-            })
+            if !is_dir {
+                return Some(Entry {
+                    name: name.into(),
+                    path,
+                    is_dir,
+                    folded: Vec::new(),
+                });
+            }
+            Some(folded_entry(name, path))
         })
         .collect();
     entries.sort_by(|left, right| {
@@ -709,32 +772,64 @@ fn read_directory(directory: &Path) -> Result<Vec<Entry>, String> {
     Ok(entries)
 }
 
+/// A folder, folded down through every folder that holds only the next.
+fn folded_entry(name: String, path: PathBuf) -> Entry {
+    let mut name = name;
+    let mut path = path;
+    let mut folded = Vec::new();
+    while folded.len() < MAX_FOLDED
+        && let Some(only) = only_subfolder(&path)
+    {
+        name.push('/');
+        name.push_str(&only.file_name().unwrap_or_default().to_string_lossy());
+        folded.push(std::mem::replace(&mut path, only));
+    }
+    Entry {
+        name: name.into(),
+        path,
+        is_dir: true,
+        folded,
+    }
+}
+
+/// The folder `folder` holds when it holds nothing else.
+fn only_subfolder(folder: &Path) -> Option<PathBuf> {
+    let mut entries = fs::read_dir(folder)
+        .ok()?
+        .flatten()
+        .filter(|entry| !SKIPPED_NAMES.contains(&entry.file_name().to_string_lossy().as_ref()));
+    let only = entries.next()?.path();
+    if entries.next().is_some() {
+        return None;
+    }
+    fs::metadata(&only)
+        .is_ok_and(|metadata| metadata.is_dir())
+        .then_some(only)
+}
+
 /// Empty outside a git work tree or when git is missing.
 fn git_state(workspace: &Path) -> GitState {
-    let run = |arguments: &[&str]| -> Option<Vec<u8>> {
-        let output = Command::new("git")
-            .without_console_window()
-            // A status that rewrote the index would wake the project watcher.
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .arg("-C")
-            .arg(workspace)
-            .args(arguments)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        output.status.success().then_some(output.stdout)
+    let mut state = GitState {
+        repositories: git::repositories(workspace).unwrap_or_default(),
+        ..GitState::default()
     };
-    let Some(root) = run(&["rev-parse", "--show-toplevel"]) else {
-        return GitState::default();
-    };
-    let root = PathBuf::from(String::from_utf8_lossy(&root).trim_end_matches(['\n', '\r']));
-    let Some(status) = run(&["status", "--porcelain=v1", "-z", "--ignored"]) else {
-        return GitState::default();
-    };
-    let mut state = parse_status(&String::from_utf8_lossy(&status), &root);
-    if let Some(numstat) = run(&["diff", "HEAD", "--numstat", "-z", "--no-renames"]) {
-        state.line_changes = parse_numstat(&String::from_utf8_lossy(&numstat), &root);
+    let repositories = state.repositories.clone();
+    let outputs = git::for_each_repository(&repositories, read_repository);
+    for (root, (status, numstat)) in repositories.iter().zip(outputs) {
+        let Some(status) = status else {
+            continue;
+        };
+        parse_status(
+            &String::from_utf8_lossy(&status),
+            root,
+            workspace,
+            &mut state,
+        );
+        if let Some(numstat) = numstat {
+            state
+                .line_changes
+                .extend(parse_numstat(&String::from_utf8_lossy(&numstat), root));
+        }
     }
     for (path, status) in &state.status {
         if *status == FileStatus::Untracked
@@ -744,6 +839,29 @@ fn git_state(workspace: &Path) -> GitState {
         }
     }
     state
+}
+
+/// `git status` and the line counts of the repository at `root`, both at once.
+fn read_repository(root: &Path) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let run = |arguments: &[&str]| -> Option<Vec<u8>> {
+        let output = Command::new("git")
+            .without_console_window()
+            // A status that rewrote the index would wake the project watcher.
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .arg("-C")
+            .arg(root)
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        output.status.success().then_some(output.stdout)
+    };
+    std::thread::scope(|scope| {
+        let numstat = scope.spawn(|| run(&["diff", "HEAD", "--numstat", "-z", "--no-renames"]));
+        let status = run(&["status", "--porcelain=v1", "-z", "--ignored"]);
+        (status, git::joined(numstat))
+    })
 }
 
 /// `git diff --numstat -z` lines: `added\tdeleted\tpath\0`. Binary files
@@ -776,8 +894,10 @@ fn count_lines(path: &Path) -> Option<usize> {
     Some(newlines + usize::from(!bytes.ends_with(b"\n")))
 }
 
-fn parse_status(output: &str, root: &Path) -> GitState {
-    let mut state = GitState::default();
+/// Adds one repository's `git status --porcelain=v1 -z` to `state`. A nested
+/// repository's folder is left to that repository; changes color the folders
+/// above them up to the project, across repositories.
+fn parse_status(output: &str, root: &Path, workspace: &Path, state: &mut GitState) {
     let mut tokens = output.split('\0').filter(|token| !token.is_empty());
     while let Some(token) = tokens.next() {
         if token.len() < 4 {
@@ -787,6 +907,9 @@ fn parse_status(output: &str, root: &Path) -> GitState {
         let code = code.trim_end();
         let is_dir = path.ends_with('/');
         let path = root.join(path.trim_end_matches('/'));
+        if state.repositories.contains(&path) {
+            continue;
+        }
         let status = match code {
             "!!" => {
                 state.ignored.push(path);
@@ -809,7 +932,7 @@ fn parse_status(output: &str, root: &Path) -> GitState {
         }
         let mut parent = path.parent();
         while let Some(directory) = parent {
-            if directory == root || !directory.starts_with(root) {
+            if directory == workspace || !directory.starts_with(workspace) {
                 break;
             }
             let entry = state
@@ -823,7 +946,6 @@ fn parse_status(output: &str, root: &Path) -> GitState {
             parent = directory.parent();
         }
     }
-    state
 }
 
 #[cfg(test)]
@@ -834,7 +956,8 @@ mod tests {
     fn status_marks_files_folders_and_ignored_paths() {
         let root = Path::new("/repo");
         let output = " M src/main.rs\0?? notes/\0R  new.rs\0old.rs\0!! target/\0A  src/ui/new.rs\0";
-        let state = parse_status(output, root);
+        let mut state = GitState::default();
+        parse_status(output, root, root, &mut state);
         assert_eq!(
             state.status(Path::new("/repo/src/main.rs")),
             Some(FileStatus::Modified)
@@ -858,6 +981,50 @@ mod tests {
         );
         assert!(state.is_ignored(Path::new("/repo/target/debug/app")));
         assert!(!state.is_ignored(Path::new("/repo/src/main.rs")));
+    }
+
+    #[test]
+    fn folds_folders_that_hold_only_one_folder() {
+        let root = std::env::temp_dir().join(format!("pi-gpui-fold-{}", std::process::id()));
+        fs::create_dir_all(root.join("backend/src/main/java/app")).unwrap();
+        fs::write(root.join("backend/src/main/java/app/Main.java"), "").unwrap();
+        fs::write(root.join("backend/src/main/build.txt"), "").unwrap();
+        let entries = read_directory(&root).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name.as_ref(), "backend/src/main");
+        assert_eq!(entries[0].path, root.join("backend/src/main"));
+        assert_eq!(
+            entries[0].folded,
+            vec![root.join("backend"), root.join("backend/src")]
+        );
+        assert_eq!(entries[0].parent(), Some(root.as_path()));
+    }
+
+    #[test]
+    fn nested_repository_answers_for_its_own_files() {
+        let root = Path::new("/repo");
+        let nested = Path::new("/repo/vendor/lib");
+        let mut state = GitState {
+            repositories: vec![root.to_path_buf(), nested.to_path_buf()],
+            ..GitState::default()
+        };
+        parse_status("?? vendor/\0?? vendor/lib/\0", root, root, &mut state);
+        parse_status(" M src/a.rs\0!! target/\0", nested, root, &mut state);
+        assert_eq!(
+            state.status(Path::new("/repo/vendor/notes.md")),
+            Some(FileStatus::Untracked)
+        );
+        assert_eq!(state.status(Path::new("/repo/vendor/lib/README.md")), None);
+        assert_eq!(
+            state.status(Path::new("/repo/vendor/lib/src/a.rs")),
+            Some(FileStatus::Modified)
+        );
+        assert_eq!(
+            state.status(Path::new("/repo/vendor/lib")),
+            Some(FileStatus::Modified)
+        );
+        assert!(state.is_ignored(Path::new("/repo/vendor/lib/target/x")));
     }
 
     #[test]

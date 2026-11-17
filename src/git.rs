@@ -1,16 +1,32 @@
-//! Git work for the Changes panel: the process runner, the porcelain v2 status
-//! parser, the staging mutations, commit, the diff a commit message is generated
-//! from, and the network calls. `diff.rs` keeps rendering. Git is started with
-//! separate arguments, never through a shell (`docs/APP_PRINCIPLES.md:34`).
+//! Git work for the Changes panel: the process runner, the repositories of a
+//! project, the porcelain v2 status parser, the staging mutations, commit, the
+//! diff a commit message is generated from, and the network calls. `diff.rs`
+//! keeps rendering. Git is started with separate arguments, never through a
+//! shell (`docs/APP_PRINCIPLES.md:34`).
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{LazyLock, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use crate::platform::ConsoleWindow as _;
 
 /// Fetch, pull and push can wait on credentials or a slow host; a timeout bounds them.
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(300);
+/// How deep a project that is no repository itself is searched for ones.
+const SEARCH_DEPTH: usize = 2;
+
+/// Repositories found per project. Finding them takes two git runs per
+/// repository, so they are looked for again only after `forget_repositories`
+/// or when one of them is gone.
+static REPOSITORIES: LazyLock<Mutex<HashMap<PathBuf, Vec<PathBuf>>>> =
+    LazyLock::new(Mutex::default);
+/// Held for a whole search, apart from `REPOSITORIES`, so a reader on the
+/// UI thread never waits for git.
+static SEARCH: Mutex<()> = Mutex::new(());
 
 /// Why a git call produced no output.
 pub(crate) enum GitError {
@@ -35,9 +51,9 @@ pub(crate) fn git(directory: &Path, arguments: &[&str]) -> Result<String, GitErr
 /// and ask the user something (`GIT_EDITOR`, credentials).
 ///
 /// Every call reads paths literally (a file named `a[1].md` is never a
-/// pattern), and reads skip the optional index refresh: a `git status`
-/// that rewrote `.git/index` would wake the project watcher, whose refresh
-/// runs `git status` again.
+/// pattern) unless `environment` turns that off, and reads skip the optional
+/// index refresh: a `git status` that rewrote `.git/index` would wake the
+/// project watcher, whose refresh runs `git status` again.
 fn git_with_env(
     directory: &Path,
     arguments: &[&str],
@@ -45,9 +61,9 @@ fn git_with_env(
 ) -> Result<String, GitError> {
     let output = Command::new("git")
         .without_console_window()
-        .envs(environment.iter().copied())
         .env("GIT_LITERAL_PATHSPECS", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .envs(environment.iter().copied())
         .arg("-C")
         .arg(directory)
         .args(arguments)
@@ -65,6 +81,176 @@ fn git_with_env(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// The repositories of a project, as Zed finds them: the one holding
+/// `workspace` first, then those nested inside it. A project that is no
+/// repository itself is searched a few folders down instead. The panels and
+/// the watcher ask at once; the lock makes them share one search.
+pub fn repositories(workspace: &Path) -> Result<Vec<PathBuf>, GitError> {
+    let _search = SEARCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let known = known_repositories(workspace);
+    if !known.is_empty() && known.iter().all(|root| root.join(".git").exists()) {
+        return Ok(known);
+    }
+    let found = find_repositories(workspace)?;
+    REPOSITORIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(workspace.to_path_buf(), found.clone());
+    Ok(found)
+}
+
+/// The repositories `repositories` found last, without running git.
+pub fn known_repositories(workspace: &Path) -> Vec<PathBuf> {
+    REPOSITORIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(workspace)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Makes the next `repositories` call search `workspace` again.
+pub fn forget_repositories(workspace: &Path) {
+    REPOSITORIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(workspace);
+}
+
+/// Searches level by level, the repositories of one level at once.
+fn find_repositories(workspace: &Path) -> Result<Vec<PathBuf>, GitError> {
+    let mut found = match git(workspace, &["rev-parse", "--show-toplevel"]) {
+        Ok(output) => vec![PathBuf::from(output.trim_end_matches(['\n', '\r']))],
+        Err(GitError::Failed(_)) => repositories_below(workspace, SEARCH_DEPTH),
+        Err(error) => return Err(error),
+    };
+    let mut level = found.clone();
+    while !level.is_empty() {
+        let mut next = Vec::new();
+        for nested in for_each_repository(&level, nested_repositories) {
+            next.extend(
+                nested?
+                    .into_iter()
+                    .filter(|root| root.starts_with(workspace)),
+            );
+        }
+        found.extend(next.iter().cloned());
+        level = next;
+    }
+    Ok(found)
+}
+
+/// Runs `job` for every repository at once, each on its own thread: a git
+/// run is mostly process start-up, so they overlap well. Results keep the
+/// order of `roots`.
+pub(crate) fn for_each_repository<R: Send>(
+    roots: &[PathBuf],
+    job: impl Fn(&Path) -> R + Sync,
+) -> Vec<R> {
+    let job = &job;
+    thread::scope(|scope| {
+        let handles: Vec<_> = roots
+            .iter()
+            .map(|root| scope.spawn(move || job(root)))
+            .collect();
+        handles.into_iter().map(joined).collect()
+    })
+}
+
+/// The result of a scoped thread; its panic carries on in the caller.
+pub(crate) fn joined<T>(handle: thread::ScopedJoinHandle<'_, T>) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// Repositories directly inside `root`'s work tree: untracked or ignored
+/// folders with their own `.git`, and checked-out submodules. Git lists an
+/// untracked one as a folder, since it never looks inside.
+fn nested_repositories(root: &Path) -> Result<Vec<PathBuf>, GitError> {
+    let (untracked, ignored) = thread::scope(|scope| {
+        let ignored = scope.spawn(|| {
+            git(
+                root,
+                &[
+                    "ls-files",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "--directory",
+                    "-z",
+                ],
+            )
+        });
+        let untracked = git(root, &["ls-files", "--others", "--exclude-standard", "-z"]);
+        (untracked, joined(ignored))
+    });
+    let (untracked, ignored) = (untracked?, ignored?);
+    let folders = untracked
+        .split('\0')
+        .chain(ignored.split('\0'))
+        .filter_map(|path| path.strip_suffix('/'))
+        .map(|path| root.join(path));
+    let submodules = submodule_paths(root)
+        .into_iter()
+        .map(|path| root.join(path));
+    Ok(folders
+        .chain(submodules)
+        .filter(|folder| folder.join(".git").exists())
+        .collect())
+}
+
+/// Paths `.gitmodules` declares; none when it is missing.
+fn submodule_paths(root: &Path) -> Vec<String> {
+    if !root.join(".gitmodules").is_file() {
+        return Vec::new();
+    }
+    let Ok(output) = git(
+        root,
+        &[
+            "config",
+            "--file",
+            ".gitmodules",
+            "--get-regexp",
+            r"^submodule\..*\.path$",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    output
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(_, path)| path.to_string())
+        .collect()
+}
+
+/// Folders with a `.git` under `folder`, `depth` levels down at most; a
+/// repository's own nested ones are found through git instead.
+fn repositories_below(folder: &Path, depth: usize) -> Vec<PathBuf> {
+    if depth == 0 {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) || entry.file_name() == ".git" {
+            continue;
+        }
+        if path.join(".git").exists() {
+            found.push(path);
+        } else {
+            found.extend(repositories_below(&path, depth - 1));
+        }
+    }
+    found.sort();
+    found
+}
+
 /// Where the repository stands: branch, upstream and the changed files. The
 /// index is the staging state, so the app keeps no parallel set of it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -78,6 +264,9 @@ pub struct RepoStatus {
     pub ahead: u32,
     pub behind: u32,
     pub entries: Vec<StatusEntry>,
+    /// Repositories inside the work tree, repo-relative: git lists each as
+    /// an untracked folder, which is not a change of this repository.
+    pub nested: Vec<String>,
     /// Names of the configured remotes, filled by `remotes`.
     pub remotes: Vec<String>,
 }
@@ -251,6 +440,7 @@ fn parse_status(output: &str) -> RepoStatus {
             }
             // An untracked path is not in the index at all, so only the worktree
             // side has it. "!" is an ignored path, which the panel does not show.
+            "?" if rest.ends_with('/') => status.nested.push(rest.to_string()),
             "?" => status.entries.push(StatusEntry {
                 path: rest.to_string(),
                 original_path: None,
@@ -364,9 +554,21 @@ pub fn unstage(root: &Path, entries: &[&StatusEntry]) -> Result<(), GitError> {
     git(root, &arguments).map(|_| ())
 }
 
-/// Stages every change in the work tree, untracked files included.
-pub fn stage_all(root: &Path) -> Result<(), GitError> {
-    git(root, &["add", "-A"]).map(|_| ())
+/// Stages every change in the work tree, untracked files included. The
+/// `nested` repositories stay out: `add -A` would record each as an embedded
+/// repository. Excluding them takes pathspec magic, so literal paths are off
+/// and each is marked literal itself.
+pub fn stage_all(root: &Path, nested: &[String]) -> Result<(), GitError> {
+    if nested.is_empty() {
+        return git(root, &["add", "-A"]).map(|_| ());
+    }
+    let exclusions: Vec<String> = nested
+        .iter()
+        .map(|path| format!(":(exclude,top,literal){}", path.trim_end_matches('/')))
+        .collect();
+    let mut arguments = vec!["add", "-A", "--", ":(top)"];
+    arguments.extend(exclusions.iter().map(String::as_str));
+    git_with_env(root, &arguments, &[("GIT_LITERAL_PATHSPECS", "0")]).map(|_| ())
 }
 
 /// Empties the index back to HEAD (or to nothing, on an unborn branch).
@@ -803,6 +1005,14 @@ mod tests {
         assert!(!status.has_staged());
         assert!(!status.has_unstaged_tracked());
         assert_eq!(status.commit_mode(false), CommitMode::AllTracked);
+    }
+
+    #[test]
+    fn keeps_a_nested_repository_out_of_the_changes() {
+        let status = parse_status(&porcelain(&[HEAD, BRANCH, "? code/app/", "? notes.md"]));
+        assert_eq!(status.nested, vec!["code/app/".to_string()]);
+        assert_eq!(status.entries.len(), 1);
+        assert_eq!(status.entries[0].path, "notes.md");
     }
 
     #[test]
