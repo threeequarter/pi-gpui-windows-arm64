@@ -420,6 +420,9 @@ pub struct ChatView {
     send_after_reload: Option<String>,
     /// The session switched to a fork; the sidebar should reload its list.
     forked: bool,
+    /// The session this chat was forked from, used to nest it in the sidebar
+    /// before pi writes the fork file to disk.
+    fork_parent: Option<PathBuf>,
     /// Built-in commands plus pi's (`get_commands`).
     slash_commands: Vec<slash::SlashCommand>,
     slash_highlight: usize,
@@ -561,6 +564,7 @@ impl ChatView {
             connection: Connection::Failed(String::new()),
             loading_history: false,
             forking: None,
+            fork_parent: None,
             editing: None,
             send_after_reload: None,
             forked: false,
@@ -670,6 +674,10 @@ impl ChatView {
 
     pub fn session_file(&self) -> Option<&Path> {
         self.session_file.as_deref()
+    }
+
+    pub fn fork_parent(&self) -> Option<&Path> {
+        self.fork_parent.as_deref()
     }
 
     /// True from the moment a prompt is sent, so the sidebar reacts immediately.
@@ -1250,6 +1258,7 @@ impl ChatView {
                         self.composer
                             .update(cx, |composer, cx| composer.set_text(text, cx));
                     }
+                    self.fork_parent = None;
                     self.reload_transcript(cx);
                 }
             }
@@ -1954,6 +1963,7 @@ impl ChatView {
             self.restore_edit(then, cx);
             return;
         }
+        self.fork_parent = self.session_file.clone();
         let text = data["text"].as_str().unwrap_or_default().to_string();
         match then {
             // The composer keeps its draft.
@@ -3341,13 +3351,14 @@ impl ChatView {
         let has_text = !self.composer.read(cx).text().trim().is_empty();
 
         // Fixed height, so the list does not jump when activity appears.
-        let activity_line = h_flex()
-            .h(ui_px(cx, 22.))
-            .gap(px(6.))
-            .when_some(self.activity(), |this, activity| {
-                this.child(Spinner::new().size(IconSize::XSmall).color(Color::Accent))
-                    .child(LoadingLabel::new(activity).size(LabelSize::Small))
-            });
+        let activity_line =
+            h_flex()
+                .h(ui_px(cx, 22.))
+                .gap(px(6.))
+                .when_some(self.activity(), |this, activity| {
+                    this.child(Spinner::new().size(IconSize::XSmall).color(Color::Accent))
+                        .child(LoadingLabel::new(activity).size(LabelSize::Small))
+                });
 
         let send_tooltip = if self.running {
             "Steer the run"

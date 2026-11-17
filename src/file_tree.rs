@@ -1,4 +1,4 @@
-//! The Files panel: the active session's project as a tree, colored by git
+//! The Files panel: the selected project as a tree, colored by git
 //! status like Zed's project panel. Folders are read lazily when expanded.
 
 use std::collections::{HashMap, HashSet};
@@ -147,7 +147,7 @@ impl FilesPanel {
         self.workspace.as_deref()
     }
 
-    /// Follows the active session's project.
+    /// Follows the selected project.
     pub fn set_workspace(&mut self, workspace: Option<PathBuf>, cx: &mut Context<Self>) {
         if self.workspace == workspace {
             return;
@@ -609,7 +609,7 @@ impl Render for FilesPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
         let content = if self.workspace.is_none() {
-            self.render_message("Open a session to see its project's files.".into())
+            self.render_message("Select a project to see its files.".into())
         } else if let Some(error) = &self.error {
             self.render_message(format!("Could not read the folder: {error}"))
         } else if self.rows.is_empty() && self.refreshing {

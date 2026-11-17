@@ -301,6 +301,9 @@ impl WorkspaceEntry {
 pub struct HubView {
     workspaces: Vec<WorkspaceEntry>,
     active_chat: Option<Entity<ChatView>>,
+    /// The project shown in the Files and Changes panels: a clicked project
+    /// header selects it, activating a session selects the session's project.
+    selected_project: Option<PathBuf>,
     installation: InstallationState,
     /// Message bar above the main area; the color picks its style.
     notice: Option<(String, Color)>,
@@ -329,7 +332,7 @@ pub struct HubView {
     diff_panel: Entity<DiffPanel>,
     files_panel: Entity<FilesPanel>,
     file_viewer: Option<WindowHandle<FileViewer>>,
-    /// The active session's project, watched so the panels update on their own.
+    /// The selected project, watched so the panels update on their own.
     project_watcher: Option<ProjectWatcher>,
     /// Focus returns to the Files panel after the viewer closes.
     focus_files: bool,
@@ -497,6 +500,7 @@ impl HubView {
         let mut this = Self {
             workspaces: Vec::new(),
             active_chat: None,
+            selected_project: None,
             installation: InstallationState::Checking,
             notice: None,
             opening_session: None,
@@ -934,6 +938,13 @@ impl HubView {
         {
             self.active_chat = None;
         }
+        if self.selected_project.as_deref() == Some(workspace) {
+            self.selected_project = self
+                .active_chat
+                .as_ref()
+                .map(|chat| chat.read(cx).workspace().to_path_buf());
+            self.refresh_visible_panels(cx);
+        }
         self.save(cx);
         cx.notify();
     }
@@ -981,6 +992,13 @@ impl HubView {
         cx.notify();
     }
 
+    /// Shows the project's files and changes without expanding its sessions.
+    fn select_project(&mut self, workspace: &Path, cx: &mut Context<Self>) {
+        self.selected_project = Some(workspace.to_path_buf());
+        self.refresh_visible_panels(cx);
+        cx.notify();
+    }
+
     fn toggle_workspace(&mut self, workspace: &Path, cx: &mut Context<Self>) {
         let Some(entry) = self.entry_mut(workspace) else {
             return;
@@ -990,6 +1008,8 @@ impl HubView {
         if needs_load {
             self.load_sessions(workspace, cx);
         }
+        self.selected_project = Some(workspace.to_path_buf());
+        self.refresh_visible_panels(cx);
         self.save(cx);
         cx.notify();
     }
@@ -2219,12 +2239,9 @@ impl HubView {
         cx.notify();
     }
 
-    /// Follows the active session's project; reads the disk only while visible.
+    /// Follows the selected project; reads the disk only while visible.
     fn refresh_files(&mut self, cx: &mut Context<Self>) {
-        let workspace = self
-            .active_chat
-            .as_ref()
-            .map(|chat| chat.read(cx).workspace().to_path_buf());
+        let workspace = self.selected_project.clone();
         let visible = self.docks.is_visible(PanelKind::Files);
         self.files_panel.update(cx, |panel, cx| {
             panel.set_workspace(workspace, cx);
@@ -2234,12 +2251,9 @@ impl HubView {
         });
     }
 
-    /// Follows the active session's project; reads git only while visible.
+    /// Follows the selected project; reads git only while visible.
     fn refresh_diff(&mut self, cx: &mut Context<Self>) {
-        let workspace = self
-            .active_chat
-            .as_ref()
-            .map(|chat| chat.read(cx).workspace().to_path_buf());
+        let workspace = self.selected_project.clone();
         let visible = self.docks.is_visible(PanelKind::Diff);
         self.diff_panel.update(cx, |panel, cx| {
             panel.set_workspace(workspace, cx);
@@ -2250,17 +2264,14 @@ impl HubView {
     }
 
     fn refresh_visible_panels(&mut self, cx: &mut Context<Self>) {
-        self.watch_active_project(cx);
+        self.watch_selected_project(cx);
         self.refresh_files(cx);
         self.refresh_diff(cx);
     }
 
-    /// Keeps the watcher on the active session's project.
-    fn watch_active_project(&mut self, cx: &mut Context<Self>) {
-        let workspace = self
-            .active_chat
-            .as_ref()
-            .map(|chat| chat.read(cx).workspace().to_path_buf());
+    /// Keeps the watcher on the selected project.
+    fn watch_selected_project(&mut self, cx: &mut Context<Self>) {
+        let workspace = self.selected_project.clone();
         let watched = self.project_watcher.as_ref().map(ProjectWatcher::root);
         if watched == workspace.as_deref() {
             return;
@@ -2354,9 +2365,19 @@ impl HubView {
             );
 
         let header = ListItem::new(workspace_id("workspace"))
+            .toggle_state(self.selected_project.as_deref() == Some(path.as_path()))
             .start_slot(
                 h_flex()
+                    .id(workspace_id("expand"))
                     .gap(px(4.))
+                    .cursor_pointer()
+                    .on_click(cx.listener({
+                        let path = path.clone();
+                        move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_workspace(&path, cx);
+                        }
+                    }))
                     .child(
                         Icon::new(chevron)
                             .size(IconSize::XSmall)
@@ -2375,7 +2396,7 @@ impl HubView {
             .tooltip(Tooltip::text(path.display().to_string()))
             .on_click(cx.listener({
                 let path = path.clone();
-                move |this, _, _, cx| this.toggle_workspace(&path, cx)
+                move |this, _, _, cx| this.select_project(&path, cx)
             }));
 
         let mut rows = Vec::new();
@@ -2485,25 +2506,34 @@ impl HubView {
     }
 
     /// Session rows of a workspace in sidebar order: open chats that are not
-    /// in the listing yet (new sessions), then the listing.
+    /// in the listing yet (new sessions), then the listing. A fork nests under
+    /// its parent even before pi writes the fork file to disk.
     fn session_rows(&self, entry: &WorkspaceEntry, cx: &App) -> Vec<SessionRow> {
         let mut rows = Vec::new();
+        let mut pending_forks: Vec<(PathBuf, SessionRow)> = Vec::new();
         for chat in &entry.chats {
             let view = chat.view.read(cx);
             let listed = view
                 .session_file()
                 .is_some_and(|file| entry.sessions.iter().any(|summary| summary.path == file));
-            if !listed {
-                rows.push(SessionRow {
-                    id: ElementId::from(("open-chat", chat.view.entity_id())),
-                    title: view.title(),
-                    open_chat: Some(chat.view.clone()),
-                    workspace: entry.path.clone(),
-                    file: view.session_file().map(Path::to_path_buf),
-                    age: None,
-                    hidden: false,
-                    depth: 0,
-                });
+            if listed {
+                continue;
+            }
+            let row = SessionRow {
+                id: ElementId::from(("open-chat", chat.view.entity_id())),
+                title: view.title(),
+                open_chat: Some(chat.view.clone()),
+                workspace: entry.path.clone(),
+                file: view.session_file().map(Path::to_path_buf),
+                age: None,
+                hidden: false,
+                depth: 0,
+            };
+            match view.fork_parent() {
+                Some(parent) if entry.sessions.iter().any(|summary| summary.path == parent) => {
+                    pending_forks.push((parent.to_path_buf(), row));
+                }
+                _ => rows.push(row),
             }
         }
         for (summary, depth) in fork_tree(&entry.sessions) {
@@ -2527,7 +2557,9 @@ impl HubView {
                 hidden: self.hidden_sessions.contains(&summary.path) && !is_active,
                 depth,
             });
+            place_forks(&mut rows, &mut pending_forks, &summary.path, depth);
         }
+        rows.extend(pending_forks.into_iter().map(|(_, row)| row));
         rows
     }
 
@@ -4825,10 +4857,14 @@ impl Render for HubView {
             window.focus(&self.files_panel.read(cx).focus_handle());
         }
 
-        // Panels follow the active session, wherever it was switched.
+        // Panels follow the selected project; activating a session selects
+        // its project, closing the last one keeps the selection.
         let active_id = self.active_chat.as_ref().map(|chat| chat.entity_id());
         if self.panels_follow != active_id {
             self.panels_follow = active_id;
+            if let Some(chat) = &self.active_chat {
+                self.selected_project = Some(chat.read(cx).workspace().to_path_buf());
+            }
             cx.defer_in(window, |this, _, cx| this.refresh_visible_panels(cx));
         }
         let colors = cx.theme().colors.clone();
@@ -5044,6 +5080,30 @@ pub(crate) fn render_window_controls(
 struct PanelMenu {
     kind: PanelKind,
     position: Point<Pixels>,
+}
+
+/// Inserts forks whose file is not on disk yet right under their parent row,
+/// at one deeper level, so a fresh fork reads as a fork immediately.
+fn place_forks(
+    rows: &mut Vec<SessionRow>,
+    pending: &mut Vec<(PathBuf, SessionRow)>,
+    parent: &Path,
+    depth: usize,
+) {
+    let mut index = 0;
+    while index < pending.len() {
+        if pending[index].0 != parent {
+            index += 1;
+            continue;
+        }
+        let (_, mut row) = pending.remove(index);
+        row.depth = depth + 1;
+        let path = row.file.clone();
+        rows.push(row);
+        if let Some(path) = path {
+            place_forks(rows, pending, &path, depth + 1);
+        }
+    }
 }
 
 /// The listing (newest first) with every fork right under the session it was

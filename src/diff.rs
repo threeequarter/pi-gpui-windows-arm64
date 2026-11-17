@@ -1,4 +1,4 @@
-//! The Changes panel: `git diff` of the active session's project against
+//! The Changes panel: `git diff` of the selected project against
 //! HEAD, untracked files included, with the git client around it: staging
 //! from the index, discarding a file's changes, commit and amend, branch
 //! switching, fetch/pull/push and a commit message written by pi. A file's
@@ -266,7 +266,7 @@ impl DiffPanel {
         }
     }
 
-    /// Follows the active session's project. Returns true when it changed.
+    /// Follows the selected project. Returns true when it changed.
     pub fn set_workspace(&mut self, workspace: Option<PathBuf>, cx: &mut Context<Self>) -> bool {
         if self.workspace == workspace {
             return false;
@@ -1039,9 +1039,7 @@ impl Render for DiffPanel {
         self.animation
             .set_active(loading || self.refreshing || self.busy.is_some(), cx);
         let content = match &self.state {
-            State::NoProject => {
-                self.render_message("Open a session to see its project's changes.".into())
-            }
+            State::NoProject => self.render_message("Select a project to see its changes.".into()),
             State::Loading => h_flex()
                 .flex_1()
                 .justify_center()
