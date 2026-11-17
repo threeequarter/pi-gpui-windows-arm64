@@ -265,10 +265,18 @@ impl FileViewer {
         }
     }
 
-    fn facts(&self) -> String {
-        if let (true, DiffState::Changed(view)) = (self.mode.is_diff(), &self.diff) {
-            return format!("+{} −{}", view.additions, view.deletions);
+    /// "+12 −4" while a diff is shown.
+    fn diff_facts(&self) -> Option<String> {
+        match (self.mode.is_diff(), &self.diff) {
+            (true, DiffState::Changed(view)) => {
+                Some(format!("+{} −{}", view.additions, view.deletions))
+            }
+            _ => None,
         }
+    }
+
+    /// "45 lines · 1.7 KB".
+    fn file_facts(&self) -> String {
         if matches!(self.content, Content::Loading | Content::Failed(_)) {
             return String::new();
         }
@@ -622,7 +630,8 @@ impl FileViewer {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let facts = self.facts();
+        let file_facts = self.file_facts();
+        let diff_facts = self.diff_facts();
         let path = self.path.clone();
         h_flex()
             .id("file-viewer-title-bar")
@@ -721,11 +730,7 @@ impl FileViewer {
                         }
                     })
                     .child(self.render_mode_buttons(cx))
-                    .child(
-                        Label::new(facts)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Placeholder),
-                    )
+                    .child(render_facts(file_facts, diff_facts))
                     .child(
                         IconButton::new("file-viewer-open", IconName::FolderOpen)
                             .size(ButtonSize::Compact)
@@ -807,6 +812,30 @@ impl Render for FileViewer {
             );
         crate::window_frame::decorate(content, window, cx)
     }
+}
+
+/// The file facts keep their width in the diff modes too, so switching
+/// modes never moves the buttons beside them. Both labels are laid out in
+/// one column, which is as wide as the wider; the hidden one has no height.
+fn render_facts(file_facts: String, diff_facts: Option<String>) -> impl IntoElement {
+    let showing_diff = diff_facts.is_some();
+    let label = |text: String, visible: bool| {
+        div()
+            .flex()
+            .justify_end()
+            .when(!visible, |this| {
+                this.h(px(0.)).overflow_hidden().opacity(0.)
+            })
+            .child(
+                Label::new(text)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Placeholder),
+            )
+    };
+    v_flex()
+        .flex_none()
+        .child(label(file_facts, !showing_diff))
+        .children(diff_facts.map(|facts| label(facts, true)))
 }
 
 fn render_message(text: String) -> AnyElement {
