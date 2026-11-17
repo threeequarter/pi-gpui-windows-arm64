@@ -112,6 +112,9 @@ pub struct FilesPanel {
     error: Option<String>,
     rows: Vec<VisibleRow>,
     refreshing: bool,
+    /// A refresh was asked for while one was in flight; it runs when that
+    /// one lands, so a change on disk is never skipped.
+    refresh_pending: bool,
     scroll: UniformListScrollHandle,
     focus_handle: FocusHandle,
     menu: Option<FileMenu>,
@@ -132,6 +135,7 @@ impl FilesPanel {
             error: None,
             rows: Vec::new(),
             refreshing: false,
+            refresh_pending: false,
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             menu: None,
@@ -164,6 +168,7 @@ impl FilesPanel {
         self.menu = None;
         self.rows.clear();
         self.refreshing = false;
+        self.refresh_pending = false;
         self._refresh_task = Task::ready(());
         cx.notify();
     }
@@ -174,6 +179,7 @@ impl FilesPanel {
             return;
         };
         if self.refreshing {
+            self.refresh_pending = true;
             return;
         }
         self.refreshing = true;
@@ -211,6 +217,9 @@ impl FilesPanel {
                 }
                 this.git = git;
                 this.rebuild_rows();
+                if std::mem::take(&mut this.refresh_pending) {
+                    this.refresh(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -654,13 +663,6 @@ impl Render for FilesPanel {
                             move |_, _, _| crate::platform::open_terminal(&workspace)
                         }),
                 )
-                .child(
-                    IconButton::new("refresh-files", IconName::Refresh)
-                        .size(ButtonSize::Compact)
-                        .icon_size(IconSize::XSmall)
-                        .tooltip(Tooltip::text("Refresh"))
-                        .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                )
         });
         let menu = self.menu.as_ref().map(|menu| self.render_menu(menu, cx));
         v_flex()
@@ -712,6 +714,8 @@ fn git_state(workspace: &Path) -> GitState {
     let run = |arguments: &[&str]| -> Option<Vec<u8>> {
         let output = Command::new("git")
             .without_console_window()
+            // A status that rewrote the index would wake the project watcher.
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .arg("-C")
             .arg(workspace)
             .args(arguments)

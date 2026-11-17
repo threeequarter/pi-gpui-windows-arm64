@@ -25,6 +25,8 @@ libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # Already comes with gpui; canonical paths without the `\\?\` prefix on Windows.
 dunce = "1"
+# Watches the active project so the Files and Changes panels update on their own.
+notify = "8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"

@@ -33,6 +33,11 @@ pub(crate) fn git(directory: &Path, arguments: &[&str]) -> Result<String, GitErr
 
 /// `git` with extra environment variables, for the calls that must never stop
 /// and ask the user something (`GIT_EDITOR`, credentials).
+///
+/// Every call reads paths literally (a file named `a[1].md` is never a
+/// pattern), and reads skip the optional index refresh: a `git status`
+/// that rewrote `.git/index` would wake the project watcher, whose refresh
+/// runs `git status` again.
 fn git_with_env(
     directory: &Path,
     arguments: &[&str],
@@ -41,6 +46,8 @@ fn git_with_env(
     let output = Command::new("git")
         .without_console_window()
         .envs(environment.iter().copied())
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(directory)
         .args(arguments)
@@ -71,6 +78,8 @@ pub struct RepoStatus {
     pub ahead: u32,
     pub behind: u32,
     pub entries: Vec<StatusEntry>,
+    /// Names of the configured remotes, filled by `remotes`.
+    pub remotes: Vec<String>,
 }
 
 /// One changed path, as porcelain v2 reports it.
@@ -149,6 +158,21 @@ impl RepoStatus {
         };
         let name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
         Some(format!("{verb} {name}"))
+    }
+
+    /// The remote of the upstream, e.g. `origin` for `origin/main`. Remote
+    /// names may contain slashes, so the longest matching name wins.
+    pub fn upstream_remote(&self) -> Option<&str> {
+        let upstream = self.upstream.as_deref()?;
+        self.remotes
+            .iter()
+            .filter(|remote| {
+                upstream
+                    .strip_prefix(remote.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .max_by_key(|remote| remote.len())
+            .map(String::as_str)
     }
 
     /// Amend wins over the index, and the index wins over "everything tracked".
@@ -459,6 +483,209 @@ pub fn push(root: &Path) -> Result<String, String> {
     network(root, &["push"])
 }
 
+/// Where Pull and Push go when the user picks a remote: the upstream branch
+/// on the upstream's remote, the branch of the same name on any other.
+pub struct RemoteTarget {
+    pub remote: String,
+    pub local_branch: String,
+    pub remote_branch: String,
+}
+
+impl RemoteTarget {
+    /// `None` while HEAD is detached.
+    pub fn new(status: &RepoStatus, remote: String) -> Option<Self> {
+        let local_branch = status.branch.clone()?;
+        let remote_branch = status
+            .upstream
+            .as_deref()
+            .filter(|_| status.upstream_remote() == Some(remote.as_str()))
+            .and_then(|upstream| upstream.strip_prefix(&format!("{remote}/")))
+            .unwrap_or(&local_branch)
+            .to_string();
+        Some(Self {
+            remote,
+            local_branch,
+            remote_branch,
+        })
+    }
+}
+
+/// Pulls the target branch into the current one, fast-forward only.
+pub fn pull_from(root: &Path, target: &RemoteTarget) -> Result<String, String> {
+    network(
+        root,
+        &["pull", "--ff-only", &target.remote, &target.remote_branch],
+    )
+}
+
+pub fn push_to(root: &Path, target: &RemoteTarget) -> Result<String, String> {
+    let refspec = format!("{}:{}", target.local_branch, target.remote_branch);
+    network(root, &["push", &target.remote, &refspec])
+}
+
+/// Names of the configured remotes.
+pub fn remotes(root: &Path) -> Result<Vec<String>, GitError> {
+    let output = git(root, &["remote"])?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// A local or remote-tracking branch, as the branch picker lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Branch {
+    /// `main` for a local branch, `origin/main` for a remote one.
+    pub name: String,
+    pub is_remote: bool,
+    /// The branch HEAD is on.
+    pub is_head: bool,
+    /// Unix time of the last commit; 0 when git printed none.
+    pub committed_at: u64,
+    /// Subject of the last commit.
+    pub subject: String,
+}
+
+/// Local and remote branches the way Zed's branch picker lists them: a
+/// remote branch some local branch already tracks is left out, because
+/// checking it out would only detach HEAD; the current branch comes first,
+/// then the most recently committed.
+pub fn branches(root: &Path) -> Result<Vec<Branch>, GitError> {
+    let output = git(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(HEAD)%00%(refname)%00%(upstream)%00%(committerdate:unix)%00%(symref)%00%(subject)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?;
+    Ok(parse_branches(&output))
+}
+
+fn parse_branches(output: &str) -> Vec<Branch> {
+    let mut tracked = Vec::new();
+    let mut branches = Vec::new();
+    for line in output.lines() {
+        let fields: Vec<&str> = line.splitn(6, '\0').collect();
+        let [head, reference, upstream, committed_at, symref, subject] = fields[..] else {
+            continue;
+        };
+        // `origin/HEAD` points at another remote branch.
+        if !symref.is_empty() {
+            continue;
+        }
+        if !upstream.is_empty() {
+            tracked.push(upstream.to_string());
+        }
+        let (name, is_remote) = if let Some(name) = reference.strip_prefix("refs/heads/") {
+            (name, false)
+        } else if let Some(name) = reference.strip_prefix("refs/remotes/") {
+            (name, true)
+        } else {
+            continue;
+        };
+        branches.push((
+            reference.to_string(),
+            Branch {
+                name: name.to_string(),
+                is_remote,
+                is_head: head == "*",
+                committed_at: committed_at.parse().unwrap_or(0),
+                subject: subject.to_string(),
+            },
+        ));
+    }
+    let mut branches: Vec<Branch> = branches
+        .into_iter()
+        .filter(|(reference, _)| !tracked.contains(reference))
+        .map(|(_, branch)| branch)
+        .collect();
+    branches.sort_by_key(|branch| (!branch.is_head, std::cmp::Reverse(branch.committed_at)));
+    branches
+}
+
+/// Checks out `branch`. A remote branch gets a local branch of the same short
+/// name that tracks it, as in Zed.
+pub fn switch_branch(root: &Path, branch: &Branch) -> Result<(), GitError> {
+    let arguments: &[&str] = if branch.is_remote {
+        &["switch", "--track", &branch.name]
+    } else {
+        &["switch", &branch.name]
+    };
+    git(root, arguments).map(|_| ())
+}
+
+/// Creates `name` at HEAD and checks it out.
+pub fn create_branch(root: &Path, name: &str) -> Result<(), GitError> {
+    git(root, &["switch", "-c", name]).map(|_| ())
+}
+
+/// A typed branch name made valid the way Zed does: surrounding space
+/// trimmed, inner whitespace turned into dashes.
+pub fn normalize_branch_name(name: &str) -> String {
+    name.split_whitespace().collect::<Vec<_>>().join("-")
+}
+
+/// What discarding a file's changes runs, decided from its status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Discard {
+    /// Tracked in HEAD: index and work tree go back to HEAD's version.
+    Restore(String),
+    /// New since HEAD: out of the index, and the file goes to the Trash.
+    Remove { path: String, staged: bool },
+}
+
+impl Discard {
+    /// The steps that throw away every change of `entry`. A rename restores
+    /// its source and removes the new path.
+    pub fn plan(entry: &StatusEntry, unborn: bool) -> Vec<Discard> {
+        let is_new =
+            entry.untracked || unborn || entry.code[0] == 'A' || entry.original_path.is_some();
+        let mut steps = Vec::new();
+        // A copy leaves its source alone; a rename took it away. The source
+        // comes back first, so a failure later never leaves neither path.
+        if let Some(original) = &entry.original_path
+            && entry.code[0] == 'R'
+            && !unborn
+        {
+            steps.push(Discard::Restore(original.clone()));
+        }
+        if is_new {
+            steps.push(Discard::Remove {
+                path: entry.path.clone(),
+                staged: !entry.untracked,
+            });
+        } else {
+            steps.push(Discard::Restore(entry.path.clone()));
+        }
+        steps
+    }
+}
+
+/// Index and work tree of `path` back to HEAD.
+pub fn restore_from_head(root: &Path, path: &str) -> Result<(), GitError> {
+    git(
+        root,
+        &[
+            "restore",
+            "--source=HEAD",
+            "--staged",
+            "--worktree",
+            "--",
+            path,
+        ],
+    )
+    .map(|_| ())
+}
+
+/// Drops `path` from the index and keeps the file on disk.
+pub fn remove_from_index(root: &Path, path: &str) -> Result<(), GitError> {
+    git(root, &["rm", "--cached", "--quiet", "--force", "--", path]).map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +882,108 @@ mod tests {
             status.entries[1].original_path.as_deref(),
             Some("old 名.txt")
         );
+    }
+
+    #[test]
+    fn lists_branches_without_tracked_remotes_newest_first() {
+        let output = [
+            " \0refs/heads/feature\0\x00300\0\0Add feature",
+            "*\0refs/heads/main\0refs/remotes/origin/main\x00100\0\0Initial commit",
+            " \0refs/remotes/origin/HEAD\0\x00100\0refs/remotes/origin/main\0Initial commit",
+            " \0refs/remotes/origin/main\0\x00100\0\0Initial commit",
+            " \0refs/remotes/origin/fix/crash\0\x00200\0\0Fix crash",
+        ]
+        .join("\n");
+        let names: Vec<(String, bool, bool)> = parse_branches(&output)
+            .into_iter()
+            .map(|branch| (branch.name, branch.is_remote, branch.is_head))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("main".to_string(), false, true),
+                ("feature".to_string(), false, false),
+                ("origin/fix/crash".to_string(), true, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_the_remote_of_the_upstream() {
+        let mut status = parse_status(&porcelain(&[
+            HEAD,
+            BRANCH,
+            "# branch.upstream team/origin/main",
+        ]));
+        status.remotes = vec!["team".to_string(), "team/origin".to_string()];
+        assert_eq!(status.upstream_remote(), Some("team/origin"));
+        status.upstream = None;
+        assert_eq!(status.upstream_remote(), None);
+    }
+
+    #[test]
+    fn targets_the_upstream_branch_on_its_own_remote() {
+        let mut status = parse_status(&porcelain(&[
+            HEAD,
+            "# branch.head work",
+            "# branch.upstream origin/main",
+        ]));
+        status.remotes = vec!["fork".to_string(), "origin".to_string()];
+        let target = RemoteTarget::new(&status, "origin".to_string()).unwrap();
+        assert_eq!(
+            (target.local_branch.as_str(), target.remote_branch.as_str()),
+            ("work", "main")
+        );
+        let target = RemoteTarget::new(&status, "fork".to_string()).unwrap();
+        assert_eq!(target.remote_branch, "work");
+    }
+
+    #[test]
+    fn plans_a_discard_from_the_status() {
+        let status = parse_status(&porcelain(&[
+            HEAD,
+            BRANCH,
+            "1 .M N... 100644 100644 100644 bab081fdb7372d4e bab081fdb7372d4e changed.rs",
+            "1 A. N... 000000 100644 100644 0000000000000000 eb0abdacb2006de4 added.rs",
+            "2 R. N... 100644 100644 100644 bab081fdb7372d4e bab081fdb7372d4e R100 new.rs",
+            "old.rs",
+            "? untracked.rs",
+        ]));
+        let plans: Vec<Vec<Discard>> = status
+            .entries
+            .iter()
+            .map(|entry| Discard::plan(entry, false))
+            .collect();
+        assert_eq!(plans[0], vec![Discard::Restore("changed.rs".to_string())]);
+        assert_eq!(
+            plans[1],
+            vec![Discard::Remove {
+                path: "added.rs".to_string(),
+                staged: true
+            }]
+        );
+        assert_eq!(
+            plans[2],
+            vec![
+                Discard::Restore("old.rs".to_string()),
+                Discard::Remove {
+                    path: "new.rs".to_string(),
+                    staged: true
+                },
+            ]
+        );
+        assert_eq!(
+            plans[3],
+            vec![Discard::Remove {
+                path: "untracked.rs".to_string(),
+                staged: false
+            }]
+        );
+    }
+
+    #[test]
+    fn normalizes_typed_branch_names() {
+        assert_eq!(normalize_branch_name("  fix  the crash "), "fix-the-crash");
     }
 
     #[test]

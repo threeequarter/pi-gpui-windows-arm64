@@ -5,6 +5,7 @@ use gpui::{Focusable, MouseButton};
 
 use super::*;
 use crate::git::CommitMode;
+use crate::settings::Settings;
 
 /// The message box's hint when no message is suggested.
 pub(super) const COMMIT_PLACEHOLDER: &str = "Commit message";
@@ -357,8 +358,8 @@ impl DiffPanel {
                     .gap(px(6.))
                     .child(amend)
                     .child(div().flex_1())
-                    .child(generate)
-                    .child(commit),
+                    .child(commit)
+                    .child(generate),
             )
             .into_any_element()
     }

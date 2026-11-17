@@ -19,6 +19,7 @@ mod pi_updates;
 mod platform;
 mod plugins;
 mod process;
+mod project_watcher;
 mod selectable;
 mod sessions;
 mod settings;

@@ -55,6 +55,7 @@ icons! {
     Copy => "copy",
     Dash => "dash",
     Diff => "diff",
+    DiffSplit => "diff_split",
     Ellipsis => "ellipsis",
     Eye => "eye",
     EyeOff => "eye_off",
@@ -74,6 +75,7 @@ icons! {
     Plus => "plus",
     Refresh => "refresh",
     Restore => "restore",
+    Settings => "settings",
     Sparkle => "sparkle",
     Star => "star",
     StarFilled => "star_filled",
@@ -81,6 +83,7 @@ icons! {
     Terminal => "terminal",
     Tool => "tool",
     Trash => "trash",
+    Undo => "undo",
     Warning => "warning",
 }
 

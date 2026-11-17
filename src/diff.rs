@@ -1,51 +1,61 @@
 //! The Changes panel: `git diff` of the active session's project against
 //! HEAD, untracked files included, with the git client around it: staging
-//! from the index, commit and amend, fetch/pull/push and a commit
-//! message written by pi. Git is run directly with separate arguments, never
+//! from the index, discarding a file's changes, commit and amend, branch
+//! switching, fetch/pull/push and a commit message written by pi. A file's
+//! diff opens in the file viewer. Git is run directly with separate arguments, never
 //! through a shell; every git and pi call runs in the background.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Context, ElementId, Entity, EventEmitter, FontWeight, HighlightStyle, Hsla,
-    KeyBinding, StyledText, Subscription, Task, Window, actions, div, px,
+    AnyElement, App, Context, Corner, ElementId, Entity, EventEmitter, FocusHandle, FontWeight,
+    Hsla, KeyBinding, Subscription, Task, Window, actions, anchored, deferred, div, px,
 };
 
-use crate::git::{self, GitError, RepoStatus, StatusEntry, git};
+use crate::git::{self, Discard, GitError, RepoStatus, StatusEntry, git};
 use crate::pi::{self, Installation};
 use crate::sessions;
-use crate::settings::{Settings, ui_px};
-use crate::text_input::TextInput;
+use crate::settings::ui_px;
+use crate::text_input::{self, TextInput};
 use crate::ui::prelude::*;
 use crate::ui::{AnimationTicker, SyntaxColors};
 
+use branch_picker::{BRANCH_PICKER_CONTEXT, BranchPicker};
+
+mod branch_picker;
 mod commit;
 
-actions!(diff, [CommitNow]);
+actions!(diff, [CommitNow, DismissBranchPicker]);
 
 /// The commit message box. Enter stays a newline there, so committing
 /// from the keyboard is ⌘Enter.
 const COMMIT_CONTEXT: &str = "GitCommit";
-/// Lines drawn per file; the rest is summarized. Keeps a huge generated
-/// file from building thousands of elements.
-const MAX_LINES_PER_FILE: usize = 1_500;
+/// A click on the button that opened a popover first closes it as a click
+/// outside; that same click must not open it again.
+const POPOVER_REOPEN_GUARD: Duration = Duration::from_millis(250);
 /// Untracked files larger than this are listed without content.
 const MAX_UNTRACKED_BYTES: u64 = 512 * 1024;
 
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new(
-        &crate::keys::binding("cmd-enter"),
-        CommitNow,
-        Some(COMMIT_CONTEXT),
-    )]);
+    cx.bind_keys([
+        KeyBinding::new(
+            &crate::keys::binding("cmd-enter"),
+            CommitNow,
+            Some(COMMIT_CONTEXT),
+        ),
+        KeyBinding::new("escape", DismissBranchPicker, Some(BRANCH_PICKER_CONTEXT)),
+    ]);
 }
 
 pub enum DiffPanelEvent {
     /// A git action ran: the index, HEAD or the remote refs may have changed.
     RepositoryChanged,
+    /// Show this file's diff: its full path and the path shown as its title.
+    OpenDiff(PathBuf, String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +144,9 @@ enum GitAction {
     ToggleFile,
     StageAll,
     UnstageAll,
+    Discard,
+    SwitchBranch,
+    CreateBranch,
     Commit,
     Generate,
     Fetch,
@@ -147,6 +160,9 @@ impl GitAction {
         match self {
             GitAction::ToggleFile | GitAction::StageAll => "Staging…",
             GitAction::UnstageAll => "Unstaging…",
+            GitAction::Discard => "Discarding…",
+            GitAction::SwitchBranch => "Switching branch…",
+            GitAction::CreateBranch => "Creating branch…",
             GitAction::Commit => "Committing…",
             GitAction::Generate => "pi is writing the commit message…",
             GitAction::Fetch => "Fetching…",
@@ -160,6 +176,9 @@ impl GitAction {
             GitAction::ToggleFile => "Staging failed",
             GitAction::StageAll => "Stage All failed",
             GitAction::UnstageAll => "Unstage All failed",
+            GitAction::Discard => "Discarding changes failed",
+            GitAction::SwitchBranch => "Switching branch failed",
+            GitAction::CreateBranch => "Creating the branch failed",
             GitAction::Commit => "Commit failed",
             GitAction::Generate => "Generating the commit message failed",
             GitAction::Fetch => "Fetch failed",
@@ -167,6 +186,12 @@ impl GitAction {
             GitAction::Push => "Push failed",
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Popover {
+    Branches,
+    Remotes(GitAction),
 }
 
 /// The checkbox of a file: the index holds all, part or none of its changes.
@@ -186,7 +211,11 @@ pub struct DiffPanel {
     /// A refresh was asked for while one was in flight; it runs when that
     /// one lands, so the state after a git action is never skipped.
     refresh_pending: bool,
-    expanded: HashSet<String>,
+    branch_picker: Option<BranchPicker>,
+    /// Pull or Push waiting for the user to pick a remote.
+    remote_menu: Option<GitAction>,
+    /// The popover a click outside closed last, and when.
+    closed_popover: Option<(Popover, Instant)>,
     commit_input: Entity<TextInput>,
     /// Unsent commit messages of the other projects, by workspace.
     drafts: HashMap<PathBuf, String>,
@@ -201,6 +230,8 @@ pub struct DiffPanel {
     _action_task: Task<()>,
     _probe_task: Task<()>,
     _subscriptions: Vec<Subscription>,
+    /// Takes the keyboard back when the branch picker closes.
+    focus_handle: FocusHandle,
     animation: AnimationTicker,
 }
 
@@ -216,7 +247,9 @@ impl DiffPanel {
             state: State::NoProject,
             refreshing: false,
             refresh_pending: false,
-            expanded: HashSet::new(),
+            branch_picker: None,
+            remote_menu: None,
+            closed_popover: None,
             commit_input,
             drafts: HashMap::new(),
             amend: false,
@@ -228,6 +261,7 @@ impl DiffPanel {
             _action_task: Task::ready(()),
             _probe_task: Task::ready(()),
             _subscriptions: subscriptions,
+            focus_handle: cx.focus_handle(),
             animation: AnimationTicker::default(),
         }
     }
@@ -253,7 +287,8 @@ impl DiffPanel {
             .unwrap_or_default();
         self.commit_input
             .update(cx, |input, cx| input.set_text(draft, cx));
-        self.expanded.clear();
+        self.branch_picker = None;
+        self.remote_menu = None;
         self.state = if self.workspace.is_some() {
             State::Loading
         } else {
@@ -372,13 +407,6 @@ impl DiffPanel {
         }
     }
 
-    fn toggle_file(&mut self, path: &str, cx: &mut Context<Self>) {
-        if !self.expanded.remove(path) {
-            self.expanded.insert(path.to_string());
-        }
-        cx.notify();
-    }
-
     /// Runs `job` against the repository root in the background, then shows
     /// its error, refreshes and tells the hub the repository changed.
     fn run_git(
@@ -469,6 +497,36 @@ impl DiffPanel {
         );
     }
 
+    /// Pull and Push ask for the remote first when there are several.
+    fn start_network(&mut self, action: GitAction, cx: &mut Context<Self>) {
+        let has_choice = action != GitAction::Fetch
+            && self
+                .status()
+                .is_some_and(|status| status.remotes.len() > 1 && status.branch.is_some());
+        if has_choice {
+            if !self.popover_just_closed(Popover::Remotes(action)) {
+                self.branch_picker = None;
+                self.remote_menu = Some(action);
+                cx.notify();
+            }
+            return;
+        }
+        self.run_network(action, cx);
+    }
+
+    fn popover_just_closed(&self, popover: Popover) -> bool {
+        self.closed_popover
+            .is_some_and(|(closed, at)| closed == popover && at.elapsed() < POPOVER_REOPEN_GUARD)
+    }
+
+    /// Closes the open popover after a click outside it.
+    fn dismiss_popover(&mut self, popover: Popover, cx: &mut Context<Self>) {
+        self.branch_picker = None;
+        self.remote_menu = None;
+        self.closed_popover = Some((popover, Instant::now()));
+        cx.notify();
+    }
+
     fn run_network(&mut self, action: GitAction, cx: &mut Context<Self>) {
         let operation: fn(&Path) -> Result<String, String> = match action {
             GitAction::Fetch => git::fetch,
@@ -477,6 +535,71 @@ impl DiffPanel {
             _ => return,
         };
         self.run_git(action, move |root| operation(root).map(|_| ()), cx);
+    }
+
+    fn run_network_with(&mut self, action: GitAction, remote: String, cx: &mut Context<Self>) {
+        self.remote_menu = None;
+        let Some(target) = self
+            .status()
+            .and_then(|status| git::RemoteTarget::new(status, remote))
+        else {
+            return;
+        };
+        let operation: fn(&Path, &git::RemoteTarget) -> Result<String, String> = match action {
+            GitAction::Pull => git::pull_from,
+            GitAction::Push => git::push_to,
+            _ => return,
+        };
+        self.run_git(action, move |root| operation(root, &target).map(|_| ()), cx);
+    }
+
+    fn confirm_discard(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(status) = self.status() else {
+            return;
+        };
+        let Some(entry) = status
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .cloned()
+        else {
+            return;
+        };
+        let steps = Discard::plan(&entry, status.is_unborn());
+        let deletes = steps
+            .iter()
+            .any(|step| matches!(step, Discard::Remove { .. }));
+        let name = path.rsplit('/').next().unwrap_or(path).to_string();
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            &format!("Discard all changes to \"{name}\"?"),
+            Some(if deletes {
+                "The file is new since the last commit: it moves to the Trash."
+            } else {
+                "The file goes back to its last committed version. This cannot be undone."
+            }),
+            &["Discard", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if answer.await.ok() != Some(0) {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                if this.busy.is_some() {
+                    this.show_error(GitAction::Discard, "another git action is running".into());
+                    cx.notify();
+                    return;
+                }
+                this.run_git(
+                    GitAction::Discard,
+                    move |root| discard(root, &entry, &steps),
+                    cx,
+                )
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn render_message(&self, message: String) -> AnyElement {
@@ -498,10 +621,11 @@ impl DiffPanel {
     /// Branch, distance to the upstream, and the network actions.
     fn render_branch_bar(&self, status: &RepoStatus, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let branch = status
-            .branch
-            .clone()
-            .unwrap_or_else(|| "detached HEAD".to_string());
+        let branch = match (&status.branch, status.upstream_remote()) {
+            (Some(branch), Some(remote)) => format!("{remote} / {branch}"),
+            (Some(branch), None) => branch.clone(),
+            (None, _) => "detached HEAD".to_string(),
+        };
         let distance = status.upstream.as_ref().map(|upstream| {
             (
                 [("↑", status.ahead), ("↓", status.behind)],
@@ -529,13 +653,44 @@ impl DiffPanel {
                     .flex_1()
                     .min_w(px(0.))
                     .gap(px(6.))
+                    // The picker is a sibling of the name, not its child, so
+                    // clicks inside it never reach the name's toggle.
                     .child(
-                        div().min_w(px(0.)).child(
-                            Label::new(branch)
-                                .size(LabelSize::XSmall)
-                                .weight(FontWeight::MEDIUM)
-                                .truncate(),
-                        ),
+                        div()
+                            .relative()
+                            .min_w(px(0.))
+                            .child(
+                                h_flex()
+                                    .id("branch-name")
+                                    .min_w(px(0.))
+                                    .h(ui_px(cx, 22.))
+                                    .px(px(4.))
+                                    .gap(px(2.))
+                                    .rounded(px(4.))
+                                    .cursor_pointer()
+                                    .when(self.branch_picker.is_some(), |this| {
+                                        this.bg(colors.ghost_element_selected)
+                                    })
+                                    .hover(|style| style.bg(colors.ghost_element_hover))
+                                    .tooltip(Tooltip::text("Switch or create a branch"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_branch_picker(window, cx)
+                                    }))
+                                    .child(
+                                        div().min_w(px(0.)).child(
+                                            Label::new(branch)
+                                                .size(LabelSize::XSmall)
+                                                .weight(FontWeight::MEDIUM)
+                                                .truncate(),
+                                        ),
+                                    )
+                                    .child(
+                                        Icon::new(IconName::ChevronDown)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Placeholder),
+                                    ),
+                            )
+                            .children(self.render_branch_picker(cx)),
                     )
                     .when_some(distance, |this, (distance, tooltip)| {
                         this.child(
@@ -592,18 +747,102 @@ impl DiffPanel {
         icon: IconName,
         action: GitAction,
         tooltip: &'static str,
-        cx: &Context<Self>,
-    ) -> IconButton {
-        IconButton::new(id, icon)
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let button = IconButton::new(id, icon)
             .size(ButtonSize::Compact)
             .icon_size(IconSize::XSmall)
             .loading(self.busy == Some(action))
             .disabled(self.busy.is_some())
+            .toggle_state(self.remote_menu == Some(action))
             .tooltip(Tooltip::text(tooltip))
-            .on_click(cx.listener(move |this, _, _, cx| this.run_network(action, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| this.start_network(action, cx)));
+        div()
+            .relative()
+            .flex_none()
+            .child(button)
+            .children(
+                (self.remote_menu == Some(action)).then(|| self.render_remote_menu(action, cx)),
+            )
+            .into_any_element()
     }
 
-    /// The diff summary, the bulk staging buttons and refresh.
+    /// The remotes to pull from or push to, under the clicked button.
+    fn render_remote_menu(&self, action: GitAction, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let (remotes, current) = match self.status() {
+            Some(status) => (
+                status.remotes.clone(),
+                status.upstream_remote().map(str::to_string),
+            ),
+            None => (Vec::new(), None),
+        };
+        let verb = if action == GitAction::Pull {
+            "Pull from"
+        } else {
+            "Push to"
+        };
+        let rows = remotes.into_iter().enumerate().map(|(index, remote)| {
+            let is_current = current.as_deref() == Some(remote.as_str());
+            ListItem::new(("remote", index))
+                .start_slot(
+                    div()
+                        .w(px(14.))
+                        .flex()
+                        .justify_center()
+                        .when(is_current, |this| {
+                            this.child(
+                                Icon::new(IconName::Check)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Accent),
+                            )
+                        }),
+                )
+                .child(Label::new(remote.clone()).size(LabelSize::Small).truncate())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.run_network_with(action, remote.clone(), cx)
+                }))
+        });
+        div()
+            .absolute()
+            .bottom_0()
+            .right_0()
+            .child(
+                deferred(
+                    anchored()
+                        .anchor(Corner::TopRight)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(
+                            v_flex()
+                                .id("remote-menu")
+                                .w(px(200.))
+                                .mt(px(4.))
+                                .p(px(4.))
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(colors.border)
+                                .bg(colors.elevated_surface_background)
+                                .shadow_lg()
+                                .occlude()
+                                .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                                    this.dismiss_popover(Popover::Remotes(action), cx)
+                                }))
+                                .child(
+                                    div().px(px(8.)).pt(px(2.)).pb(px(4.)).child(
+                                        Label::new(verb)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Placeholder),
+                                    ),
+                                )
+                                .children(rows),
+                        ),
+                )
+                .with_priority(1),
+            )
+            .into_any_element()
+    }
+
+    /// The diff summary and the bulk staging buttons.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
         let staging = self.status().map(|status| {
@@ -631,32 +870,28 @@ impl DiffPanel {
             )
             .when_some(staging, |this, (can_stage, can_unstage)| {
                 this.child(
-                    Button::new("stage-all", "Stage All")
+                    IconButton::new("stage-all", IconName::Plus)
                         .size(ButtonSize::Compact)
+                        .icon_size(IconSize::XSmall)
                         .loading(self.busy == Some(GitAction::StageAll))
                         .disabled(self.busy.is_some() || !can_stage)
                         .tooltip(Tooltip::text(
-                            "Stage every change, untracked files included",
+                            "Stage All: every change, untracked files included",
                         ))
                         .on_click(cx.listener(|this, _, _, cx| this.stage_all(cx))),
                 )
                 .child(
-                    Button::new("unstage-all", "Unstage All")
+                    IconButton::new("unstage-all", IconName::Dash)
                         .size(ButtonSize::Compact)
+                        .icon_size(IconSize::XSmall)
                         .loading(self.busy == Some(GitAction::UnstageAll))
                         .disabled(self.busy.is_some() || !can_unstage)
-                        .tooltip(Tooltip::text("Take everything out of the index"))
+                        .tooltip(Tooltip::text(
+                            "Unstage All: take everything out of the index",
+                        ))
                         .on_click(cx.listener(|this, _, _, cx| this.unstage_all(cx))),
                 )
             })
-            .child(
-                IconButton::new("refresh-diff", IconName::Refresh)
-                    .size(ButtonSize::Compact)
-                    .icon_size(IconSize::XSmall)
-                    .loading(self.refreshing)
-                    .tooltip(Tooltip::text("Refresh"))
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-            )
             .into_any_element()
     }
 
@@ -693,12 +928,10 @@ impl DiffPanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let expanded = self.expanded.contains(&file.path);
         let (directory, name) = match file.path.rsplit_once('/') {
             Some((directory, name)) => (format!("{directory}/"), name.to_string()),
             None => (String::new(), file.path.clone()),
         };
-        let path = file.path.clone();
         let full_path = root.join(&file.path);
         let tooltip = match &file.old_path {
             Some(old_path) => format!("{} from {old_path}", file.status.description()),
@@ -709,28 +942,42 @@ impl DiffPanel {
             ),
         };
         let checkbox = self.render_stage_checkbox(file, entry, cx);
+        let group: gpui::SharedString = format!("diff-file:{}", file.path).into();
+        let title = file.path.clone();
+        let discard_path = file.path.clone();
+        let discard = IconButton::new(
+            ElementId::Name(format!("discard:{}", file.path).into()),
+            IconName::Undo,
+        )
+        .size(ButtonSize::Compact)
+        .icon_size(IconSize::XSmall)
+        .disabled(self.busy.is_some() || entry.is_none_or(|entry| entry.conflicted))
+        .tooltip(Tooltip::text(
+            if entry.is_some_and(|entry| entry.conflicted) {
+                "Resolve the conflict first"
+            } else {
+                "Discard changes"
+            },
+        ))
+        .on_click(
+            cx.listener(move |this, _, window, cx| this.confirm_discard(&discard_path, window, cx)),
+        );
 
-        let header = h_flex()
-            .id(ElementId::Name(format!("diff-file:{}", file.path).into()))
+        h_flex()
+            .id(ElementId::Name(group.clone()))
+            .group(group.clone())
             .h(ui_px(cx, 28.))
             .pl(px(4.))
-            .pr(px(8.))
+            .pr(px(4.))
             .gap(px(6.))
             .rounded(px(5.))
             .cursor_pointer()
             .hover(|style| style.bg(colors.element_hover))
             .tooltip(Tooltip::text(tooltip))
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_file(&path, cx)))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(DiffPanelEvent::OpenDiff(full_path.clone(), title.clone()))
+            }))
             .child(checkbox)
-            .child(
-                Icon::new(if expanded {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                })
-                .size(IconSize::XSmall)
-                .color(Color::Muted),
-            )
             .child(
                 div().flex_none().w(px(12.)).child(
                     Label::new(file.status.letter())
@@ -772,115 +1019,16 @@ impl DiffPanel {
                         .size(LabelSize::XSmall)
                         .color(Color::Error),
                 )
-            });
-
-        let body = expanded.then(|| self.render_file_lines(file, cx));
-        v_flex().child(header).children(body).into_any_element()
-    }
-
-    fn render_file_lines(&self, file: &FileDiff, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors.clone();
-        let font = Settings::get(cx).buffer_font_family.clone();
-        let (code_size, code_line) = Settings::get(cx).dense_code_size();
-        if file.binary {
-            return div()
-                .px(px(28.))
-                .py(px(4.))
-                .child(
-                    Label::new("Binary file")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Placeholder),
-                )
-                .into_any_element();
-        }
-        if file.lines.is_empty() {
-            return div()
-                .px(px(28.))
-                .py(px(4.))
-                .child(
-                    Label::new("No text changes")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Placeholder),
-                )
-                .into_any_element();
-        }
-        let hidden = file.lines.len().saturating_sub(MAX_LINES_PER_FILE);
-        let shown = &file.lines[..file.lines.len().min(MAX_LINES_PER_FILE)];
-        let texts: Vec<String> = shown
-            .iter()
-            .map(|line| line.text.replace('\t', "    "))
-            .collect();
-        let highlights = line_highlights(&file.path, shown, &texts, &colors.syntax);
-        let lines = shown
-            .iter()
-            .zip(texts)
-            .zip(highlights)
-            .map(|((line, text), spans)| {
-                let (sign, background, text_color) = match line.kind {
-                    LineKind::Hunk => (
-                        "",
-                        Some(colors.info_background.opacity(0.5)),
-                        colors.text_muted,
-                    ),
-                    LineKind::Context => (" ", None, colors.text_muted),
-                    LineKind::Added => ("+", Some(colors.success.opacity(0.14)), colors.text),
-                    LineKind::Removed => ("−", Some(colors.error.opacity(0.14)), colors.text),
-                };
-                h_flex()
-                    .items_start()
-                    .when_some(background, |this, background| this.bg(background))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(16.))
-                            .text_center()
-                            .text_color(colors.text_placeholder)
-                            .child(sign),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .pr(px(6.))
-                            .text_color(text_color)
-                            // Keeps empty lines one line tall.
-                            .child(if text.is_empty() {
-                                StyledText::new(" ")
-                            } else {
-                                StyledText::new(text).with_highlights(spans.into_iter().map(
-                                    |(range, color)| {
-                                        let style = HighlightStyle {
-                                            color: Some(color),
-                                            ..HighlightStyle::default()
-                                        };
-                                        (range, style)
-                                    },
-                                ))
-                            }),
-                    )
-            });
-        v_flex()
-            .mx(px(4.))
-            .mb(px(6.))
-            .py(px(2.))
-            .rounded(px(4.))
-            .overflow_hidden()
-            .bg(colors.editor_background)
-            .border_1()
-            .border_color(colors.border_variant)
-            .font_family(font)
-            .text_size(px(code_size))
-            .line_height(px(code_line))
-            .children(lines)
-            .when(hidden > 0, |this| {
-                this.child(
-                    div().px(px(16.)).py(px(4.)).child(
-                        Label::new(format!("{hidden} more lines not shown"))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Placeholder),
-                    ),
-                )
             })
+            // Shown on hover; transparent rather than absent keeps the row's
+            // layout stable (gpui 0.2.2 has no `invisible()`).
+            .child(
+                div()
+                    .flex_none()
+                    .opacity(0.)
+                    .group_hover(group, |style| style.opacity(1.))
+                    .child(discard),
+            )
             .into_any_element()
     }
 }
@@ -937,7 +1085,12 @@ impl Render for DiffPanel {
             _ => (None, None),
         };
         let toolbar = self.workspace.is_some().then(|| self.render_toolbar(cx));
+        // Scrolled to the highlight once; the wheel owns the list after that.
+        if let Some(picker) = &mut self.branch_picker {
+            picker.scroll_to_highlight = false;
+        }
         v_flex()
+            .track_focus(&self.focus_handle)
             .size_full()
             .children(branch_bar)
             .children(toolbar)
@@ -952,7 +1105,9 @@ fn load_repository(workspace: &Path) -> Result<Option<(Changes, RepoStatus)>, St
     let Some(changes) = load_changes(workspace)? else {
         return Ok(None);
     };
-    let status = git::status(&changes.root).map_err(GitError::message)?;
+    let mut status = git::status(&changes.root).map_err(GitError::message)?;
+    // The remotes only feed the remote picker; the panel works without them.
+    status.remotes = git::remotes(&changes.root).unwrap_or_default();
     Ok(Some((changes, status)))
 }
 
@@ -963,14 +1118,7 @@ fn load_changes(workspace: &Path) -> Result<Option<Changes>, String> {
         Err(GitError::Failed(_)) => return Ok(None),
         Err(GitError::Spawn(error)) => return Err(error),
     };
-    // A fresh repository has no HEAD yet: compare with the empty tree.
-    let base = match git(&root, &["rev-parse", "--verify", "--quiet", "HEAD"]) {
-        Ok(_) => "HEAD".to_string(),
-        Err(_) => git(&root, &["hash-object", "-t", "tree", "/dev/null"])
-            .map_err(GitError::message)?
-            .trim()
-            .to_string(),
-    };
+    let base = diff_base(&root)?;
     let diff = git(
         &root,
         &[
@@ -994,9 +1142,115 @@ fn load_changes(workspace: &Path) -> Result<Option<Changes>, String> {
     Ok(Some(Changes { root, files }))
 }
 
+/// HEAD, or the empty tree in a fresh repository that has no HEAD yet.
+fn diff_base(directory: &Path) -> Result<String, String> {
+    match git(directory, &["rev-parse", "--verify", "--quiet", "HEAD"]) {
+        Ok(_) => Ok("HEAD".to_string()),
+        Err(_) => Ok(git(directory, &["hash-object", "-t", "tree", "/dev/null"])
+            .map_err(GitError::message)?
+            .trim()
+            .to_string()),
+    }
+}
+
+/// The change of one file against HEAD, as the Changes panel shows it.
+/// `Ok(None)` when the file is unchanged, ignored or outside a git work tree.
+pub fn load_file_diff(path: &Path) -> Result<Option<FileDiff>, String> {
+    // A deleted file may have taken its folders with it; git runs from the
+    // nearest folder that still exists.
+    let Some(directory) = path
+        .ancestors()
+        .skip(1)
+        .find(|directory| directory.is_dir())
+    else {
+        return Ok(None);
+    };
+    let Ok(relative) = path.strip_prefix(directory) else {
+        return Ok(None);
+    };
+    let relative = relative.to_string_lossy().into_owned();
+    let base = match diff_base(directory) {
+        Ok(base) => base,
+        Err(_) => return Ok(None),
+    };
+    let diff = match git(
+        directory,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            &base,
+            "--",
+            &relative,
+        ],
+    ) {
+        Ok(diff) => diff,
+        Err(GitError::Failed(_)) => return Ok(None),
+        Err(GitError::Spawn(error)) => return Err(error),
+    };
+    if let Some(file) = parse_diff(&diff).into_iter().next() {
+        return Ok(Some(file));
+    }
+    let untracked = git(
+        directory,
+        &[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            &relative,
+        ],
+    )
+    .map_err(GitError::message)?;
+    if untracked.split('\0').all(str::is_empty) {
+        return Ok(None);
+    }
+    Ok(Some(untracked_diff(path, relative)))
+}
+
+/// Runs the steps of a discard in order; a file new since HEAD goes to the
+/// Trash, so it can still be brought back. The steps were planned when the
+/// user was asked; if the file's status moved on since (the agent committed
+/// or renamed it), nothing runs.
+fn discard(root: &Path, planned_for: &StatusEntry, steps: &[Discard]) -> Result<(), String> {
+    let status = git::status(root).map_err(GitError::message)?;
+    let current = status
+        .entries
+        .iter()
+        .find(|entry| entry.path == planned_for.path);
+    if current != Some(planned_for) {
+        return Err("the file changed since you asked; nothing was discarded".to_string());
+    }
+    for step in steps {
+        match step {
+            Discard::Restore(path) => {
+                git::restore_from_head(root, path).map_err(GitError::message)?;
+            }
+            Discard::Remove { path, staged } => {
+                if *staged {
+                    git::remove_from_index(root, path).map_err(GitError::message)?;
+                }
+                let full_path = root.join(path);
+                if full_path.exists() {
+                    crate::platform::move_to_trash(&full_path)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn untracked_file(root: &Path, path: &str) -> FileDiff {
+    untracked_diff(&root.join(path), path.to_string())
+}
+
+/// An untracked file as a diff that adds all of it; `path` is the one shown.
+fn untracked_diff(full_path: &Path, path: String) -> FileDiff {
     let mut file = FileDiff {
-        path: path.to_string(),
+        path,
         old_path: None,
         status: FileStatus::Untracked,
         binary: false,
@@ -1004,10 +1258,9 @@ fn untracked_file(root: &Path, path: &str) -> FileDiff {
         deletions: 0,
         lines: Vec::new(),
     };
-    let full_path = root.join(path);
     let too_big =
-        fs::metadata(&full_path).is_ok_and(|metadata| metadata.len() > MAX_UNTRACKED_BYTES);
-    match fs::read(&full_path) {
+        fs::metadata(full_path).is_ok_and(|metadata| metadata.len() > MAX_UNTRACKED_BYTES);
+    match fs::read(full_path) {
         Ok(bytes) if !too_big && !bytes.contains(&0) => {
             let text = String::from_utf8_lossy(&bytes);
             file.lines = text
@@ -1099,7 +1352,7 @@ pub fn parse_diff(output: &str) -> Vec<FileDiff> {
 /// new side (context and added lines) and the old side (context and removed
 /// lines) are highlighted as two continuous texts, so strings and comments
 /// that span lines keep their colors. Hunk headers stay plain.
-fn line_highlights(
+pub(crate) fn line_highlights(
     path: &str,
     lines: &[DiffLine],
     texts: &[String],

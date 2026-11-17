@@ -1,6 +1,7 @@
 //! A read-only view of one project file in its own window, opened from the
-//! Files panel: markdown rendered, other text with syntax colors and line
-//! numbers, binary files only named.
+//! Files and Changes panels: markdown rendered, other text with syntax colors
+//! and line numbers, binary files only named. A file changed against HEAD can
+//! also be shown as an inline or a side-by-side diff.
 
 use std::io::Read as _;
 use std::ops::Range;
@@ -13,6 +14,7 @@ use gpui::{
     list, point, px,
 };
 
+use crate::diff;
 use crate::hub::{TITLE_BAR_HEIGHT, TRAFFIC_LIGHT_PADDING, render_window_controls};
 use crate::markdown::{self, Node};
 use crate::platform;
@@ -21,6 +23,10 @@ use crate::settings::Settings;
 use crate::ui::prelude::*;
 use crate::ui::scrollbar::{ScrollDrag, thumb_height};
 use crate::ui::{SyntaxColors, Tooltip};
+
+use diff_view::{DiffView, RowStyle};
+
+mod diff_view;
 
 actions!(file_viewer, [Close, CopySelection]);
 
@@ -50,6 +56,28 @@ pub fn bind_keys(cx: &mut gpui::App) {
     )]);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewMode {
+    File,
+    InlineDiff,
+    SplitDiff,
+}
+
+impl ViewMode {
+    fn is_diff(self) -> bool {
+        self != ViewMode::File
+    }
+}
+
+/// The file's change against HEAD.
+enum DiffState {
+    Loading,
+    /// Unchanged, ignored or outside a git work tree.
+    Unchanged,
+    Failed(String),
+    Changed(DiffView),
+}
+
 enum Content {
     Loading,
     Binary,
@@ -75,7 +103,9 @@ struct Loaded {
 pub struct FileViewer {
     path: PathBuf,
     title: String,
+    mode: ViewMode,
     content: Content,
+    diff: DiffState,
     cut: bool,
     markdown_as_text: bool,
     size: u64,
@@ -88,18 +118,22 @@ pub struct FileViewer {
     focused: bool,
     _selection_subscription: Subscription,
     _load: Task<()>,
+    _diff_load: Task<()>,
 }
 
 impl FileViewer {
-    /// `title` is the path shown, relative to the project.
-    pub fn new(path: PathBuf, title: String, cx: &mut Context<Self>) -> Self {
+    /// `title` is the path shown, relative to the project. A diff mode falls
+    /// back to the file when the file turns out unchanged.
+    pub fn new(path: PathBuf, title: String, mode: ViewMode, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         let selection = cx.new(|_| Self::selection_for(&path, focus.clone()));
         let selection_subscription = cx.observe(&selection, |_, _, cx| cx.notify());
         let mut this = Self {
             path,
             title,
+            mode,
             content: Content::Loading,
+            diff: DiffState::Loading,
             cut: false,
             markdown_as_text: false,
             size: 0,
@@ -112,15 +146,17 @@ impl FileViewer {
             focused: false,
             _selection_subscription: selection_subscription,
             _load: Task::ready(()),
+            _diff_load: Task::ready(()),
         };
         this.start_load(cx);
         this
     }
 
     /// Loads another file into the same window.
-    pub fn open(&mut self, path: PathBuf, title: String, cx: &mut Context<Self>) {
+    pub fn open(&mut self, path: PathBuf, title: String, mode: ViewMode, cx: &mut Context<Self>) {
         self.path = path;
         self.title = title;
+        self.mode = mode;
         self.list = ListState::new(0, ListAlignment::Top, px(400.));
         self.markdown_scroll = ScrollHandle::new();
         self.scroll_drag = None;
@@ -144,6 +180,7 @@ impl FileViewer {
         self.cut = false;
         self.markdown_as_text = false;
         self.size = 0;
+        self.diff = DiffState::Loading;
         let syntax = cx.theme().colors.syntax;
         let read_path = self.path.clone();
         let read = cx.background_spawn(async move { load(&read_path, &syntax) });
@@ -152,9 +189,6 @@ impl FileViewer {
             this.update(cx, |this, cx| {
                 match result {
                     Ok(loaded) => {
-                        if let Content::Text { lines, .. } = &loaded.content {
-                            this.list.reset(lines.len());
-                        }
                         this.cut = loaded.cut;
                         this.size = loaded.size;
                         this.markdown_as_text = loaded.markdown_as_text;
@@ -162,10 +196,67 @@ impl FileViewer {
                     }
                     Err(error) => this.content = Content::Failed(error),
                 }
+                this.reset_list();
                 cx.notify();
             })
             .ok();
         });
+        let diff_path = self.path.clone();
+        let read_diff = cx.background_spawn(async move {
+            diff::load_file_diff(&diff_path)
+                .map(|file| file.map(|file| DiffView::new(file, &syntax)))
+        });
+        self._diff_load = cx.spawn(async move |this, cx| {
+            let result = read_diff.await;
+            this.update(cx, |this, cx| {
+                this.diff = match result {
+                    Ok(Some(view)) => DiffState::Changed(view),
+                    Ok(None) => DiffState::Unchanged,
+                    Err(error) => {
+                        eprintln!(
+                            "pi-gpui: git diff of {} failed: {error}",
+                            this.path.display()
+                        );
+                        DiffState::Failed(error)
+                    }
+                };
+                if this.mode.is_diff() && !matches!(this.diff, DiffState::Changed(_)) {
+                    this.mode = ViewMode::File;
+                }
+                this.reset_list();
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    fn set_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        self.scroll_drag = None;
+        self.reset_list();
+        cx.notify();
+    }
+
+    /// Rows of the virtual list in the current mode; `None` when the body is
+    /// not a list (markdown, messages).
+    fn list_rows(&self) -> Option<usize> {
+        match (self.mode, &self.content, &self.diff) {
+            (ViewMode::File, Content::Text { lines, .. }, _) => Some(lines.len()),
+            (ViewMode::InlineDiff, _, DiffState::Changed(view)) => Some(view.inline_row_count()),
+            (ViewMode::SplitDiff, _, DiffState::Changed(view)) => Some(view.split_row_count()),
+            _ => None,
+        }
+    }
+
+    fn reset_list(&mut self) {
+        self.list.reset(self.list_rows().unwrap_or(0));
+    }
+
+    fn shows_markdown(&self) -> bool {
+        self.mode == ViewMode::File && matches!(self.content, Content::Markdown(_))
     }
 
     fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
@@ -175,6 +266,9 @@ impl FileViewer {
     }
 
     fn facts(&self) -> String {
+        if let (true, DiffState::Changed(view)) = (self.mode.is_diff(), &self.diff) {
+            return format!("+{} −{}", view.additions, view.deletions);
+        }
         if matches!(self.content, Content::Loading | Content::Failed(_)) {
             return String::new();
         }
@@ -208,18 +302,20 @@ impl FileViewer {
     /// Track height, whole content height and the current offset, or `None`
     /// when the content fits and needs no scrollbar.
     fn scroll_metrics(&self) -> Option<(Pixels, Pixels, Pixels)> {
-        let (track, max, offset) = match &self.content {
-            Content::Text { .. } => (
+        let (track, max, offset) = if self.list_rows().is_some() {
+            (
                 self.list.viewport_bounds().size.height,
                 self.list.max_offset_for_scrollbar().height,
                 -self.list.scroll_px_offset_for_scrollbar().y,
-            ),
-            Content::Markdown(_) => (
+            )
+        } else if self.shows_markdown() {
+            (
                 self.markdown_scroll.bounds().size.height,
                 self.markdown_scroll.max_offset().height,
                 -self.markdown_scroll.offset().y,
-            ),
-            _ => return None,
+            )
+        } else {
+            return None;
         };
         if track <= px(0.) || max <= px(0.) {
             return None;
@@ -229,16 +325,12 @@ impl FileViewer {
 
     fn apply_scroll(&self, desired: Pixels) {
         let desired = desired.max(px(0.));
-        match &self.content {
-            Content::Text { .. } => {
-                self.list.set_offset_from_scrollbar(point(px(0.), -desired));
-            }
-            Content::Markdown(_) => {
-                let max = self.markdown_scroll.max_offset().height;
-                self.markdown_scroll
-                    .set_offset(point(px(0.), -desired.min(max)));
-            }
-            _ => {}
+        if self.list_rows().is_some() {
+            self.list.set_offset_from_scrollbar(point(px(0.), -desired));
+        } else if self.shows_markdown() {
+            let max = self.markdown_scroll.max_offset().height;
+            self.markdown_scroll
+                .set_offset(point(px(0.), -desired.min(max)));
         }
     }
 
@@ -246,7 +338,7 @@ impl FileViewer {
         let Some((track, content, offset)) = self.scroll_metrics() else {
             return;
         };
-        if matches!(self.content, Content::Text { .. }) {
+        if self.list_rows().is_some() {
             self.list.scrollbar_drag_started();
         }
         self.scroll_drag = Some(ScrollDrag {
@@ -285,9 +377,10 @@ impl FileViewer {
         let colors = cx.theme().colors.clone();
         let thumb = thumb_height(track, content);
         let thumb_y = (track - thumb) * (f32::from(offset) / f32::from(content - track));
-        let top = match &self.content {
-            Content::Text { .. } => self.list.viewport_bounds().origin.y,
-            _ => self.markdown_scroll.bounds().origin.y,
+        let top = if self.list_rows().is_some() {
+            self.list.viewport_bounds().origin.y
+        } else {
+            self.markdown_scroll.bounds().origin.y
         };
         Some(
             div()
@@ -298,10 +391,12 @@ impl FileViewer {
                 .w(px(10.))
                 .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                     let delta = event.delta.pixel_delta(px(20.));
-                    let offset = match &this.content {
-                        Content::Text { .. } => -this.list.scroll_px_offset_for_scrollbar().y,
-                        Content::Markdown(_) => -this.markdown_scroll.offset().y,
-                        _ => return,
+                    let offset = if this.list_rows().is_some() {
+                        -this.list.scroll_px_offset_for_scrollbar().y
+                    } else if this.shows_markdown() {
+                        -this.markdown_scroll.offset().y
+                    } else {
+                        return;
                     };
                     this.apply_scroll(offset - delta.y);
                     cx.notify();
@@ -342,23 +437,16 @@ impl FileViewer {
     }
 
     fn render_body(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let message = |text: String| {
-            h_flex()
-                .flex_1()
-                .justify_center()
-                .py(px(40.))
-                .child(
-                    Label::new(text)
-                        .size(LabelSize::Small)
-                        .color(Color::Placeholder),
-                )
-                .into_any_element()
-        };
+        if self.mode.is_diff() {
+            return self.render_diff(cx);
+        }
         match &self.content {
-            Content::Loading => message("Loading…".to_string()),
-            Content::Binary => message("Binary file: open it in an editor.".to_string()),
-            Content::Failed(error) => message(format!("Could not read the file: {error}")),
-            Content::Text { lines, .. } if lines.is_empty() => message("Empty file.".to_string()),
+            Content::Loading => render_message("Loading…".to_string()),
+            Content::Binary => render_message("Binary file: open it in an editor.".to_string()),
+            Content::Failed(error) => render_message(format!("Could not read the file: {error}")),
+            Content::Text { lines, .. } if lines.is_empty() => {
+                render_message("Empty file.".to_string())
+            }
             Content::Markdown(nodes) => {
                 let settings = Settings::get(cx);
                 div()
@@ -448,6 +536,81 @@ impl FileViewer {
                 .into_any_element()
             }
         }
+    }
+
+    fn render_diff(&self, cx: &mut Context<Self>) -> AnyElement {
+        let DiffState::Changed(view) = &self.diff else {
+            return render_message("Loading…".to_string());
+        };
+        if view.binary {
+            return render_message("Binary file: no text diff.".to_string());
+        }
+        if view.is_empty() {
+            return render_message("No text changes.".to_string());
+        }
+        let settings = Settings::get(cx);
+        let style = RowStyle {
+            font_size: px(settings.buffer_font_size),
+            line_height: px(settings.buffer_line_height()),
+            // Wide enough for the longest number in the code font.
+            gutter: px(settings.buffer_font_size * 0.62 * view.number_digits() as f32 + 16.),
+        };
+        let mode = self.mode;
+        list(
+            self.list.clone(),
+            cx.processor(move |this, index: usize, _, cx| {
+                let DiffState::Changed(view) = &this.diff else {
+                    return div().into_any_element();
+                };
+                match mode {
+                    ViewMode::SplitDiff => view.render_split_row(index, &this.selection, style, cx),
+                    _ => view.render_inline_row(index, &this.selection, style, cx),
+                }
+            }),
+        )
+        .font_family(settings.buffer_font_family.clone())
+        .flex_1()
+        .py(px(8.))
+        .into_any_element()
+    }
+
+    fn render_mode_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let diff_ready = matches!(self.diff, DiffState::Changed(_));
+        let unavailable = match &self.diff {
+            DiffState::Loading => "reading git diff…".to_string(),
+            DiffState::Failed(error) => format!("git diff failed: {error}"),
+            _ => "no changes against HEAD".to_string(),
+        };
+        let button = |id: &'static str, icon: IconName, mode: ViewMode, tooltip: &str| {
+            let available = mode == ViewMode::File || diff_ready;
+            IconButton::new(id, icon)
+                .size(ButtonSize::Compact)
+                .icon_size(IconSize::XSmall)
+                .toggle_state(self.mode == mode)
+                .disabled(!available)
+                .tooltip(Tooltip::text(if available {
+                    tooltip.to_string()
+                } else {
+                    format!("{tooltip}: {unavailable}")
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| this.set_mode(mode, cx)))
+        };
+        h_flex()
+            .flex_none()
+            .gap(px(2.))
+            .child(button("view-file", IconName::File, ViewMode::File, "File"))
+            .child(button(
+                "view-inline-diff",
+                IconName::Diff,
+                ViewMode::InlineDiff,
+                "Inline diff",
+            ))
+            .child(button(
+                "view-split-diff",
+                IconName::DiffSplit,
+                ViewMode::SplitDiff,
+                "Side-by-side diff",
+            ))
     }
 
     /// The file name strip doubles as the window's title bar, laid out like
@@ -542,11 +705,6 @@ impl FileViewer {
                                         .monospace()
                                         .truncate(),
                                 ),
-                            )
-                            .child(
-                                Label::new(facts)
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Placeholder),
                             );
                         if cfg!(windows) {
                             // Scoped to the name area: the buttons are its
@@ -562,6 +720,12 @@ impl FileViewer {
                             drag_area
                         }
                     })
+                    .child(self.render_mode_buttons(cx))
+                    .child(
+                        Label::new(facts)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Placeholder),
+                    )
                     .child(
                         IconButton::new("file-viewer-open", IconName::FolderOpen)
                             .size(ButtonSize::Compact)
@@ -643,6 +807,19 @@ impl Render for FileViewer {
             );
         crate::window_frame::decorate(content, window, cx)
     }
+}
+
+fn render_message(text: String) -> AnyElement {
+    h_flex()
+        .flex_1()
+        .justify_center()
+        .py(px(40.))
+        .child(
+            Label::new(text)
+                .size(LabelSize::Small)
+                .color(Color::Placeholder),
+        )
+        .into_any_element()
 }
 
 fn load(path: &Path, syntax: &SyntaxColors) -> Result<Loaded, String> {

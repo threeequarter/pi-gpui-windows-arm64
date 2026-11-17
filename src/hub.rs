@@ -21,7 +21,7 @@ use crate::chat::{ChatEvent, ChatStatus, ChatView, DetailsExpanded};
 use crate::diff::{DiffPanel, DiffPanelEvent};
 use crate::dock::{DockSide, Docks, PanelKind};
 use crate::file_tree::{FilesEvent, FilesPanel};
-use crate::file_viewer::FileViewer;
+use crate::file_viewer::{FileViewer, ViewMode};
 use crate::pi::{self, Installation};
 use crate::pi_updates;
 use crate::platform;
@@ -29,6 +29,7 @@ use crate::plugins::{
     CommandContext, PluginEvent, PluginRegistry, PluginReply, PluginRequest, PluginSetting,
     RunPluginCommand, SettingKind,
 };
+use crate::project_watcher::ProjectWatcher;
 use crate::sessions::{self, SessionSummary};
 use crate::settings::{self, Settings, ui_px};
 use crate::text_input::TextInput;
@@ -74,6 +75,8 @@ const SESSIONS_PER_WORKSPACE: usize = 20;
 pub const TITLE_BAR_HEIGHT: f32 = 38.;
 /// Room for the macOS traffic lights, as in Zed's `TRAFFIC_LIGHT_PADDING`.
 pub(crate) const TRAFFIC_LIGHT_PADDING: f32 = 84.;
+/// A new file viewer window; on Windows it shrinks to fit the screen.
+const FILE_VIEWER_SIZE: gpui::Size<Pixels> = size(px(1100.), px(760.));
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -315,9 +318,6 @@ pub struct HubView {
     /// Workspaces whose hidden sessions are shown for now.
     show_hidden: HashSet<PathBuf>,
     session_menu: Option<SessionMenu>,
-    /// Linux has no menu bar: Settings, updates and Quit live in this menu,
-    /// opened from the title bar. Holds where it opens.
-    app_menu: Option<Point<Pixels>>,
     renaming: Option<Renaming>,
     /// Sessions being renamed through a short-lived pi process.
     renaming_sessions: HashSet<PathBuf>,
@@ -329,6 +329,8 @@ pub struct HubView {
     diff_panel: Entity<DiffPanel>,
     files_panel: Entity<FilesPanel>,
     file_viewer: Option<WindowHandle<FileViewer>>,
+    /// The active session's project, watched so the panels update on their own.
+    project_watcher: Option<ProjectWatcher>,
     /// Focus returns to the Files panel after the viewer closes.
     focus_files: bool,
     /// Right-click menu of a side panel.
@@ -446,11 +448,19 @@ impl HubView {
         ];
         let docks = state_path.as_deref().map(load_docks).unwrap_or_default();
         let diff_panel = cx.new(DiffPanel::new);
-        // Staging, commits and pulls change the Files panel's git badges.
-        cx.subscribe(
+        cx.subscribe_in(
             &diff_panel,
-            |this: &mut Self, _, event: &DiffPanelEvent, cx| match event {
+            window,
+            |this: &mut Self, _, event: &DiffPanelEvent, window, cx| match event {
+                // Staging, commits and pulls change the Files panel's git badges.
                 DiffPanelEvent::RepositoryChanged => this.refresh_files(cx),
+                DiffPanelEvent::OpenDiff(path, title) => this.open_file_viewer(
+                    path.clone(),
+                    title.clone(),
+                    ViewMode::InlineDiff,
+                    window,
+                    cx,
+                ),
             },
         )
         .detach();
@@ -472,7 +482,7 @@ impl HubView {
                     }
                 }
                 FilesEvent::OpenPath(path, title) => {
-                    this.open_file_viewer(path.clone(), title.clone(), window, cx);
+                    this.open_file_viewer(path.clone(), title.clone(), ViewMode::File, window, cx);
                 }
             },
         )
@@ -497,7 +507,6 @@ impl HubView {
             hidden_sessions: HashSet::new(),
             show_hidden: HashSet::new(),
             session_menu: None,
-            app_menu: None,
             renaming: None,
             renaming_sessions: HashSet::new(),
             command_held: false,
@@ -506,6 +515,7 @@ impl HubView {
             diff_panel,
             files_panel,
             file_viewer: None,
+            project_watcher: None,
             focus_files: false,
             panel_menu: None,
             resizing_dock: None,
@@ -2147,96 +2157,6 @@ impl HubView {
         .into_any_element()
     }
 
-    /// What the macOS menu bar holds, for platforms without one.
-    fn render_app_menu(&self, position: Point<Pixels>, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors.clone();
-        let item =
-            |id: &'static str, label: &'static str, keys: Option<&'static str>, enabled: bool| {
-                h_flex()
-                    .id(id)
-                    .h(ui_px(cx, 28.))
-                    .px(px(8.))
-                    .gap(px(8.))
-                    .rounded(px(5.))
-                    .when(enabled, |this| {
-                        this.cursor_pointer()
-                            .hover(|style| style.bg(colors.element_hover))
-                    })
-                    .when(!enabled, |this| this.cursor_not_allowed())
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(Label::new(label).size(LabelSize::Small).color(if enabled {
-                                Color::Default
-                            } else {
-                                Color::Disabled
-                            })),
-                    )
-                    .children(keys.map(KeyHint::new))
-            };
-        let settings = item("app-menu-settings", "Settings", Some("⌘,"), true).on_click(
-            cx.listener(|this, _, window, cx| {
-                this.app_menu = None;
-                this.open_settings(&OpenSettings, window, cx);
-            }),
-        );
-        // Updates only work in an installed bundle, never on Windows, so the
-        // item is greyed out where they are unavailable.
-        let updates_enabled = AutoUpdater::global(cx).read(cx).available();
-        let updates = item(
-            "app-menu-updates",
-            "Check for Updates",
-            None,
-            updates_enabled,
-        );
-        let updates = if updates_enabled {
-            updates.on_click(cx.listener(|this, _, _, cx| {
-                this.app_menu = None;
-                AutoUpdater::global(cx).update(cx, |updater, cx| updater.check(true, cx));
-                cx.notify();
-            }))
-        } else {
-            updates
-        };
-        let about = item("app-menu-about", "About Pi GPUI", None, true).on_click(cx.listener(
-            |this, _, _, cx| {
-                this.app_menu = None;
-                cx.open_url("https://github.com/bytesbay/pi-gpui");
-                cx.notify();
-            },
-        ));
-        let quit = item("app-menu-quit", "Quit", Some("⌘Q"), true)
-            .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::Quit), cx));
-        deferred(
-            anchored()
-                .position(position)
-                .anchor(gpui::Corner::TopRight)
-                .child(
-                    v_flex()
-                        .id("app-menu")
-                        .w(px(220.))
-                        .p(px(4.))
-                        .rounded(px(8.))
-                        .border_1()
-                        .border_color(colors.border)
-                        .bg(colors.elevated_surface_background)
-                        .shadow_lg()
-                        .occlude()
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            this.app_menu = None;
-                            cx.notify();
-                        }))
-                        .child(settings)
-                        .child(updates)
-                        .child(about)
-                        .child(div().my(px(4.)).h(px(1.)).bg(colors.border_variant))
-                        .child(quit),
-                ),
-        )
-        .with_priority(1)
-        .into_any_element()
-    }
-
     fn move_panel(&mut self, kind: PanelKind, to: DockSide, cx: &mut Context<Self>) {
         self.docks.move_panel(kind, to);
         self.save(cx);
@@ -2330,8 +2250,32 @@ impl HubView {
     }
 
     fn refresh_visible_panels(&mut self, cx: &mut Context<Self>) {
+        self.watch_active_project(cx);
         self.refresh_files(cx);
         self.refresh_diff(cx);
+    }
+
+    /// Keeps the watcher on the active session's project.
+    fn watch_active_project(&mut self, cx: &mut Context<Self>) {
+        let workspace = self
+            .active_chat
+            .as_ref()
+            .map(|chat| chat.read(cx).workspace().to_path_buf());
+        let watched = self.project_watcher.as_ref().map(ProjectWatcher::root);
+        if watched == workspace.as_deref() {
+            return;
+        }
+        self.project_watcher = workspace.and_then(|workspace| {
+            ProjectWatcher::new(
+                workspace.clone(),
+                |this: &mut Self, cx| this.refresh_visible_panels(cx),
+                cx,
+            )
+            .inspect_err(|error| {
+                eprintln!("pi-gpui: cannot watch {}: {error}", workspace.display());
+            })
+            .ok()
+        });
     }
 
     fn render_workspace(
@@ -4641,15 +4585,6 @@ impl HubView {
                             )
                         },
                     )
-                    .when_some(self.active_chat.clone(), |this, chat| {
-                        this.child(
-                            IconButton::new("session-tree", IconName::ListTree)
-                                .tooltip(Tooltip::with_keys("Session tree", "⌘⇧T"))
-                                .on_click(move |_, window, cx| {
-                                    chat.update(cx, |chat, cx| chat.toggle_tree(window, cx))
-                                }),
-                        )
-                    })
                     .child({
                         let expanded = cx.global::<DetailsExpanded>().expanded;
                         IconButton::new(
@@ -4675,15 +4610,11 @@ impl HubView {
                     .children(self.render_dock_toggle(DockSide::Right, cx))
                     .when(!cfg!(target_os = "macos"), |this| {
                         this.child(
-                            IconButton::new("app-menu", IconName::Ellipsis)
-                                .toggle_state(self.app_menu.is_some())
-                                .tooltip(Tooltip::text("Settings and more"))
-                                .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
-                                    // Below the button, right edges roughly aligned.
-                                    let click = event.position();
-                                    this.app_menu =
-                                        Some(point(click.x + px(14.), click.y + px(18.)));
-                                    cx.notify();
+                            IconButton::new("open-settings", IconName::Settings)
+                                .toggle_state(self.settings_page.is_some())
+                                .tooltip(Tooltip::with_keys("Settings", "⌘,"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_settings(&OpenSettings, window, cx)
                                 })),
                         )
                     })
@@ -4811,12 +4742,13 @@ impl HubView {
         &mut self,
         path: PathBuf,
         title: String,
+        mode: ViewMode,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(viewer) = self.file_viewer {
             let reused = viewer.update(cx, |viewer, window, cx| {
-                viewer.open(path.clone(), title.clone(), cx);
+                viewer.open(path.clone(), title.clone(), mode, cx);
                 window.set_window_title(&title);
                 window.activate_window();
             });
@@ -4829,8 +4761,7 @@ impl HubView {
         // bounds with that display's defaults when their center lies on
         // another display, so both name the hub's display.
         let display_id = window.display(cx).map(|display| display.id());
-        let bounds =
-            WindowBounds::Windowed(Bounds::centered(display_id, size(px(1100.), px(760.)), cx));
+        let bounds = WindowBounds::Windowed(Bounds::centered(display_id, FILE_VIEWER_SIZE, cx));
         let options = WindowOptions {
             window_bounds: Some(bounds),
             display_id,
@@ -4847,7 +4778,7 @@ impl HubView {
             ..Default::default()
         };
         let viewer = match cx.open_window(options, |_, cx| {
-            cx.new(|cx| FileViewer::new(path, title, cx))
+            cx.new(|cx| FileViewer::new(path, title, mode, cx))
         }) {
             Ok(viewer) => viewer,
             Err(error) => {
@@ -4855,6 +4786,17 @@ impl HubView {
                 return;
             }
         };
+        #[cfg(windows)]
+        if let (Some(anchor), Ok(Some(native))) = (
+            platform::native_window(window),
+            viewer.update(cx, |_, window, _| platform::native_window(window)),
+        ) {
+            // Off the current update: moving the window re-enters gpui.
+            cx.spawn(async move |_, _| {
+                platform::center_on_monitor_of(native, anchor, FILE_VIEWER_SIZE)
+            })
+            .detach();
+        }
         // Closing the window releases its root view, however it was closed.
         if let Ok(entity) = viewer.entity(cx) {
             cx.observe_release(&entity, |this, _, cx| {
@@ -5037,10 +4979,6 @@ impl Render for HubView {
                 self.panel_menu
                     .as_ref()
                     .map(|menu| self.render_panel_menu(menu, cx)),
-            )
-            .children(
-                self.app_menu
-                    .map(|position| self.render_app_menu(position, cx)),
             );
         crate::window_frame::decorate(content, window, cx)
     }

@@ -157,6 +157,116 @@ pub fn toggle_maximized(window: &Window) {
     window.zoom_window();
 }
 
+/// A window's Win32 handle, kept for calls that must run outside gpui updates.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub struct NativeWindow(isize);
+
+#[cfg(windows)]
+pub fn native_window(window: &Window) -> Option<NativeWindow> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    // `Window` also has an inherent `window_handle()`; ask the raw-window-handle trait.
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return None;
+    };
+    Some(NativeWindow(win32.hwnd.get()))
+}
+
+/// Centers `window` on the work area of the monitor `anchor` is on, `size`
+/// logical pixels large but never larger than that work area.
+///
+/// gpui 0.2.2 converts the bounds of a new window with the DPI of the
+/// monitor Windows first creates it on (the primary one), not of the target
+/// display, so on a second monitor with another scale the window lands off
+/// center or partly off screen. Here the rectangle is computed in physical
+/// pixels of the anchor's monitor instead.
+///
+/// Call it outside gpui updates: `SetWindowPos` sends `WM_MOVE`, `WM_SIZE`
+/// and `WM_DPICHANGED` synchronously, and gpui answers them by re-entering
+/// the app.
+#[cfg(windows)]
+pub fn center_on_monitor_of(
+    window: NativeWindow,
+    anchor: NativeWindow,
+    size: gpui::Size<gpui::Pixels>,
+) {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct MonitorInfo {
+        size: u32,
+        _monitor: Rect,
+        work: Rect,
+        _flags: u32,
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
+        fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
+        fn GetDpiForWindow(hwnd: isize) -> u32;
+        fn SetWindowPos(
+            hwnd: isize,
+            after: isize,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            flags: u32,
+        ) -> i32;
+    }
+    const MONITOR_DEFAULTTONEAREST: u32 = 2;
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    const DEFAULT_DPI: f32 = 96.;
+
+    // SAFETY: both handles are gpui's live windows; the calls only read
+    // monitor data into valid locals and move `window`.
+    unsafe {
+        let monitor = MonitorFromWindow(anchor.0, MONITOR_DEFAULTTONEAREST);
+        let mut info = MonitorInfo {
+            size: std::mem::size_of::<MonitorInfo>() as u32,
+            ..MonitorInfo::default()
+        };
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            return;
+        }
+        // 0 when the hub window is already gone.
+        let dpi = GetDpiForWindow(anchor.0);
+        if dpi == 0 {
+            return;
+        }
+        let scale = dpi as f32 / DEFAULT_DPI;
+        let work = info.work;
+        let width = ((f32::from(size.width) * scale) as i32).min(work.right - work.left);
+        let height = ((f32::from(size.height) * scale) as i32).min(work.bottom - work.top);
+        let x = work.left + (work.right - work.left - width) / 2;
+        let y = work.top + (work.bottom - work.top - height) / 2;
+        // Crossing to a monitor with another DPI makes gpui apply the size
+        // Windows suggests for it; the second call restores the exact
+        // rectangle once the window is on the target monitor.
+        for _ in 0..2 {
+            SetWindowPos(
+                window.0,
+                0,
+                x,
+                y,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
 /// Tells macOS whether the app looks dark or light, so system-drawn parts
 /// (traffic lights, menus, scroll bars, permission sheets) and other apps
 /// asking for our appearance match the theme instead of the system setting.
