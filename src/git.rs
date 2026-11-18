@@ -376,6 +376,97 @@ impl RepoStatus {
     }
 }
 
+/// What a repository holds that is not on its remote yet, for the
+/// repository menu: uncommitted changes and branches still to push.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepoOverview {
+    /// Changed and untracked files, as the Changes panel counts them.
+    pub changes: usize,
+    pub unpushed: Vec<UnpushedBranch>,
+}
+
+/// A local branch with commits its upstream lacks, or with no upstream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnpushedBranch {
+    pub name: String,
+    /// Commits ahead of the upstream; `None` when the branch was never published.
+    pub ahead: Option<u32>,
+}
+
+impl RepoOverview {
+    pub fn is_clean(&self) -> bool {
+        self.changes == 0 && self.unpushed.is_empty()
+    }
+
+    /// Commits to push on the branches that have an upstream.
+    pub fn commits_ahead(&self) -> u32 {
+        self.unpushed.iter().filter_map(|branch| branch.ahead).sum()
+    }
+
+    pub fn unpublished(&self) -> usize {
+        self.unpushed
+            .iter()
+            .filter(|branch| branch.ahead.is_none())
+            .count()
+    }
+}
+
+/// The overview of one repository: a status, a ref listing and the remotes.
+/// A repository without remotes has nowhere to publish a branch, so its
+/// branches without upstream are not listed.
+pub fn overview(root: &Path) -> Result<RepoOverview, GitError> {
+    let (status, branches, remotes) = thread::scope(|scope| {
+        let remotes = scope.spawn(|| remotes(root));
+        let branches = scope.spawn(|| {
+            git(
+                root,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)%00%(upstream)%00%(upstream:track,nobracket)",
+                    "refs/heads",
+                ],
+            )
+        });
+        (status(root), joined(branches), joined(remotes))
+    });
+    let mut unpushed = parse_unpushed(&branches?);
+    if remotes?.is_empty() {
+        unpushed.retain(|branch| branch.ahead.is_some());
+    }
+    Ok(RepoOverview {
+        changes: status?.entries.len(),
+        unpushed,
+    })
+}
+
+/// Branches of `for-each-ref` output that still need a push. A `gone`
+/// upstream was deleted on the remote, usually after a merge, so it counts
+/// as pushed; a branch only behind its upstream has nothing to push.
+fn parse_unpushed(output: &str) -> Vec<UnpushedBranch> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\0');
+            let name = fields.next()?.strip_prefix("refs/heads/")?.to_string();
+            let upstream = fields.next().unwrap_or_default();
+            let track = fields.next().unwrap_or_default();
+            if upstream.is_empty() {
+                return Some(UnpushedBranch { name, ahead: None });
+            }
+            // "ahead 2", "behind 1", "ahead 2, behind 1" or "gone".
+            let ahead = track
+                .split(", ")
+                .find_map(|part| part.strip_prefix("ahead "))
+                .and_then(|count| count.parse().ok())
+                .filter(|&count: &u32| count > 0)?;
+            Some(UnpushedBranch {
+                name,
+                ahead: Some(ahead),
+            })
+        })
+        .collect()
+}
+
 /// Branch header and entries of `git status --porcelain=v2 -z`.
 pub fn status(root: &Path) -> Result<RepoStatus, GitError> {
     let output = git(
@@ -691,6 +782,9 @@ pub struct RemoteTarget {
     pub remote: String,
     pub local_branch: String,
     pub remote_branch: String,
+    /// The branch tracks nothing yet: Push records the target as its upstream,
+    /// the way `push.autoSetupRemote` would, instead of failing.
+    pub set_upstream: bool,
 }
 
 impl RemoteTarget {
@@ -708,6 +802,7 @@ impl RemoteTarget {
             remote,
             local_branch,
             remote_branch,
+            set_upstream: status.upstream.is_none(),
         })
     }
 }
@@ -722,7 +817,12 @@ pub fn pull_from(root: &Path, target: &RemoteTarget) -> Result<String, String> {
 
 pub fn push_to(root: &Path, target: &RemoteTarget) -> Result<String, String> {
     let refspec = format!("{}:{}", target.local_branch, target.remote_branch);
-    network(root, &["push", &target.remote, &refspec])
+    let mut arguments = vec!["push"];
+    if target.set_upstream {
+        arguments.push("--set-upstream");
+    }
+    arguments.extend([target.remote.as_str(), refspec.as_str()]);
+    network(root, &arguments)
 }
 
 /// Names of the configured remotes.
@@ -744,6 +844,9 @@ pub struct Branch {
     pub is_remote: bool,
     /// The branch HEAD is on.
     pub is_head: bool,
+    /// A local branch that is on no remote: it has no upstream, or its
+    /// upstream was deleted there (`gone`).
+    pub local_only: bool,
     /// Unix time of the last commit; 0 when git printed none.
     pub committed_at: u64,
     /// Subject of the last commit.
@@ -759,7 +862,7 @@ pub fn branches(root: &Path) -> Result<Vec<Branch>, GitError> {
         root,
         &[
             "for-each-ref",
-            "--format=%(HEAD)%00%(refname)%00%(upstream)%00%(committerdate:unix)%00%(symref)%00%(subject)",
+            "--format=%(HEAD)%00%(refname)%00%(upstream)%00%(upstream:track)%00%(committerdate:unix)%00%(symref)%00%(subject)",
             "refs/heads",
             "refs/remotes",
         ],
@@ -771,8 +874,17 @@ fn parse_branches(output: &str) -> Vec<Branch> {
     let mut tracked = Vec::new();
     let mut branches = Vec::new();
     for line in output.lines() {
-        let fields: Vec<&str> = line.splitn(6, '\0').collect();
-        let [head, reference, upstream, committed_at, symref, subject] = fields[..] else {
+        let fields: Vec<&str> = line.splitn(7, '\0').collect();
+        let [
+            head,
+            reference,
+            upstream,
+            track,
+            committed_at,
+            symref,
+            subject,
+        ] = fields[..]
+        else {
             continue;
         };
         // `origin/HEAD` points at another remote branch.
@@ -795,6 +907,7 @@ fn parse_branches(output: &str) -> Vec<Branch> {
                 name: name.to_string(),
                 is_remote,
                 is_head: head == "*",
+                local_only: !is_remote && (upstream.is_empty() || track == "[gone]"),
                 committed_at: committed_at.parse().unwrap_or(0),
                 subject: subject.to_string(),
             },
@@ -818,6 +931,20 @@ pub fn switch_branch(root: &Path, branch: &Branch) -> Result<(), GitError> {
         &["switch", &branch.name]
     };
     git(root, arguments).map(|_| ())
+}
+
+/// Deletes the local branch `name`. Without `force`, git refuses a branch
+/// whose commits are not merged into its upstream or HEAD; see
+/// `is_not_merged`, which reads git's English message, so the locale is C.
+pub fn delete_branch(root: &Path, name: &str, force: bool) -> Result<(), GitError> {
+    let flag = if force { "-D" } else { "-d" };
+    git_with_env(root, &["branch", flag, name], &[("LC_ALL", "C")]).map(|_| ())
+}
+
+/// Whether a `delete_branch` error is git refusing an unmerged branch,
+/// which a forced delete would go through.
+pub fn is_not_merged(error: &str) -> bool {
+    error.contains("not fully merged")
 }
 
 /// Creates `name` at HEAD and checks it out.
@@ -1097,23 +1224,32 @@ mod tests {
     #[test]
     fn lists_branches_without_tracked_remotes_newest_first() {
         let output = [
-            " \0refs/heads/feature\0\x00300\0\0Add feature",
-            "*\0refs/heads/main\0refs/remotes/origin/main\x00100\0\0Initial commit",
-            " \0refs/remotes/origin/HEAD\0\x00100\0refs/remotes/origin/main\0Initial commit",
-            " \0refs/remotes/origin/main\0\x00100\0\0Initial commit",
-            " \0refs/remotes/origin/fix/crash\0\x00200\0\0Fix crash",
+            " \0refs/heads/feature\0\0\x00300\0\0Add feature",
+            " \0refs/heads/merged\0refs/remotes/origin/merged\0[gone]\x00250\0\0Merge",
+            "*\0refs/heads/main\0refs/remotes/origin/main\0[ahead 1]\x00100\0\0Initial commit",
+            " \0refs/remotes/origin/HEAD\0\0\x00100\0refs/remotes/origin/main\0Initial commit",
+            " \0refs/remotes/origin/main\0\0\x00100\0\0Initial commit",
+            " \0refs/remotes/origin/fix/crash\0\0\x00200\0\0Fix crash",
         ]
         .join("\n");
-        let names: Vec<(String, bool, bool)> = parse_branches(&output)
+        let names: Vec<(String, bool, bool, bool)> = parse_branches(&output)
             .into_iter()
-            .map(|branch| (branch.name, branch.is_remote, branch.is_head))
+            .map(|branch| {
+                (
+                    branch.name,
+                    branch.is_remote,
+                    branch.is_head,
+                    branch.local_only,
+                )
+            })
             .collect();
         assert_eq!(
             names,
             vec![
-                ("main".to_string(), false, true),
-                ("feature".to_string(), false, false),
-                ("origin/fix/crash".to_string(), true, false),
+                ("main".to_string(), false, true, false),
+                ("feature".to_string(), false, false, true),
+                ("merged".to_string(), false, false, true),
+                ("origin/fix/crash".to_string(), true, false, false),
             ]
         );
     }
@@ -1146,6 +1282,47 @@ mod tests {
         );
         let target = RemoteTarget::new(&status, "fork".to_string()).unwrap();
         assert_eq!(target.remote_branch, "work");
+        assert!(!target.set_upstream);
+    }
+
+    #[test]
+    fn lists_branches_that_still_need_a_push() {
+        let output = [
+            "refs/heads/main\0refs/remotes/origin/main\0",
+            "refs/heads/work\0refs/remotes/origin/work\0ahead 2, behind 1",
+            "refs/heads/old\0refs/remotes/origin/old\0behind 3",
+            "refs/heads/merged\0refs/remotes/origin/merged\0gone",
+            "refs/heads/new\0\0",
+        ]
+        .join("\n");
+        let overview = RepoOverview {
+            changes: 0,
+            unpushed: parse_unpushed(&output),
+        };
+        assert_eq!(
+            overview.unpushed,
+            vec![
+                UnpushedBranch {
+                    name: "work".to_string(),
+                    ahead: Some(2),
+                },
+                UnpushedBranch {
+                    name: "new".to_string(),
+                    ahead: None,
+                },
+            ]
+        );
+        assert_eq!((overview.commits_ahead(), overview.unpublished()), (2, 1));
+        assert!(!overview.is_clean());
+    }
+
+    #[test]
+    fn sets_the_upstream_of_a_branch_that_tracks_nothing() {
+        let mut status = parse_status(&porcelain(&[HEAD, "# branch.head work"]));
+        status.remotes = vec!["origin".to_string()];
+        let target = RemoteTarget::new(&status, "origin".to_string()).unwrap();
+        assert_eq!(target.remote_branch, "work");
+        assert!(target.set_upstream);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use gpui::{
     Hsla, KeyBinding, Subscription, Task, Window, actions, anchored, deferred, div, px,
 };
 
-use crate::git::{self, Discard, GitError, RepoStatus, StatusEntry, git};
+use crate::git::{self, Discard, GitError, RepoOverview, RepoStatus, StatusEntry, git};
 use crate::pi::{self, Installation};
 use crate::sessions;
 use crate::settings::ui_px;
@@ -149,6 +149,7 @@ enum GitAction {
     Discard,
     SwitchBranch,
     CreateBranch,
+    DeleteBranch,
     Commit,
     Generate,
     Fetch,
@@ -165,6 +166,7 @@ impl GitAction {
             GitAction::Discard => "Discarding…",
             GitAction::SwitchBranch => "Switching branch…",
             GitAction::CreateBranch => "Creating branch…",
+            GitAction::DeleteBranch => "Deleting branch…",
             GitAction::Commit => "Committing…",
             GitAction::Generate => "pi is writing the commit message…",
             GitAction::Fetch => "Fetching…",
@@ -181,6 +183,7 @@ impl GitAction {
             GitAction::Discard => "Discarding changes failed",
             GitAction::SwitchBranch => "Switching branch failed",
             GitAction::CreateBranch => "Creating the branch failed",
+            GitAction::DeleteBranch => "Deleting the branch failed",
             GitAction::Commit => "Commit failed",
             GitAction::Generate => "Generating the commit message failed",
             GitAction::Fetch => "Fetch failed",
@@ -206,6 +209,68 @@ fn stage_state(entry: &StatusEntry) -> ToggleState {
     }
 }
 
+/// Branches the overview tooltip names before it only counts the rest.
+const TOOLTIP_BRANCHES: usize = 5;
+
+/// A repository's row markers in the repository menu: a dot with the
+/// uncommitted files, ↑ with the commits to push, a branch icon with the
+/// branches never published.
+fn render_overview(overview: &RepoOverview) -> AnyElement {
+    let count = |count: String| {
+        Label::new(count)
+            .size(LabelSize::XSmall)
+            .color(Color::Muted)
+    };
+    let commits = overview.commits_ahead();
+    let unpublished = overview.unpublished();
+    h_flex()
+        .gap(px(8.))
+        .when(overview.changes > 0, |this| {
+            this.child(
+                h_flex()
+                    .gap(px(3.))
+                    .child(Indicator::dot(Color::Warning))
+                    .child(count(overview.changes.to_string())),
+            )
+        })
+        .when(commits > 0, |this| this.child(count(format!("↑{commits}"))))
+        .when(unpublished > 0, |this| {
+            this.child(
+                h_flex()
+                    .gap(px(2.))
+                    .child(
+                        Icon::new(IconName::Fork)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(count(unpublished.to_string())),
+            )
+        })
+        .into_any_element()
+}
+
+/// One line per fact: the uncommitted files, then each branch to push.
+fn overview_tooltip(overview: &RepoOverview) -> String {
+    let mut lines = Vec::new();
+    match overview.changes {
+        0 => {}
+        1 => lines.push("1 uncommitted change".to_string()),
+        count => lines.push(format!("{count} uncommitted changes")),
+    }
+    lines.extend(overview.unpushed.iter().take(TOOLTIP_BRANCHES).map(
+        |branch| match branch.ahead {
+            None => format!("{}: not published", branch.name),
+            Some(1) => format!("{}: 1 commit to push", branch.name),
+            Some(count) => format!("{}: {count} commits to push", branch.name),
+        },
+    ));
+    let hidden = overview.unpushed.len().saturating_sub(TOOLTIP_BRANCHES);
+    if hidden > 0 {
+        lines.push(format!("and {hidden} more branches to push"));
+    }
+    lines.join("\n")
+}
+
 pub struct DiffPanel {
     workspace: Option<PathBuf>,
     /// The project's repository first, then the nested ones.
@@ -217,6 +282,9 @@ pub struct DiffPanel {
     /// The repositories shown before, by root, as last read.
     stashed: HashMap<PathBuf, (Changes, RepoStatus)>,
     repository_menu: bool,
+    /// What each repository has not pushed, by root, as read when the
+    /// repository menu last opened.
+    overviews: HashMap<PathBuf, RepoOverview>,
     state: State,
     /// A refresh is in flight while the previous result stays on screen.
     refreshing: bool,
@@ -241,6 +309,7 @@ pub struct DiffPanel {
     _task: Task<()>,
     _action_task: Task<()>,
     _probe_task: Task<()>,
+    _overview_task: Task<()>,
     _subscriptions: Vec<Subscription>,
     /// Takes the keyboard back when the branch picker closes.
     focus_handle: FocusHandle,
@@ -261,6 +330,7 @@ impl DiffPanel {
             chosen_repositories: HashMap::new(),
             stashed: HashMap::new(),
             repository_menu: false,
+            overviews: HashMap::new(),
             state: State::NoProject,
             refreshing: false,
             refresh_pending: false,
@@ -277,6 +347,7 @@ impl DiffPanel {
             _task: Task::ready(()),
             _action_task: Task::ready(()),
             _probe_task: Task::ready(()),
+            _overview_task: Task::ready(()),
             _subscriptions: subscriptions,
             focus_handle: cx.focus_handle(),
             animation: AnimationTicker::default(),
@@ -632,6 +703,19 @@ impl DiffPanel {
     }
 
     fn run_network(&mut self, action: GitAction, cx: &mut Context<Self>) {
+        // A new branch tracks nothing, so a bare `git push` fails; push it to
+        // the only remote and record that as its upstream.
+        if action == GitAction::Push {
+            let remote = self.status().and_then(|status| {
+                (status.upstream.is_none() && status.branch.is_some())
+                    .then(|| status.remotes.first().cloned())
+                    .flatten()
+            });
+            if let Some(remote) = remote {
+                self.run_network_with(action, remote, cx);
+                return;
+            }
+        }
         let operation: fn(&Path) -> Result<String, String> = match action {
             GitAction::Fetch => git::fetch,
             GitAction::Pull => git::pull,
@@ -914,7 +998,31 @@ impl DiffPanel {
         self.branch_picker = None;
         self.remote_menu = None;
         self.repository_menu = true;
+        self.load_overviews(cx);
         cx.notify();
+    }
+
+    /// Reads every repository's overview in the background; the menu shows
+    /// the last one read until the new one lands.
+    fn load_overviews(&mut self, cx: &mut Context<Self>) {
+        let roots = self.repositories.clone();
+        let load = cx.background_spawn(async move {
+            let overviews = git::for_each_repository(&roots, git::overview);
+            roots.into_iter().zip(overviews).collect::<Vec<_>>()
+        });
+        self._overview_task = cx.spawn(async move |this, cx| {
+            let overviews = load.await;
+            this.update(cx, |this, cx| {
+                for (root, overview) in overviews {
+                    match overview {
+                        Ok(overview) => this.overviews.insert(root, overview),
+                        Err(_) => this.overviews.remove(&root),
+                    };
+                }
+                cx.notify();
+            })
+            .ok();
+        });
     }
 
     /// A repository as the project sees it: its folder relative to the
@@ -956,6 +1064,15 @@ impl DiffPanel {
                     Label::new(self.repository_name(&root))
                         .size(LabelSize::Small)
                         .truncate(),
+                )
+                .when_some(
+                    self.overviews
+                        .get(&root)
+                        .filter(|overview| !overview.is_clean()),
+                    |this, overview| {
+                        this.end_slot(render_overview(overview))
+                            .tooltip(Tooltip::text(overview_tooltip(overview)))
+                    },
                 )
                 .on_click(
                     cx.listener(move |this, _, _, cx| this.select_repository(root.clone(), cx)),

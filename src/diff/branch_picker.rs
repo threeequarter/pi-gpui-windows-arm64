@@ -178,6 +178,104 @@ impl DiffPanel {
         }
     }
 
+    /// Asks before deleting the local branch `name`; the picker closes, since
+    /// the prompt takes the keyboard.
+    fn confirm_delete_branch(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.branch_picker = None;
+        window.focus(&self.focus_handle);
+        cx.notify();
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            &format!("Delete branch \"{name}\"?"),
+            Some("Only the local branch is deleted; a branch of the same name on a remote stays."),
+            &["Delete", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await.ok() != Some(0) {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.delete_branch(name, false, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// `git branch -d`, or `-D` when `force`. A refused unmerged branch asks
+    /// once more before the forced delete.
+    fn delete_branch(
+        &mut self,
+        name: String,
+        force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy.is_some() {
+            self.show_error(
+                GitAction::DeleteBranch,
+                "another git action is running".into(),
+            );
+            cx.notify();
+            return;
+        }
+        let (Some(workspace), State::Loaded(changes, _)) = (self.workspace.clone(), &self.state)
+        else {
+            return;
+        };
+        let root = changes.root.clone();
+        self.busy = Some(GitAction::DeleteBranch);
+        self.action_error = None;
+        let work = cx.background_spawn({
+            let name = name.clone();
+            async move { git::delete_branch(&root, &name, force).map_err(GitError::message) }
+        });
+        self._action_task = cx.spawn_in(window, async move |this, cx| {
+            let result = work.await;
+            this.update_in(cx, |this, window, cx| {
+                if this.workspace.as_ref() != Some(&workspace) {
+                    return;
+                }
+                this.busy = None;
+                match result {
+                    Ok(()) => {}
+                    Err(error) if !force && git::is_not_merged(&error) => {
+                        this.confirm_force_delete(name, window, cx)
+                    }
+                    Err(error) => this.show_error(GitAction::DeleteBranch, error),
+                }
+                this.refresh(cx);
+                cx.emit(DiffPanelEvent::RepositoryChanged);
+                cx.notify();
+            })
+            .ok();
+        });
+        cx.notify();
+    }
+
+    fn confirm_force_delete(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let answer = window.prompt(
+            gpui::PromptLevel::Critical,
+            &format!("\"{name}\" is not fully merged"),
+            Some(
+                "Some of its commits are neither in the current branch nor in its upstream. Deleting it anyway can lose them; the reflog keeps them for a while.",
+            ),
+            &["Delete Anyway", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await.ok() != Some(0) {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.delete_branch(name, true, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// The picker, anchored under the branch name.
     pub(super) fn render_branch_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let picker = self.branch_picker.as_ref()?;
@@ -308,19 +406,62 @@ impl DiffPanel {
             ),
         };
         let is_remote = matches!(&entry, Entry::Branch(branch) if branch.is_remote);
+        let local_only = matches!(&entry, Entry::Branch(branch) if branch.local_only);
+        // Any local branch but the one checked out can go.
+        let deletable = match &entry {
+            Entry::Branch(branch) if !branch.is_remote && !branch.is_head => {
+                Some(branch.name.clone())
+            }
+            _ => None,
+        };
+        let colors = cx.theme().colors.clone();
         ListItem::new(("branch", index))
             .toggle_state(highlighted)
             .start_slot(Icon::new(icon).size(IconSize::XSmall).color(icon_color))
             .child(
-                Label::new(title)
-                    .size(LabelSize::Small)
-                    .color(if is_remote {
-                        Color::Muted
-                    } else {
-                        Color::Default
-                    })
-                    .truncate(),
+                div().min_w(px(0.)).child(
+                    Label::new(title)
+                        .size(LabelSize::Small)
+                        .color(if is_remote {
+                            Color::Muted
+                        } else {
+                            Color::Default
+                        })
+                        .truncate(),
+                ),
             )
+            .when(local_only, |this| {
+                this.child(
+                    div()
+                        .id(("branch-local", index))
+                        .flex_none()
+                        .px(px(4.))
+                        .rounded(px(3.))
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .tooltip(Tooltip::text(
+                            "On no remote: never pushed, or deleted there",
+                        ))
+                        .child(
+                            Label::new("local")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
+            .when_some(deletable, |this, name| {
+                this.end_hover_slot(
+                    IconButton::new(("branch-delete", index), IconName::Trash)
+                        .size(ButtonSize::Compact)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Error)
+                        .disabled(self.busy.is_some())
+                        .tooltip(Tooltip::text("Delete branch"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.confirm_delete_branch(name.clone(), window, cx)
+                        })),
+                )
+            })
             .when_some(age, |this, age| {
                 this.end_slot(
                     Label::new(age)
