@@ -8,6 +8,9 @@
 //!   digits 1 to 9 (or Y and N) pick; Esc cancels.
 //! - `input` and `editor` are answered in the composer: Enter sends the text
 //!   as the answer, Esc cancels.
+//! - ask_user_question's multi-select `input` (recognized by its placeholder)
+//!   shows checkbox rows: click or Space toggles, Enter or the Answer row
+//!   sends the picked numbers; the composer still answers it with text.
 //!
 //! Extensions often ask a chain of dialogs for one question (ask_user_question
 //! asks "Other…" as a select followed by an input). A dialog that follows an
@@ -19,11 +22,35 @@ pub(super) const DIALOG_CONTEXT: &str = "ChatDialog";
 const ANSWER_PLACEHOLDER: &str = "Type your answer. Enter sends it, Esc cancels.";
 /// ask_user_question marks its free-text choice with this prefix.
 const FREE_TEXT_PREFIX: &str = "✎";
+/// ask_user_question's multi-select input placeholder, not localized by the
+/// extension, so it identifies the dialog in every locale.
+const MULTI_SELECT_PLACEHOLDER: &str = "1,3; custom answer";
+
+/// Reads the numbered option list out of the extension's multi-select prompt
+/// (`question \n\n 1. label — description … \n\n instructions`). Returns the
+/// question and the option lines without their numbers.
+fn parse_multi_select(title: &str) -> Option<(String, Vec<String>)> {
+    let mut options: Vec<String> = Vec::new();
+    let mut list_start = None;
+    let mut offset = 0;
+    for line in title.split_inclusive('\n') {
+        let prefix = format!("{}. ", options.len() + 1);
+        let text = line.trim_end_matches(['\n', '\r']);
+        if let Some(rest) = text.strip_prefix(&prefix) {
+            list_start.get_or_insert(offset);
+            options.push(rest.to_string());
+        }
+        offset += line.len();
+    }
+    let start = list_start?;
+    Some((title[..start].trim().to_string(), options))
+}
 
 #[derive(Clone)]
 pub(super) enum DialogKind {
     Select(Vec<String>),
     Confirm(String),
+    MultiSelect(Vec<String>),
     Input,
     Editor,
 }
@@ -48,6 +75,7 @@ pub(super) struct PendingDialog {
     id: String,
     row: usize,
     highlight: usize,
+    checked: Vec<bool>,
     /// Composer text before an `editor` prefill replaced it.
     saved_draft: Option<SharedString>,
     _timeout: Task<()>,
@@ -56,14 +84,24 @@ pub(super) struct PendingDialog {
 impl DialogKind {
     fn choices(&self) -> Vec<String> {
         match self {
-            DialogKind::Select(options) => options.clone(),
+            DialogKind::Select(options) | DialogKind::MultiSelect(options) => options.clone(),
             DialogKind::Confirm(_) => vec!["Yes".to_string(), "No".to_string()],
             DialogKind::Input | DialogKind::Editor => Vec::new(),
         }
     }
 
     fn uses_composer(&self) -> bool {
-        matches!(self, DialogKind::Input | DialogKind::Editor)
+        matches!(
+            self,
+            DialogKind::Input | DialogKind::Editor | DialogKind::MultiSelect(_)
+        )
+    }
+
+    fn has_card_choices(&self) -> bool {
+        matches!(
+            self,
+            DialogKind::Select(_) | DialogKind::Confirm(_) | DialogKind::MultiSelect(_)
+        )
     }
 }
 
@@ -79,7 +117,7 @@ impl ChatView {
         let Some(id) = record["id"].as_str().map(str::to_string) else {
             return matches!(method, "select" | "confirm" | "input" | "editor");
         };
-        let title = record["title"].as_str().unwrap_or_default().to_string();
+        let mut title = record["title"].as_str().unwrap_or_default().to_string();
         let kind = match method {
             "select" => DialogKind::Select(
                 record["options"]
@@ -95,7 +133,18 @@ impl ChatView {
             "confirm" => {
                 DialogKind::Confirm(record["message"].as_str().unwrap_or_default().to_string())
             }
-            "input" => DialogKind::Input,
+            "input" => {
+                let parsed = (record["placeholder"].as_str() == Some(MULTI_SELECT_PLACEHOLDER))
+                    .then(|| parse_multi_select(&title))
+                    .flatten();
+                match parsed {
+                    Some((question, options)) => {
+                        title = question;
+                        DialogKind::MultiSelect(options)
+                    }
+                    None => DialogKind::Input,
+                }
+            }
             "editor" => DialogKind::Editor,
             _ => return false,
         };
@@ -147,10 +196,15 @@ impl ChatView {
             }
             _ => Task::ready(()),
         };
+        let checked = match &kind {
+            DialogKind::MultiSelect(options) => vec![false; options.len()],
+            _ => Vec::new(),
+        };
         self.dialog = Some(PendingDialog {
             id,
             row,
             highlight: 0,
+            checked,
             saved_draft,
             _timeout: timeout,
         });
@@ -243,7 +297,7 @@ impl ChatView {
         let (kind, message) = match &row.kind {
             DialogKind::Select(_) => ("select", None),
             DialogKind::Confirm(message) => ("confirm", Some(message.clone())),
-            DialogKind::Input => ("input", None),
+            DialogKind::MultiSelect(_) | DialogKind::Input => ("input", None),
             DialogKind::Editor => ("editor", None),
         };
         json!({
@@ -312,7 +366,7 @@ impl ChatView {
                     cx,
                 );
             }
-            DialogKind::Input | DialogKind::Editor => {
+            DialogKind::Input | DialogKind::Editor | DialogKind::MultiSelect(_) => {
                 let text = answer.ok_or("give answer: the text")?.to_string();
                 if row.kind.uses_composer() {
                     self.composer.update(cx, |composer, cx| composer.clear(cx));
@@ -356,11 +410,79 @@ impl ChatView {
         }
     }
 
+    fn toggle_choice(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(dialog) = &mut self.dialog else {
+            return;
+        };
+        let Some(checked) = dialog.checked.get_mut(index) else {
+            return;
+        };
+        *checked = !*checked;
+        dialog.highlight = index;
+        let row = dialog.row;
+        self.list_state.splice(row..row + 1, 1);
+        cx.notify();
+    }
+
+    /// Sends the checked numbers, with any composer text as the custom part.
+    fn submit_choices(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = &self.dialog else {
+            return;
+        };
+        let Some(Row::Dialog(row)) = self.rows.get(dialog.row) else {
+            return;
+        };
+        let DialogKind::MultiSelect(options) = &row.kind else {
+            return;
+        };
+        let picked: Vec<usize> = dialog
+            .checked
+            .iter()
+            .enumerate()
+            .filter(|(_, checked)| **checked)
+            .map(|(index, _)| index)
+            .collect();
+        let numbers: Vec<String> = picked.iter().map(|index| (index + 1).to_string()).collect();
+        let labels: Vec<String> = picked
+            .iter()
+            .filter_map(|index| options.get(*index))
+            .map(|option| {
+                option
+                    .split_once(" — ")
+                    .map_or(option.clone(), |(label, _)| label.to_string())
+            })
+            .collect();
+        let custom = self.composer.read(cx).text().trim().to_string();
+        let mut value = numbers.join(",");
+        let mut answer = labels.join(", ");
+        if !custom.is_empty() {
+            value = if value.is_empty() {
+                custom.clone()
+            } else {
+                format!("{value}; {custom}")
+            };
+            answer = if answer.is_empty() {
+                custom
+            } else {
+                format!("{answer}; {custom}")
+            };
+            self.composer.update(cx, |composer, cx| composer.clear(cx));
+        }
+        self.answer_dialog(json!({ "value": value }), DialogState::Answered(answer), cx);
+    }
+
+    fn pending_is_multi(&self) -> bool {
+        let Some(dialog) = &self.dialog else {
+            return false;
+        };
+        matches!(self.rows.get(dialog.row), Some(Row::Dialog(row)) if matches!(row.kind, DialogKind::MultiSelect(_)))
+    }
+
     /// The pending dialog's choices when it shows them in the card.
     fn pending_choices(&self) -> Option<Vec<String>> {
         let dialog = self.dialog.as_ref()?;
         match self.rows.get(dialog.row) {
-            Some(Row::Dialog(row)) if !row.kind.uses_composer() => Some(row.kind.choices()),
+            Some(Row::Dialog(row)) if row.kind.has_card_choices() => Some(row.kind.choices()),
             _ => None,
         }
     }
@@ -380,7 +502,7 @@ impl ChatView {
             return false;
         };
         match &row.kind {
-            DialogKind::Input | DialogKind::Editor => {
+            DialogKind::Input | DialogKind::Editor | DialogKind::MultiSelect(_) => {
                 let text = text.trim().to_string();
                 self.composer.update(cx, |composer, cx| composer.clear(cx));
                 self.answer_dialog(
@@ -447,7 +569,13 @@ impl ChatView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(highlight) = self.dialog.as_ref().map(|dialog| dialog.highlight) {
+        let Some(dialog) = self.dialog.as_ref() else {
+            return;
+        };
+        let highlight = dialog.highlight;
+        if self.pending_is_multi() {
+            self.submit_choices(cx);
+        } else {
             self.pick_choice(highlight, cx);
         }
     }
@@ -471,6 +599,21 @@ impl ChatView {
             return;
         };
         let key = event.keystroke.key.as_str();
+        if self.pending_is_multi() {
+            let index = match key {
+                "space" => Some(self.dialog.as_ref().map_or(0, |dialog| dialog.highlight)),
+                _ => key
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|number| (1..=choices.len().min(9)).contains(number))
+                    .map(|number| number - 1),
+            };
+            if let Some(index) = index {
+                cx.stop_propagation();
+                self.toggle_choice(index, cx);
+            }
+            return;
+        }
         let index = match key {
             "y" if choices.len() == 2 && choices[0] == "Yes" => Some(0),
             "n" if choices.len() == 2 && choices[1] == "No" => Some(1),
@@ -540,9 +683,14 @@ impl ChatView {
         };
 
         let body: AnyElement = match &row.state {
-            DialogState::Pending if pending && !row.kind.uses_composer() => {
+            DialogState::Pending if pending && row.kind.has_card_choices() => {
                 let choices = row.kind.choices();
                 let numbered = matches!(row.kind, DialogKind::Confirm(_));
+                let multi = matches!(row.kind, DialogKind::MultiSelect(_));
+                let checked = self
+                    .dialog
+                    .as_ref()
+                    .map_or_else(Vec::new, |dialog| dialog.checked.clone());
                 v_flex()
                     .gap(px(2.))
                     .children(choices.into_iter().enumerate().map(|(position, choice)| {
@@ -566,6 +714,20 @@ impl ChatView {
                             .when(numbered, |this| {
                                 this.child(KeyHint::new(if position == 0 { "Y" } else { "N" }))
                             })
+                            .when(multi, |this| {
+                                let state = if checked.get(position) == Some(&true) {
+                                    ToggleState::Selected
+                                } else {
+                                    ToggleState::Unselected
+                                };
+                                this.child(
+                                    Checkbox::new(("dialog-check", position), state).on_click(
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.toggle_choice(position, cx)
+                                        }),
+                                    ),
+                                )
+                            })
                             .child(
                                 v_flex()
                                     .flex_1()
@@ -579,10 +741,34 @@ impl ChatView {
                                         )
                                     }),
                             )
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.pick_choice(position, cx)),
-                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if multi {
+                                    this.toggle_choice(position, cx);
+                                } else {
+                                    this.pick_choice(position, cx);
+                                }
+                            }))
                     }))
+                    .when(multi, |this| {
+                        this.child(
+                            h_flex()
+                                .id(("dialog-submit", index))
+                                .items_center()
+                                .gap(px(8.))
+                                .px(px(8.))
+                                .py(px(5.))
+                                .rounded(px(5.))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(colors.element_hover))
+                                .child(
+                                    Label::new("Answer")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Accent),
+                                )
+                                .child(KeyHint::new("Enter"))
+                                .on_click(cx.listener(|this, _, _, cx| this.submit_choices(cx))),
+                        )
+                    })
                     .into_any_element()
             }
             DialogState::Pending => h_flex()
@@ -643,17 +829,27 @@ impl ChatView {
             };
             h_flex()
                 .gap(px(12.))
-                .when(!row.kind.uses_composer(), |this| {
+                .when(row.kind.has_card_choices(), |this| {
                     this.child(hint("↑↓", "choose"))
+                        .when(matches!(row.kind, DialogKind::MultiSelect(_)), |this| {
+                            this.child(hint("Space", "toggle"))
+                        })
                         .child(hint("Enter", "answer"))
                 })
-                .when(row.kind.uses_composer(), |this| {
+                .when(!row.kind.has_card_choices(), |this| {
                     this.child(hint("Enter", "send"))
                 })
                 .child(hint("Esc", "cancel"))
                 .when(matches!(row.kind, DialogKind::Select(_)), |this| {
                     this.child(
                         Label::new("or type the number or your own answer below")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Placeholder),
+                    )
+                })
+                .when(matches!(row.kind, DialogKind::MultiSelect(_)), |this| {
+                    this.child(
+                        Label::new("or type your own answer below")
                             .size(LabelSize::XSmall)
                             .color(Color::Placeholder),
                     )
