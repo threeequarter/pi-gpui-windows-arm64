@@ -458,18 +458,6 @@ impl HubView {
             &files_panel,
             window,
             |this: &mut Self, _, event: &FilesEvent, window, cx| match event {
-                FilesEvent::InsertPath(path) => {
-                    if let Some(chat) = &this.active_chat {
-                        let edit = PluginEvent::ComposerInsert {
-                            text: format!("{path} "),
-                            replace_last: false,
-                            space_before: true,
-                        };
-                        chat.update(cx, |chat, cx| chat.apply_plugin_edit(&edit, cx));
-                        this.focus_active_chat = true;
-                        cx.notify();
-                    }
-                }
                 FilesEvent::OpenPath(path, title) => {
                     this.open_file_viewer(path.clone(), title.clone(), ViewMode::File, window, cx);
                 }

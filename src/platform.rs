@@ -373,15 +373,19 @@ pub fn move_to_trash(path: &std::path::Path) -> Result<(), String> {
     Err("no trash tool found (install gio, kioclient or trash-cli)".to_string())
 }
 
-/// Moves a file to the Recycle Bin through .NET's `FileSystem.DeleteFile`,
+/// Moves a file or folder to the Recycle Bin through .NET's `FileSystem`,
 /// which every Windows PowerShell has. The path goes in an environment
 /// variable, so it is never parsed as PowerShell code.
 #[cfg(windows)]
 pub fn move_to_trash(path: &std::path::Path) -> Result<(), String> {
     const SCRIPT: &str = "$ErrorActionPreference = 'Stop'; \
         Add-Type -AssemblyName Microsoft.VisualBasic; \
+        $path = $env:PI_GPUI_TRASH_PATH; \
+        if (Test-Path -LiteralPath $path -PathType Container) { \
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory(\
+        $path, 'OnlyErrorDialogs', 'SendToRecycleBin') } else { \
         [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(\
-        $env:PI_GPUI_TRASH_PATH, 'OnlyErrorDialogs', 'SendToRecycleBin')";
+        $path, 'OnlyErrorDialogs', 'SendToRecycleBin') }";
 
     let output = std::process::Command::new("powershell")
         .without_console_window()
@@ -491,6 +495,72 @@ pub fn open_in_editor(path: &std::path::Path) {
     }
 }
 
+/// Opens a file with the app the system associates with it, like a
+/// double-click in the file manager.
+#[cfg(windows)]
+pub fn open_with_default_app(path: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            hwnd: isize,
+            verb: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show: i32,
+        ) -> isize;
+    }
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn CoInitializeEx(reserved: *mut std::ffi::c_void, concurrency: u32) -> i32;
+    }
+    const SW_SHOWNORMAL: i32 = 1;
+    const SUCCESS_ABOVE: isize = 32;
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+
+    let verb: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+    let file: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let display = path.display().to_string();
+    // ShellExecuteW can pump messages (DDE, COM activation, open-with UI);
+    // inside a gpui listener that re-enters the app and aborts, like the
+    // native move loop. Run it on its own STA thread instead.
+    std::thread::spawn(move || {
+        // SAFETY: the wide strings are null-terminated and live for the
+        // call; no window handle is needed. ShellExecuteW reports success
+        // above 32.
+        unsafe {
+            CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
+            let result = ShellExecuteW(
+                0,
+                verb.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            );
+            if result <= SUCCESS_ABOVE {
+                eprintln!("pi-gpui: could not open {display} with the default app (code {result})");
+            }
+        }
+    });
+}
+
+#[cfg(not(windows))]
+pub fn open_with_default_app(path: &std::path::Path) {
+    use std::process::Command;
+
+    let result = if cfg!(target_os = "macos") {
+        Command::new("open").arg(path).spawn().map(drop)
+    } else {
+        Command::new("xdg-open").arg(path).spawn().map(drop)
+    };
+    if let Err(error) = result {
+        eprintln!("pi-gpui: could not open {}: {error}", path.display());
+    }
+}
+
 /// Opens the system's terminal in `directory`: Windows Terminal (its default
 /// profile) or a console with the command shell on Windows, Terminal on
 /// macOS, and on Linux the first terminal found, starting with the desktop's
@@ -591,16 +661,33 @@ fn file_uri(path: &std::path::Path) -> String {
     uri
 }
 
+/// Files on the clipboard, and whether they were cut rather than copied.
+pub struct FileClipboard {
+    pub paths: Vec<std::path::PathBuf>,
+    pub cut: bool,
+}
+
+pub fn clipboard_file_paths() -> Vec<std::path::PathBuf> {
+    read_file_clipboard()
+        .map(|clipboard| clipboard.paths)
+        .unwrap_or_default()
+}
+
+/// A private pasteboard type marking our own Cut, so a later Paste moves.
+/// Finder ignores it; Finder's own Cut is not readable, so it pastes as copy.
+#[cfg(target_os = "macos")]
+const CUT_MARKER: &str = "application/x-pi-gpui-cut";
+
 /// Files copied in Finder (file URLs on the general pasteboard).
 #[cfg(target_os = "macos")]
-pub fn clipboard_file_paths() -> Vec<std::path::PathBuf> {
+pub fn read_file_clipboard() -> Option<FileClipboard> {
     use std::ffi::{CStr, CString};
 
     use objc::runtime::{Class, Object, YES};
     use objc::{class, msg_send, sel, sel_impl};
 
     let Ok(key) = CString::new("NSPasteboardURLReadingFileURLsOnlyKey") else {
-        return Vec::new();
+        return None;
     };
     let mut paths = Vec::new();
     // SAFETY: standard AppKit/Foundation calls on the main thread; every
@@ -608,7 +695,7 @@ pub fn clipboard_file_paths() -> Vec<std::path::PathBuf> {
     unsafe {
         let pasteboard: *mut Object = msg_send![class!(NSPasteboard), generalPasteboard];
         if pasteboard.is_null() {
-            return paths;
+            return None;
         }
         let url_class: *const Class = class!(NSURL);
         let classes: *mut Object = msg_send![class!(NSArray), arrayWithObject: url_class];
@@ -619,7 +706,7 @@ pub fn clipboard_file_paths() -> Vec<std::path::PathBuf> {
         let urls: *mut Object =
             msg_send![pasteboard, readObjectsForClasses: classes options: options];
         if urls.is_null() {
-            return paths;
+            return None;
         }
         let count: usize = msg_send![urls, count];
         for index in 0..count {
@@ -635,13 +722,336 @@ pub fn clipboard_file_paths() -> Vec<std::path::PathBuf> {
                 ));
             }
         }
+        let Ok(marker) = CString::new(CUT_MARKER) else {
+            return Some(FileClipboard { paths, cut: false });
+        };
+        let marker: *mut Object =
+            msg_send![class!(NSString), stringWithUTF8String: marker.as_ptr()];
+        let cut: *mut Object = msg_send![pasteboard, stringForType: marker];
+        Some(FileClipboard {
+            paths,
+            cut: !cut.is_null(),
+        })
     }
-    paths
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn clipboard_file_paths() -> Vec<std::path::PathBuf> {
-    Vec::new()
+/// File URLs for Finder, plus the private cut marker for our own Paste.
+#[cfg(target_os = "macos")]
+pub fn write_file_clipboard(paths: &[std::path::PathBuf], cut: bool) {
+    use std::ffi::CString;
+
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+
+    // SAFETY: standard AppKit calls on the main thread; every returned
+    // object is checked for null before use.
+    unsafe {
+        let pasteboard: *mut Object = msg_send![class!(NSPasteboard), generalPasteboard];
+        if pasteboard.is_null() {
+            return;
+        }
+        let _: () = msg_send![pasteboard, clearContents];
+        let urls: *mut Object = msg_send![class!(NSMutableArray), array];
+        for path in paths {
+            let Ok(text) = CString::new(path.to_string_lossy().as_bytes()) else {
+                continue;
+            };
+            let string: *mut Object =
+                msg_send![class!(NSString), stringWithUTF8String: text.as_ptr()];
+            if string.is_null() {
+                continue;
+            }
+            let url: *mut Object = msg_send![class!(NSURL), fileURLWithPath: string];
+            if url.is_null() {
+                continue;
+            }
+            let _: () = msg_send![urls, addObject: url];
+        }
+        let _: objc::runtime::BOOL = msg_send![pasteboard, writeObjects: urls];
+        if !cut {
+            return;
+        }
+        let Ok(key) = CString::new(CUT_MARKER) else {
+            return;
+        };
+        let marker: *mut Object = msg_send![class!(NSString), stringWithUTF8String: key.as_ptr()];
+        let value: *mut Object = msg_send![class!(NSString), stringWithUTF8String: c"1".as_ptr()];
+        let _: () = msg_send![pasteboard, setString: value forType: marker];
+    }
+}
+
+/// Files copied or cut in Explorer (CF_HDROP); the Preferred DropEffect
+/// format tells a cut from a copy, the same way Explorer does.
+#[cfg(windows)]
+pub fn read_file_clipboard() -> Option<FileClipboard> {
+    use std::os::windows::ffi::OsStringExt as _;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn OpenClipboard(hwnd: isize) -> i32;
+        fn CloseClipboard() -> i32;
+        fn GetClipboardData(format: u32) -> isize;
+        fn RegisterClipboardFormatW(name: *const u16) -> u32;
+    }
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn DragQueryFileW(drop: isize, index: u32, buffer: *mut u16, len: u32) -> u32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalLock(handle: isize) -> *mut std::ffi::c_void;
+        fn GlobalUnlock(handle: isize) -> i32;
+    }
+    const CF_HDROP: u32 = 15;
+    const DROPEFFECT_MOVE: u32 = 2;
+
+    // SAFETY: the clipboard stays open for the reads and is closed on every
+    // path; the handles GetClipboardData returns remain owned by the
+    // clipboard and are only read while it is open.
+    unsafe {
+        if OpenClipboard(0) == 0 {
+            return None;
+        }
+        let drop = GetClipboardData(CF_HDROP);
+        if drop == 0 {
+            CloseClipboard();
+            return None;
+        }
+        let count = DragQueryFileW(drop, u32::MAX, std::ptr::null_mut(), 0);
+        let mut paths = Vec::new();
+        for index in 0..count {
+            let len = DragQueryFileW(drop, index, std::ptr::null_mut(), 0);
+            let mut buffer = vec![0u16; len as usize + 1];
+            DragQueryFileW(drop, index, buffer.as_mut_ptr(), len + 1);
+            paths.push(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+                &buffer[..len as usize],
+            )));
+        }
+        let name: Vec<u16> = "Preferred DropEffect"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let format = RegisterClipboardFormatW(name.as_ptr());
+        let mut cut = false;
+        let effect = GetClipboardData(format);
+        if effect != 0 {
+            let value = GlobalLock(effect) as *mut u32;
+            if !value.is_null() {
+                cut = *value & DROPEFFECT_MOVE != 0;
+                GlobalUnlock(effect);
+            }
+        }
+        CloseClipboard();
+        Some(FileClipboard { paths, cut })
+    }
+}
+
+/// CF_HDROP for Explorer and the drop effect for cut, so a paste in Explorer
+/// or in the Files panel moves instead of copying.
+#[cfg(windows)]
+pub fn write_file_clipboard(paths: &[std::path::PathBuf], cut: bool) {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn OpenClipboard(hwnd: isize) -> i32;
+        fn EmptyClipboard() -> i32;
+        fn CloseClipboard() -> i32;
+        fn SetClipboardData(format: u32, handle: isize) -> isize;
+        fn RegisterClipboardFormatW(name: *const u16) -> u32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalAlloc(flags: u32, size: usize) -> isize;
+        fn GlobalLock(handle: isize) -> *mut std::ffi::c_void;
+        fn GlobalUnlock(handle: isize) -> i32;
+        fn GlobalFree(handle: isize) -> isize;
+    }
+    const CF_HDROP: u32 = 15;
+    const GMEM_MOVEABLE: u32 = 0x0002;
+    const GMEM_ZEROINIT: u32 = 0x0040;
+    const DROPEFFECT_COPY: u32 = 1;
+    const DROPEFFECT_MOVE: u32 = 2;
+    #[repr(C)]
+    struct DropFiles {
+        p_files: u32,
+        point: [i32; 2],
+        f_nc: i32,
+        f_wide: i32,
+    }
+
+    let mut list: Vec<u16> = Vec::new();
+    for path in paths {
+        list.extend(path.as_os_str().encode_wide().chain(Some(0)));
+    }
+    list.push(0);
+    let header_size = std::mem::size_of::<DropFiles>();
+    // SAFETY: the globals are filled through GlobalLock and handed to the
+    // clipboard, which owns them once SetClipboardData succeeds; a failed
+    // set frees them. The clipboard is closed on every path.
+    unsafe {
+        let handle = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, header_size + list.len() * 2);
+        if handle == 0 {
+            return;
+        }
+        let memory = GlobalLock(handle) as *mut u8;
+        if memory.is_null() {
+            GlobalFree(handle);
+            return;
+        }
+        let header = DropFiles {
+            p_files: header_size as u32,
+            point: [0, 0],
+            f_nc: 0,
+            f_wide: 1,
+        };
+        std::ptr::copy_nonoverlapping(
+            &header as *const DropFiles as *const u8,
+            memory,
+            header_size,
+        );
+        std::ptr::copy_nonoverlapping(
+            list.as_ptr() as *const u8,
+            memory.add(header_size),
+            list.len() * 2,
+        );
+        GlobalUnlock(handle);
+        if OpenClipboard(0) == 0 {
+            GlobalFree(handle);
+            return;
+        }
+        EmptyClipboard();
+        if SetClipboardData(CF_HDROP, handle) == 0 {
+            GlobalFree(handle);
+        }
+        let name: Vec<u16> = "Preferred DropEffect"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let format = RegisterClipboardFormatW(name.as_ptr());
+        let effect = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, 4);
+        if effect != 0 {
+            let value = GlobalLock(effect) as *mut u32;
+            if !value.is_null() {
+                *value = if cut {
+                    DROPEFFECT_MOVE
+                } else {
+                    DROPEFFECT_COPY
+                };
+                GlobalUnlock(effect);
+            }
+            if SetClipboardData(format, effect) == 0 {
+                GlobalFree(effect);
+            }
+        }
+        CloseClipboard();
+    }
+}
+
+/// The GNOME copied-files format carries the operation (copy/cut) above the
+/// URIs; plain text/uri-list is the fallback other desktops write.
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn read_file_clipboard() -> Option<FileClipboard> {
+    const GNOME: &str = "x-special/gnome-copied-files";
+    const URI_LIST: &str = "text/uri-list";
+    let attempts = [
+        ("wl-paste", vec!["--type", GNOME], true),
+        (
+            "xclip",
+            vec!["-selection", "clipboard", "-t", GNOME, "-o"],
+            true,
+        ),
+        ("wl-paste", vec!["--type", URI_LIST], false),
+        (
+            "xclip",
+            vec!["-selection", "clipboard", "-t", URI_LIST, "-o"],
+            false,
+        ),
+    ];
+    for (program, arguments, gnome) in attempts {
+        let Ok(output) = std::process::Command::new(program)
+            .args(&arguments)
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut lines = text
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'));
+        let cut = gnome && lines.next() == Some("cut");
+        let paths: Vec<std::path::PathBuf> = lines.filter_map(parse_file_uri).collect();
+        if !paths.is_empty() {
+            return Some(FileClipboard { paths, cut });
+        }
+    }
+    None
+}
+
+/// One clipboard target only: wl-copy and xclip each own the selection with
+/// a single format, so the GNOME format wins for its copy/cut line.
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn write_file_clipboard(paths: &[std::path::PathBuf], cut: bool) {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut content = String::from(if cut { "cut\n" } else { "copy\n" });
+    for path in paths {
+        content.push_str(&file_uri(path));
+        content.push('\n');
+    }
+    let attempts: [(&str, &[&str]); 2] = [
+        ("wl-copy", &["--type", "x-special/gnome-copied-files"]),
+        (
+            "xclip",
+            &[
+                "-selection",
+                "clipboard",
+                "-t",
+                "x-special/gnome-copied-files",
+                "-i",
+            ],
+        ),
+    ];
+    for (program, arguments) in attempts {
+        let spawned = Command::new(program)
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        if let Ok(mut child) = spawned {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(content.as_bytes());
+            }
+            let _ = child.wait();
+            return;
+        }
+    }
+    eprintln!("pi-gpui: no clipboard tool found (install wl-copy or xclip)");
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn parse_file_uri(uri: &str) -> Option<std::path::PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let mut bytes = Vec::new();
+    let mut characters = rest.bytes();
+    while let Some(byte) = characters.next() {
+        if byte == b'%' {
+            let hex = [characters.next()?, characters.next()?];
+            let hex = std::str::from_utf8(&hex).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    Some(std::path::PathBuf::from(
+        String::from_utf8_lossy(&bytes).into_owned(),
+    ))
 }
 
 /// Asks for one or more folders with the system open panel.

@@ -4,21 +4,24 @@
 //! that each hold only the next one shows as a single row, as Zed folds them.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use gpui::{
-    AnyElement, ClickEvent, Context, EventEmitter, FocusHandle, KeyBinding, MouseButton,
-    MouseDownEvent, Pixels, Point, ScrollStrategy, SharedString, Task, UniformListScrollHandle,
-    Window, actions, anchored, deferred, div, px, uniform_list,
+    AnyElement, Bounds, ClickEvent, Context, DragMoveEvent, Entity, EventEmitter, ExternalPaths,
+    FocusHandle, Focusable as _, KeyBinding, MouseButton, MouseDownEvent, Pixels, Point,
+    ScrollStrategy, SharedString, Task, UniformListScrollHandle, Window, actions, anchored, canvas,
+    deferred, div, px, uniform_list,
 };
 
 use crate::diff::FileStatus;
 use crate::git;
-use crate::platform::ConsoleWindow as _;
+use crate::platform::{self, ConsoleWindow as _, FileClipboard};
 use crate::settings::ui_px;
+use crate::text_input::TextInput;
 use crate::ui::prelude::*;
 
 actions!(
@@ -28,11 +31,14 @@ actions!(
         SelectNext,
         CollapseOrParent,
         ExpandOrChild,
-        OpenSelected
+        OpenSelected,
+        ConfirmEdit,
+        CancelEdit
     ]
 );
 
 const KEY_CONTEXT: &str = "FileTree";
+const EDIT_KEY_CONTEXT: &str = "FileTreeEdit";
 const ROW_HEIGHT: f32 = 24.;
 const INDENT: f32 = 14.;
 /// Not worth showing: git's own data and Finder's folder metadata.
@@ -48,12 +54,12 @@ pub fn bind_keys(cx: &mut gpui::App) {
         KeyBinding::new("left", CollapseOrParent, Some(KEY_CONTEXT)),
         KeyBinding::new("right", ExpandOrChild, Some(KEY_CONTEXT)),
         KeyBinding::new("enter", OpenSelected, Some(KEY_CONTEXT)),
+        KeyBinding::new("enter", ConfirmEdit, Some(EDIT_KEY_CONTEXT)),
+        KeyBinding::new("escape", CancelEdit, Some(EDIT_KEY_CONTEXT)),
     ]);
 }
 
 pub enum FilesEvent {
-    /// "Add to message": a path relative to the project.
-    InsertPath(String),
     /// A file clicked: the path, and the same relative to the project.
     OpenPath(PathBuf, String),
 }
@@ -79,6 +85,7 @@ impl Entry {
 struct VisibleRow {
     entry: Entry,
     depth: usize,
+    editing: bool,
 }
 
 #[derive(Default)]
@@ -129,6 +136,22 @@ impl GitState {
 struct FileMenu {
     path: PathBuf,
     position: Point<Pixels>,
+    /// Read once when the menu opens, so Paste knows what it would paste.
+    clipboard: Option<FileClipboard>,
+}
+
+enum EditKind {
+    NewFile,
+    NewFolder,
+    Rename(PathBuf),
+}
+
+/// An input row in the tree: a new file or folder in `directory`, or the
+/// rename of one entry.
+struct Editing {
+    directory: PathBuf,
+    kind: EditKind,
+    input: Entity<TextInput>,
 }
 
 /// A project shown before, put back at once on coming back while the
@@ -155,6 +178,10 @@ pub struct FilesPanel {
     scroll: UniformListScrollHandle,
     focus_handle: FocusHandle,
     menu: Option<FileMenu>,
+    editing: Option<Editing>,
+    edit_anchor: Option<Bounds<Pixels>>,
+    drop_target: Option<PathBuf>,
+    action_error: Option<String>,
     _refresh_task: Task<()>,
 }
 
@@ -176,6 +203,10 @@ impl FilesPanel {
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             menu: None,
+            editing: None,
+            edit_anchor: None,
+            drop_target: None,
+            action_error: None,
             _refresh_task: Task::ready(()),
         }
     }
@@ -210,6 +241,10 @@ impl FilesPanel {
         self.selected = None;
         self.error = None;
         self.menu = None;
+        self.editing = None;
+        self.edit_anchor = None;
+        self.drop_target = None;
+        self.action_error = None;
         self.rebuild_rows();
         self.refreshing = false;
         self.refresh_pending = false;
@@ -288,6 +323,21 @@ impl FilesPanel {
     }
 
     fn push_rows(&self, directory: &Path, depth: usize, rows: &mut Vec<VisibleRow>) {
+        if let Some(editing) = &self.editing
+            && !matches!(editing.kind, EditKind::Rename(_))
+            && editing.directory == directory
+        {
+            rows.push(VisibleRow {
+                entry: Entry {
+                    name: "".into(),
+                    path: directory.to_path_buf(),
+                    is_dir: matches!(editing.kind, EditKind::NewFolder),
+                    folded: Vec::new(),
+                },
+                depth,
+                editing: true,
+            });
+        }
         let Some(entries) = self.children.get(directory) else {
             return;
         };
@@ -295,6 +345,7 @@ impl FilesPanel {
             rows.push(VisibleRow {
                 entry: entry.clone(),
                 depth,
+                editing: false,
             });
             if entry.is_dir && self.expanded.contains(&entry.path) {
                 self.push_rows(&entry.path, depth + 1, rows);
@@ -362,6 +413,9 @@ impl FilesPanel {
     }
 
     fn select_previous(&mut self, _: &SelectPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            return;
+        }
         let index = match self.selected_index() {
             Some(index) => index.saturating_sub(1),
             None => self.rows.len().saturating_sub(1),
@@ -370,6 +424,9 @@ impl FilesPanel {
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            return;
+        }
         let index = match self.selected_index() {
             Some(index) => (index + 1).min(self.rows.len().saturating_sub(1)),
             None => 0,
@@ -378,6 +435,9 @@ impl FilesPanel {
     }
 
     fn collapse_or_parent(&mut self, _: &CollapseOrParent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            return;
+        }
         let Some(index) = self.selected_index() else {
             return;
         };
@@ -394,6 +454,9 @@ impl FilesPanel {
     }
 
     fn expand_or_child(&mut self, _: &ExpandOrChild, _: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            return;
+        }
         let Some(index) = self.selected_index() else {
             return;
         };
@@ -415,6 +478,9 @@ impl FilesPanel {
     }
 
     fn open_selected(&mut self, _: &OpenSelected, _: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            return;
+        }
         let Some(index) = self.selected_index() else {
             return;
         };
@@ -447,6 +513,201 @@ impl FilesPanel {
         cx.notify();
     }
 
+    fn start_edit(
+        &mut self,
+        kind: EditKind,
+        directory: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let placeholder = match &kind {
+            EditKind::NewFile => "File name",
+            EditKind::NewFolder => "Folder name",
+            EditKind::Rename(_) => "Name",
+        };
+        let initial = match &kind {
+            EditKind::Rename(path) => path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let input = cx.new(|cx| {
+            let mut input = TextInput::single_line(placeholder, cx).compact();
+            input.set_text(initial, cx);
+            input
+        });
+        window.focus(&input.read(cx).focus_handle(cx));
+        if matches!(kind, EditKind::Rename(_)) {
+            input.update(cx, |input, cx| input.select_all_text(cx));
+        } else {
+            self.expanded.insert(directory.clone());
+            self.refresh(cx);
+        }
+        self.editing = Some(Editing {
+            directory,
+            kind,
+            input,
+        });
+        cx.notify();
+    }
+
+    fn confirm_edit(&mut self, _: &ConfirmEdit, window: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        self.commit_edit(window, cx);
+    }
+
+    fn cancel_edit(&mut self, _: &CancelEdit, window: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        if self.editing.take().is_some() {
+            self.action_error = None;
+            self.edit_anchor = None;
+            self.rebuild_rows();
+            window.focus(&self.focus_handle);
+            cx.notify();
+        }
+    }
+
+    fn commit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editing) = self.editing.take() else {
+            return;
+        };
+        let name = editing.input.read(cx).text().trim().to_string();
+        if name.is_empty() {
+            self.edit_anchor = None;
+            self.rebuild_rows();
+            window.focus(&self.focus_handle);
+            cx.notify();
+            return;
+        }
+        let destination = editing.directory.join(&name);
+        if let EditKind::Rename(source) = &editing.kind
+            && *source == destination
+        {
+            window.focus(&self.focus_handle);
+            cx.notify();
+            return;
+        }
+        if !valid_name(&name) {
+            let input = editing.input.clone();
+            self.editing = Some(editing);
+            window.focus(&input.read(cx).focus_handle(cx));
+            self.show_error(format!("\"{name}\" is not a valid name"));
+            cx.notify();
+            return;
+        }
+        if destination.exists() {
+            let input = editing.input.clone();
+            self.editing = Some(editing);
+            window.focus(&input.read(cx).focus_handle(cx));
+            self.show_error(format!("{} already exists", destination.display()));
+            cx.notify();
+            return;
+        }
+        window.focus(&self.focus_handle);
+        self.edit_anchor = None;
+        self.rebuild_rows();
+        self.selected = Some(destination.clone());
+        match editing.kind {
+            EditKind::Rename(source) => self.run_file_job(
+                move || {
+                    fs::rename(&source, &destination)
+                        .map_err(|error| format!("could not rename {}: {error}", source.display()))
+                },
+                cx,
+            ),
+            EditKind::NewFile => self.run_file_job(
+                move || {
+                    fs::write(&destination, "").map_err(|error| {
+                        format!("could not create {}: {error}", destination.display())
+                    })
+                },
+                cx,
+            ),
+            EditKind::NewFolder => self.run_file_job(
+                move || {
+                    fs::create_dir_all(&destination).map_err(|error| {
+                        format!("could not create {}: {error}", destination.display())
+                    })
+                },
+                cx,
+            ),
+        }
+    }
+
+    fn show_error(&mut self, message: String) {
+        eprintln!("pi-gpui: {message}");
+        self.action_error = Some(message);
+    }
+
+    fn run_file_job(
+        &mut self,
+        job: impl FnOnce() -> Result<(), String> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.action_error = None;
+        let work = cx.background_spawn(async move { job() });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.show_error(error);
+                }
+                this.refresh(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn move_into(&mut self, source: PathBuf, directory: PathBuf, cx: &mut Context<Self>) {
+        if directory.starts_with(&source) || source.parent() == Some(directory.as_path()) {
+            return;
+        }
+        let Some(name) = source.file_name() else {
+            return;
+        };
+        let destination = unique_destination(&directory, name);
+        self.selected = Some(destination.clone());
+        self.run_file_job(move || move_path(&source, &destination), cx);
+    }
+
+    fn paste_into(
+        &mut self,
+        sources: Vec<PathBuf>,
+        directory: PathBuf,
+        cut: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_file_job(
+            move || {
+                for source in &sources {
+                    if directory.starts_with(source) {
+                        return Err(format!("cannot paste {} into itself", source.display()));
+                    }
+                    if cut && source.parent() == Some(directory.as_path()) {
+                        continue;
+                    }
+                    let Some(name) = source.file_name() else {
+                        continue;
+                    };
+                    let destination = unique_destination(&directory, name);
+                    if cut {
+                        move_path(source, &destination)?;
+                    } else {
+                        copy_path(source, &destination)?;
+                    }
+                }
+                if cut {
+                    platform::write_file_clipboard(&[], false);
+                }
+                Ok(())
+            },
+            cx,
+        );
+    }
+
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
     }
@@ -460,11 +721,79 @@ impl FilesPanel {
             .to_string()
     }
 
+    /// The label area of the edited row, in window coordinates. The input
+    /// overlays it from a deferred root: uniform_list lays rows out outside
+    /// the normal flex tree, which collapses a TextInput placed in a row.
+    fn edit_anchor_canvas(&self, cx: &mut Context<Self>) -> AnyElement {
+        let entity = cx.entity();
+        canvas(
+            move |bounds, _, cx| {
+                entity.update(cx, |this, cx| {
+                    if this.edit_anchor != Some(bounds) {
+                        this.edit_anchor = Some(bounds);
+                        cx.notify();
+                    }
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .flex_1()
+        .min_w(px(0.))
+        .h_full()
+        .into_any_element()
+    }
+
+    fn render_edit_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let editing = self.editing.as_ref()?;
+        let anchor = self.edit_anchor?;
+        Some(
+            deferred(
+                anchored().position(anchor.origin).child(
+                    div()
+                        .w(anchor.size.width)
+                        .key_context(EDIT_KEY_CONTEXT)
+                        .on_action(cx.listener(Self::confirm_edit))
+                        .on_action(cx.listener(Self::cancel_edit))
+                        .on_mouse_down_out(
+                            cx.listener(|this, _, window, cx| this.commit_edit(window, cx)),
+                        )
+                        .child(editing.input.clone()),
+                ),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    fn render_edit_row(&self, depth: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(editing) = &self.editing else {
+            return div().into_any_element();
+        };
+        let icon = if matches!(editing.kind, EditKind::NewFolder) {
+            IconName::Folder
+        } else {
+            IconName::File
+        };
+        h_flex()
+            .w_full()
+            .h(ui_px(cx, ROW_HEIGHT))
+            .pl(px(8. + depth as f32 * INDENT))
+            .pr(px(8.))
+            .gap(px(4.))
+            .child(div().w(px(12.)))
+            .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+            .child(self.edit_anchor_canvas(cx))
+            .into_any_element()
+    }
+
     fn render_rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let colors = cx.theme().colors.clone();
         range
             .filter_map(|index| {
                 let row = self.rows.get(index)?.clone();
+                if row.editing {
+                    return Some(self.render_edit_row(row.depth, cx));
+                }
                 let entry = row.entry;
                 let name = entry.name.clone();
                 let selected = self.selected.as_ref() == Some(&entry.path);
@@ -504,17 +833,40 @@ impl FilesPanel {
                         .unwrap_or_default()
                 };
                 let menu_path = entry.path.clone();
-                Some(
-                    h_flex()
-                        .id(("file-row", index))
-                        .h(ui_px(cx, ROW_HEIGHT))
-                        .pl(px(8. + row.depth as f32 * INDENT))
-                        .pr(px(8.))
-                        .gap(px(4.))
-                        .rounded(px(4.))
-                        .cursor_pointer()
-                        .when(selected, |this| this.bg(colors.ghost_element_selected))
-                        .hover(|style| style.bg(colors.ghost_element_hover))
+                let drag_path = entry.path.clone();
+                let drag_name = entry.name.clone();
+                let drag_is_dir = entry.is_dir;
+                let drop_directory = if entry.is_dir {
+                    Some(entry.path.clone())
+                } else {
+                    entry.path.parent().map(Path::to_path_buf)
+                };
+                let rename_input = match &self.editing {
+                    Some(editing) => match &editing.kind {
+                        EditKind::Rename(path) if *path == entry.path => {
+                            Some(editing.input.clone())
+                        }
+                        _ => None,
+                    },
+                    None => None,
+                };
+                let mut element = h_flex()
+                    .id(("file-row", index))
+                    .w_full()
+                    .h(ui_px(cx, ROW_HEIGHT))
+                    .pl(px(8. + row.depth as f32 * INDENT))
+                    .pr(px(8.))
+                    .gap(px(4.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .when(selected, |this| this.bg(colors.ghost_element_selected))
+                    .when(
+                        entry.is_dir && self.drop_target.as_ref() == Some(&entry.path),
+                        |this| this.bg(colors.ghost_element_selected),
+                    )
+                    .hover(|style| style.bg(colors.ghost_element_hover));
+                if rename_input.is_none() {
+                    element = element
                         .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                             this.click_row(&entry, event, window, cx)
                         }))
@@ -526,20 +878,83 @@ impl FilesPanel {
                                 this.menu = Some(FileMenu {
                                     path: menu_path.clone(),
                                     position: event.position,
+                                    clipboard: platform::read_file_clipboard(),
                                 });
+                                cx.stop_propagation();
                                 cx.notify();
                             }),
                         )
+                        .on_drag(drag_path, move |_, offset, _, cx| {
+                            cx.new(|_| DraggedFile {
+                                name: drag_name.clone(),
+                                is_dir: drag_is_dir,
+                                offset,
+                            })
+                        })
+                        .on_drag_move::<PathBuf>(cx.listener({
+                            let directory = drop_directory.clone();
+                            move |this, event: &DragMoveEvent<PathBuf>, _, cx| {
+                                if !event.bounds.contains(&event.event.position) {
+                                    return;
+                                }
+                                let Some(directory) = directory.clone() else {
+                                    return;
+                                };
+                                if directory.starts_with(event.drag(cx)) {
+                                    return;
+                                }
+                                this.drop_target = Some(directory);
+                                cx.notify();
+                            }
+                        }))
+                        .on_drag_move::<ExternalPaths>(cx.listener({
+                            let directory = drop_directory.clone();
+                            move |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                                if !event.bounds.contains(&event.event.position) {
+                                    return;
+                                }
+                                this.drop_target = directory.clone();
+                                cx.notify();
+                            }
+                        }))
+                        .on_drop::<PathBuf>(cx.listener({
+                            let directory = drop_directory.clone();
+                            move |this, source: &PathBuf, _, cx| {
+                                this.drop_target = None;
+                                let Some(directory) = directory.clone() else {
+                                    return;
+                                };
+                                this.move_into(source.clone(), directory, cx);
+                            }
+                        }))
+                        .on_drop::<ExternalPaths>(cx.listener({
+                            let directory = drop_directory.clone();
+                            move |this, paths: &ExternalPaths, _, cx| {
+                                this.drop_target = None;
+                                let Some(directory) = directory.clone() else {
+                                    return;
+                                };
+                                this.paste_into(paths.paths().to_vec(), directory, false, cx);
+                            }
+                        }));
+                }
+                Some(
+                    element
                         .child(disclosure)
                         .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
-                        .child(
-                            div().flex_1().min_w(px(0.)).child(
-                                Label::new(name)
-                                    .size(LabelSize::Small)
-                                    .color(color)
-                                    .truncate(),
-                            ),
-                        )
+                        .child(match rename_input {
+                            Some(_) => self.edit_anchor_canvas(cx),
+                            None => div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(
+                                    Label::new(name)
+                                        .size(LabelSize::Small)
+                                        .color(color)
+                                        .truncate(),
+                                )
+                                .into_any_element(),
+                        })
                         .when(additions > 0, |this| {
                             this.child(
                                 Label::new(format!("+{additions}"))
@@ -563,6 +978,12 @@ impl FilesPanel {
     fn render_menu(&self, menu: &FileMenu, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
         let is_dir = fs::metadata(&menu.path).is_ok_and(|metadata| metadata.is_dir());
+        let is_root = self.workspace.as_ref() == Some(&menu.path);
+        let directory = if is_dir {
+            menu.path.clone()
+        } else {
+            menu.path.parent().unwrap_or(&menu.path).to_path_buf()
+        };
         let item = |id: &'static str, icon: IconName, label: &'static str| {
             h_flex()
                 .id(id)
@@ -575,30 +996,125 @@ impl FilesPanel {
                 .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Default))
                 .child(Label::new(label).size(LabelSize::Small))
         };
+        let separator = || div().my(px(4.)).h(px(1.)).bg(colors.border_variant);
         let path = menu.path.clone();
-        let relative = self.relative_path(&menu.path);
-        let open = (!is_dir).then(|| {
+        let mut items: Vec<AnyElement> = Vec::new();
+        if !is_dir {
             let path = path.clone();
-            item("file-menu-open", IconName::File, "Open in editor").on_click(cx.listener(
-                move |this, _, _, cx| {
+            items.push(
+                item(
+                    "file-menu-open",
+                    IconName::ExternalLink,
+                    "Open with default app",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
                     this.menu = None;
-                    crate::hub::open_in_editor(&path);
+                    platform::open_with_default_app(&path);
                     cx.notify();
-                },
-            ))
-        });
-        let insert = {
-            let relative = relative.clone();
-            item("file-menu-insert", IconName::Message, "Add to message").on_click(cx.listener(
-                move |this, _, _, cx| {
+                }))
+                .into_any_element(),
+            );
+            items.push(separator().into_any_element());
+        }
+        let new_file_directory = directory.clone();
+        items.push(
+            item("file-menu-new-file", IconName::FilePlus, "New file")
+                .on_click(cx.listener(move |this, _, window, cx| {
                     this.menu = None;
-                    cx.emit(FilesEvent::InsertPath(relative.clone()));
-                    cx.notify();
-                },
-            ))
-        };
-        let reveal = {
-            let path = path.clone();
+                    this.start_edit(EditKind::NewFile, new_file_directory.clone(), window, cx);
+                }))
+                .into_any_element(),
+        );
+        let new_folder_directory = directory.clone();
+        items.push(
+            item("file-menu-new-folder", IconName::FolderPlus, "New folder")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.menu = None;
+                    this.start_edit(
+                        EditKind::NewFolder,
+                        new_folder_directory.clone(),
+                        window,
+                        cx,
+                    );
+                }))
+                .into_any_element(),
+        );
+        if !is_root {
+            items.push(separator().into_any_element());
+            let cut_path = path.clone();
+            items.push(
+                item("file-menu-cut", IconName::Scissors, "Cut")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu = None;
+                        platform::write_file_clipboard(std::slice::from_ref(&cut_path), true);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            let copy_source = path.clone();
+            items.push(
+                item("file-menu-copy", IconName::Copy, "Copy")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu = None;
+                        platform::write_file_clipboard(std::slice::from_ref(&copy_source), false);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if menu
+            .clipboard
+            .as_ref()
+            .is_some_and(|clipboard| !clipboard.paths.is_empty())
+        {
+            let paste_directory = directory.clone();
+            items.push(
+                item("file-menu-paste", IconName::ClipboardPaste, "Paste")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu = None;
+                        if let Some(clipboard) = platform::read_file_clipboard() {
+                            this.paste_into(
+                                clipboard.paths,
+                                paste_directory.clone(),
+                                clipboard.cut,
+                                cx,
+                            );
+                        }
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if !is_root {
+            items.push(separator().into_any_element());
+            let rename_path = path.clone();
+            let rename_directory = menu.path.parent().unwrap_or(&menu.path).to_path_buf();
+            items.push(
+                item("file-menu-rename", IconName::Pencil, "Rename")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.menu = None;
+                        this.start_edit(
+                            EditKind::Rename(rename_path.clone()),
+                            rename_directory.clone(),
+                            window,
+                            cx,
+                        );
+                    }))
+                    .into_any_element(),
+            );
+            let delete_path = path.clone();
+            items.push(
+                item("file-menu-delete", IconName::Trash, "Delete")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu = None;
+                        let path = delete_path.clone();
+                        this.run_file_job(move || platform::move_to_trash(&path), cx);
+                    }))
+                    .into_any_element(),
+            );
+            items.push(separator().into_any_element());
+        }
+        let reveal_path = path.clone();
+        items.push(
             item(
                 "file-menu-reveal",
                 IconName::FolderOpen,
@@ -610,22 +1126,32 @@ impl FilesPanel {
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.menu = None;
-                crate::platform::reveal_in_file_manager(&path);
+                platform::reveal_in_file_manager(&reveal_path);
                 cx.notify();
             }))
-        };
-        let copy = item("file-menu-copy", IconName::Copy, "Copy relative path").on_click(
-            cx.listener(move |this, _, _, cx| {
-                this.menu = None;
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(relative.clone()));
-                cx.notify();
-            }),
+            .into_any_element(),
         );
+        if !is_root {
+            let relative = self.relative_path(&menu.path);
+            items.push(
+                item(
+                    "file-menu-copy-relative",
+                    IconName::Copy,
+                    "Copy relative path",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.menu = None;
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(relative.clone()));
+                    cx.notify();
+                }))
+                .into_any_element(),
+            );
+        }
         deferred(
             anchored().position(menu.position).child(
                 v_flex()
                     .id("file-menu")
-                    .w(px(190.))
+                    .w(px(220.))
                     .p(px(4.))
                     .rounded(px(8.))
                     .border_1()
@@ -637,10 +1163,8 @@ impl FilesPanel {
                         this.menu = None;
                         cx.notify();
                     }))
-                    .children(open)
-                    .child(insert)
-                    .child(reveal)
-                    .child(copy),
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                    .children(items),
             ),
         )
         .with_priority(1)
@@ -667,6 +1191,10 @@ impl FilesPanel {
 impl Render for FilesPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
+        if self.drop_target.is_some() && !cx.has_active_drag() {
+            self.drop_target = None;
+            cx.notify();
+        }
         let content = if self.workspace.is_none() {
             self.render_message("Select a project to see its files.".into())
         } else if let Some(error) = &self.error {
@@ -724,7 +1252,26 @@ impl Render for FilesPanel {
                 )
         });
         let menu = self.menu.as_ref().map(|menu| self.render_menu(menu, cx));
+        let action_error = self.action_error.as_ref().map(|error| {
+            h_flex()
+                .gap(px(6.))
+                .px(px(12.))
+                .py(px(4.))
+                .child(
+                    Icon::new(IconName::Warning)
+                        .size(IconSize::XSmall)
+                        .color(Color::Error),
+                )
+                .child(
+                    div().flex_1().min_w(px(0.)).child(
+                        Label::new(error.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Error),
+                    ),
+                )
+        });
         v_flex()
+            .id("files-panel")
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::select_previous))
@@ -732,11 +1279,226 @@ impl Render for FilesPanel {
             .on_action(cx.listener(Self::collapse_or_parent))
             .on_action(cx.listener(Self::expand_or_child))
             .on_action(cx.listener(Self::open_selected))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    let Some(workspace) = this.workspace.clone() else {
+                        return;
+                    };
+                    window.focus(&this.focus_handle);
+                    this.menu = Some(FileMenu {
+                        path: workspace,
+                        position: event.position,
+                        clipboard: platform::read_file_clipboard(),
+                    });
+                    cx.notify();
+                }),
+            )
+            .on_drag_move::<PathBuf>(cx.listener(|this, event: &DragMoveEvent<PathBuf>, _, cx| {
+                if !event.bounds.contains(&event.event.position) {
+                    if this.drop_target.take().is_some() {
+                        cx.notify();
+                    }
+                    return;
+                }
+                let Some(workspace) = this.workspace.clone() else {
+                    return;
+                };
+                if workspace.starts_with(event.drag(cx)) {
+                    return;
+                }
+                this.drop_target = Some(workspace);
+                cx.notify();
+            }))
+            .on_drag_move::<ExternalPaths>(cx.listener(
+                |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                    if !event.bounds.contains(&event.event.position) {
+                        if this.drop_target.take().is_some() {
+                            cx.notify();
+                        }
+                        return;
+                    }
+                    this.drop_target = this.workspace.clone();
+                    cx.notify();
+                },
+            ))
+            .on_drop::<PathBuf>(cx.listener(|this, source: &PathBuf, _, cx| {
+                this.drop_target = None;
+                let Some(workspace) = this.workspace.clone() else {
+                    return;
+                };
+                this.move_into(source.clone(), workspace, cx);
+            }))
+            .on_drop::<ExternalPaths>(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.drop_target = None;
+                let Some(workspace) = this.workspace.clone() else {
+                    return;
+                };
+                this.paste_into(paths.paths().to_vec(), workspace, false, cx);
+            }))
             .size_full()
             .children(project)
+            .children(action_error)
             .child(content)
+            .children(self.render_edit_overlay(cx))
             .children(menu)
     }
+}
+
+/// The ghost following the cursor while a tree entry is dragged. The
+/// padding puts the pill under the cursor: gpui anchors the ghost at the
+/// mouse minus the press point inside the row.
+struct DraggedFile {
+    name: SharedString,
+    is_dir: bool,
+    offset: Point<Pixels>,
+}
+
+impl Render for DraggedFile {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors.clone();
+        div()
+            .pl(px(f32::from(self.offset.x)))
+            .pt(px(f32::from(self.offset.y)))
+            .child(
+                h_flex()
+                    .gap(px(4.))
+                    .px(px(8.))
+                    .py(px(4.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.elevated_surface_background)
+                    .shadow_lg()
+                    .child(
+                        Icon::new(if self.is_dir {
+                            IconName::Folder
+                        } else {
+                            IconName::File
+                        })
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .child(Label::new(self.name.clone()).size(LabelSize::Small)),
+            )
+    }
+}
+
+/// A name one path component can hold.
+fn valid_name(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        // Windows strips trailing dots and spaces silently and reserves
+        // device names even with an extension.
+        if name.ends_with('.') || name.ends_with(' ') {
+            return false;
+        }
+        if name.chars().any(|character| {
+            character < ' ' || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+        }) {
+            return false;
+        }
+        let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+        const RESERVED: [&str; 22] = [
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+            "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        ];
+        if RESERVED.contains(&stem.as_str()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `name` in `directory`, or `name (2)`, `name (3)`… when taken, keeping the
+/// extension on files.
+fn unique_destination(directory: &Path, name: &OsStr) -> PathBuf {
+    let destination = directory.join(name);
+    if !destination.exists() {
+        return destination;
+    }
+    let base = Path::new(name);
+    let stem = base.file_stem().unwrap_or_default().to_string_lossy();
+    let extension = base
+        .extension()
+        .map(|extension| format!(".{}", extension.to_string_lossy()));
+    let mut counter = 2;
+    loop {
+        let candidate = match &extension {
+            Some(extension) => format!("{stem} ({counter}){extension}"),
+            None => format!("{stem} ({counter})"),
+        };
+        let destination = directory.join(candidate);
+        if !destination.exists() {
+            return destination;
+        }
+        counter += 1;
+    }
+}
+
+/// Recursive copy; symlinks are recreated as links so a linked folder
+/// cannot loop the walk.
+fn copy_path(source: &Path, destination: &Path) -> Result<(), String> {
+    copy_inner(source, destination, &mut Vec::new())
+}
+
+fn copy_inner(source: &Path, destination: &Path, stack: &mut Vec<PathBuf>) -> Result<(), String> {
+    let fail = |error: std::io::Error| format!("could not copy {}: {error}", source.display());
+    let metadata = fs::symlink_metadata(source).map_err(fail)?;
+    if metadata.is_symlink() {
+        let target = fs::read_link(source).map_err(fail)?;
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, destination);
+        #[cfg(windows)]
+        let linked = if fs::metadata(source).is_ok_and(|metadata| metadata.is_dir()) {
+            std::os::windows::fs::symlink_dir(&target, destination)
+        } else {
+            std::os::windows::fs::symlink_file(&target, destination)
+        };
+        if linked.is_ok() {
+            return Ok(());
+        }
+        // Windows usually refuses link creation without a privilege;
+        // fall back to copying the target, like Explorer.
+    }
+    let metadata = fs::metadata(source).map_err(fail)?;
+    if metadata.is_dir() {
+        let canonical = fs::canonicalize(source).map_err(fail)?;
+        if stack.contains(&canonical) {
+            return Err(format!(
+                "could not copy {}: symlink cycle",
+                source.display()
+            ));
+        }
+        stack.push(canonical);
+        fs::create_dir_all(destination).map_err(fail)?;
+        for entry in fs::read_dir(source).map_err(fail)?.flatten() {
+            copy_inner(&entry.path(), &destination.join(entry.file_name()), stack)?;
+        }
+        stack.pop();
+        return Ok(());
+    }
+    fs::copy(source, destination).map_err(fail)?;
+    Ok(())
+}
+
+/// Rename, or copy and remove the source when rename fails across volumes.
+/// The source only goes once the copy fully succeeded.
+fn move_path(source: &Path, destination: &Path) -> Result<(), String> {
+    if fs::rename(source, destination).is_ok() {
+        return Ok(());
+    }
+    copy_path(source, destination)?;
+    let fail = |error: std::io::Error| format!("could not move {}: {error}", source.display());
+    if fs::symlink_metadata(source).map_err(fail)?.is_dir() {
+        fs::remove_dir_all(source).map_err(fail)?;
+    } else {
+        fs::remove_file(source).map_err(fail)?;
+    }
+    Ok(())
 }
 
 /// Folders first, then files, by name ignoring case.

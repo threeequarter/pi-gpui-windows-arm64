@@ -832,7 +832,7 @@ impl FileViewer {
                     .child(self.render_mode_buttons(cx))
                     .child(render_facts(file_facts, diff_facts))
                     .child(
-                        IconButton::new("file-viewer-open", IconName::FolderOpen)
+                        IconButton::new("file-viewer-open", IconName::Pencil)
                             .size(ButtonSize::Compact)
                             .icon_size(IconSize::XSmall)
                             .tooltip(Tooltip::text("Open in editor"))
