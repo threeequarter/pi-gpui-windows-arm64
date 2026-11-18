@@ -29,6 +29,8 @@ actions!(
     [
         SelectPrevious,
         SelectNext,
+        ExtendSelectionPrevious,
+        ExtendSelectionNext,
         CollapseOrParent,
         ExpandOrChild,
         OpenSelected,
@@ -51,6 +53,8 @@ pub fn bind_keys(cx: &mut gpui::App) {
     cx.bind_keys([
         KeyBinding::new("up", SelectPrevious, Some(KEY_CONTEXT)),
         KeyBinding::new("down", SelectNext, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-up", ExtendSelectionPrevious, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-down", ExtendSelectionNext, Some(KEY_CONTEXT)),
         KeyBinding::new("left", CollapseOrParent, Some(KEY_CONTEXT)),
         KeyBinding::new("right", ExpandOrChild, Some(KEY_CONTEXT)),
         KeyBinding::new("enter", OpenSelected, Some(KEY_CONTEXT)),
@@ -135,6 +139,8 @@ impl GitState {
 
 struct FileMenu {
     path: PathBuf,
+    /// The selection when the menu opened: what Cut, Copy and Delete act on.
+    paths: Vec<PathBuf>,
     position: Point<Pixels>,
     /// Read once when the menu opens, so Paste knows what it would paste.
     clipboard: Option<FileClipboard>,
@@ -167,7 +173,13 @@ pub struct FilesPanel {
     children: HashMap<PathBuf, Vec<Entry>>,
     expanded: HashSet<PathBuf>,
     remembered: HashMap<PathBuf, Remembered>,
+    /// The cursor row: what the keyboard moves and Enter opens. Ctrl-click
+    /// can toggle it out of the selection while the cursor stays on it.
     selected: Option<PathBuf>,
+    /// Every selected row.
+    selection: HashSet<PathBuf>,
+    /// The fixed end of a shift range.
+    anchor: Option<PathBuf>,
     git: GitState,
     error: Option<String>,
     rows: Vec<VisibleRow>,
@@ -179,6 +191,9 @@ pub struct FilesPanel {
     focus_handle: FocusHandle,
     menu: Option<FileMenu>,
     editing: Option<Editing>,
+    /// An inline edit was open when the mouse pressed on the tree, so the
+    /// click that commits it must not also clear the selection.
+    pressed_while_editing: bool,
     edit_anchor: Option<Bounds<Pixels>>,
     drop_target: Option<PathBuf>,
     action_error: Option<String>,
@@ -195,6 +210,8 @@ impl FilesPanel {
             expanded: HashSet::new(),
             remembered: HashMap::new(),
             selected: None,
+            selection: HashSet::new(),
+            anchor: None,
             git: GitState::default(),
             error: None,
             rows: Vec::new(),
@@ -204,6 +221,7 @@ impl FilesPanel {
             focus_handle: cx.focus_handle(),
             menu: None,
             editing: None,
+            pressed_while_editing: false,
             edit_anchor: None,
             drop_target: None,
             action_error: None,
@@ -239,6 +257,8 @@ impl FilesPanel {
         };
         self.workspace = workspace;
         self.selected = None;
+        self.selection.clear();
+        self.anchor = None;
         self.error = None;
         self.menu = None;
         self.editing = None;
@@ -399,16 +419,90 @@ impl FilesPanel {
         .detach();
     }
 
+    fn row_index(&self, path: &Path) -> Option<usize> {
+        self.rows.iter().position(|row| row.entry.path == path)
+    }
+
     fn selected_index(&self) -> Option<usize> {
-        let selected = self.selected.as_ref()?;
-        self.rows.iter().position(|row| &row.entry.path == selected)
+        self.row_index(self.selected.as_deref()?)
+    }
+
+    fn select_only(&mut self, path: PathBuf) {
+        self.selected = Some(path.clone());
+        self.anchor = Some(path.clone());
+        self.selection.clear();
+        self.selection.insert(path);
+    }
+
+    fn clear_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle);
+        self.selected = None;
+        self.selection.clear();
+        self.anchor = None;
+        cx.notify();
     }
 
     fn select_index(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(row) = self.rows.get(index) {
-            self.selected = Some(row.entry.path.clone());
+            self.select_only(row.entry.path.clone());
             self.scroll.scroll_to_item(index, ScrollStrategy::Top);
             cx.notify();
+        }
+    }
+
+    /// Selects every row between the anchor and `index`, keeping the
+    /// anchor so further shift steps grow or shrink the same range.
+    fn extend_selection_to(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(path) = self.rows.get(index).map(|row| row.entry.path.clone()) else {
+            return;
+        };
+        let Some(anchor) = self
+            .anchor
+            .as_deref()
+            .and_then(|anchor| self.row_index(anchor))
+        else {
+            self.select_index(index, cx);
+            return;
+        };
+        let range = anchor.min(index)..=anchor.max(index);
+        self.selection = self.rows[range]
+            .iter()
+            .map(|row| row.entry.path.clone())
+            .collect();
+        self.selected = Some(path);
+        self.scroll.scroll_to_item(index, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// The selected rows' paths in tree order, without ones a selected
+    /// folder already holds; paths gone from the tree are left out.
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        let paths: Vec<PathBuf> = self
+            .rows
+            .iter()
+            .filter(|row| !row.editing && self.selection.contains(&row.entry.path))
+            .map(|row| row.entry.path.clone())
+            .collect();
+        let mut roots = paths.clone();
+        roots.retain(|path| {
+            !paths
+                .iter()
+                .any(|other| path != other && path.starts_with(other))
+        });
+        roots
+    }
+
+    fn previous_index(&self) -> usize {
+        match self.selected_index() {
+            Some(index) => index.saturating_sub(1),
+            None => self.rows.len().saturating_sub(1),
+        }
+    }
+
+    fn next_index(&self) -> usize {
+        match self.selected_index() {
+            Some(index) => (index + 1).min(self.rows.len().saturating_sub(1)),
+            None => 0,
         }
     }
 
@@ -416,22 +510,38 @@ impl FilesPanel {
         if self.editing.is_some() {
             return;
         }
-        let index = match self.selected_index() {
-            Some(index) => index.saturating_sub(1),
-            None => self.rows.len().saturating_sub(1),
-        };
-        self.select_index(index, cx);
+        self.select_index(self.previous_index(), cx);
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
         if self.editing.is_some() {
             return;
         }
-        let index = match self.selected_index() {
-            Some(index) => (index + 1).min(self.rows.len().saturating_sub(1)),
-            None => 0,
-        };
-        self.select_index(index, cx);
+        self.select_index(self.next_index(), cx);
+    }
+
+    fn extend_selection_previous(
+        &mut self,
+        _: &ExtendSelectionPrevious,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing.is_some() {
+            return;
+        }
+        self.extend_selection_to(self.previous_index(), cx);
+    }
+
+    fn extend_selection_next(
+        &mut self,
+        _: &ExtendSelectionNext,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing.is_some() {
+            return;
+        }
+        self.extend_selection_to(self.next_index(), cx);
     }
 
     fn collapse_or_parent(&mut self, _: &CollapseOrParent, _: &mut Window, cx: &mut Context<Self>) {
@@ -502,11 +612,25 @@ impl FilesPanel {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
-        self.selected = Some(entry.path.clone());
-        if entry.is_dir {
-            let expanded = self.expanded.contains(&entry.path);
-            self.set_expanded(entry, !expanded, cx);
-        } else if event.click_count() == 1 {
+        let modifiers = event.modifiers();
+        if modifiers.secondary() {
+            self.selected = Some(entry.path.clone());
+            self.anchor = Some(entry.path.clone());
+            if !self.selection.remove(&entry.path) {
+                self.selection.insert(entry.path.clone());
+            }
+        } else if modifiers.shift {
+            if let Some(index) = self.row_index(&entry.path) {
+                self.extend_selection_to(index, cx);
+            }
+        } else {
+            self.select_only(entry.path.clone());
+            if entry.is_dir {
+                let expanded = self.expanded.contains(&entry.path);
+                self.set_expanded(entry, !expanded, cx);
+            }
+        }
+        if !entry.is_dir && event.click_count() >= 2 {
             let relative = self.relative_path(&entry.path);
             cx.emit(FilesEvent::OpenPath(entry.path.clone(), relative));
         }
@@ -607,7 +731,7 @@ impl FilesPanel {
         window.focus(&self.focus_handle);
         self.edit_anchor = None;
         self.rebuild_rows();
-        self.selected = Some(destination.clone());
+        self.select_only(destination.clone());
         match editing.kind {
             EditKind::Rename(source) => self.run_file_job(
                 move || {
@@ -661,16 +785,38 @@ impl FilesPanel {
         .detach();
     }
 
-    fn move_into(&mut self, source: PathBuf, directory: PathBuf, cx: &mut Context<Self>) {
-        if directory.starts_with(&source) || source.parent() == Some(directory.as_path()) {
-            return;
+    fn move_into(&mut self, sources: Vec<PathBuf>, directory: PathBuf, cx: &mut Context<Self>) {
+        let mut moves = Vec::new();
+        let mut taken = HashSet::new();
+        for source in sources {
+            if directory.starts_with(&source) || source.parent() == Some(directory.as_path()) {
+                continue;
+            }
+            let Some(name) = source.file_name() else {
+                continue;
+            };
+            let destination = unique_destination(&directory, name, &taken);
+            taken.insert(destination.clone());
+            moves.push((source, destination));
         }
-        let Some(name) = source.file_name() else {
+        let Some((_, first)) = moves.first() else {
             return;
         };
-        let destination = unique_destination(&directory, name);
-        self.selected = Some(destination.clone());
-        self.run_file_job(move || move_path(&source, &destination), cx);
+        self.selected = Some(first.clone());
+        self.anchor = Some(first.clone());
+        self.selection = moves
+            .iter()
+            .map(|(_, destination)| destination.clone())
+            .collect();
+        self.run_file_job(
+            move || {
+                for (source, destination) in &moves {
+                    move_path(source, destination)?;
+                }
+                Ok(())
+            },
+            cx,
+        );
     }
 
     fn paste_into(
@@ -682,6 +828,7 @@ impl FilesPanel {
     ) {
         self.run_file_job(
             move || {
+                let mut taken = HashSet::new();
                 for source in &sources {
                     if directory.starts_with(source) {
                         return Err(format!("cannot paste {} into itself", source.display()));
@@ -692,7 +839,8 @@ impl FilesPanel {
                     let Some(name) = source.file_name() else {
                         continue;
                     };
-                    let destination = unique_destination(&directory, name);
+                    let destination = unique_destination(&directory, name, &taken);
+                    taken.insert(destination.clone());
                     if cut {
                         move_path(source, &destination)?;
                     } else {
@@ -751,6 +899,7 @@ impl FilesPanel {
                 anchored().position(anchor.origin).child(
                     div()
                         .w(anchor.size.width)
+                        .occlude()
                         .key_context(EDIT_KEY_CONTEXT)
                         .on_action(cx.listener(Self::confirm_edit))
                         .on_action(cx.listener(Self::cancel_edit))
@@ -788,6 +937,7 @@ impl FilesPanel {
 
     fn render_rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let colors = cx.theme().colors.clone();
+        let selected_paths = self.selected_paths();
         range
             .filter_map(|index| {
                 let row = self.rows.get(index)?.clone();
@@ -796,7 +946,7 @@ impl FilesPanel {
                 }
                 let entry = row.entry;
                 let name = entry.name.clone();
-                let selected = self.selected.as_ref() == Some(&entry.path);
+                let selected = self.selection.contains(&entry.path);
                 let expanded = entry.is_dir && self.expanded.contains(&entry.path);
                 let color = if self.git.is_ignored(&entry.path) {
                     Color::Placeholder
@@ -833,9 +983,22 @@ impl FilesPanel {
                         .unwrap_or_default()
                 };
                 let menu_path = entry.path.clone();
-                let drag_path = entry.path.clone();
-                let drag_name = entry.name.clone();
-                let drag_is_dir = entry.is_dir;
+                let drag_paths = if self.selection.contains(&entry.path) {
+                    selected_paths.clone()
+                } else {
+                    vec![entry.path.clone()]
+                };
+                let dragged_row = if drag_paths.len() == 1 {
+                    self.rows.iter().find(|row| row.entry.path == drag_paths[0])
+                } else {
+                    None
+                };
+                let drag_name = match dragged_row {
+                    Some(row) => row.entry.name.clone(),
+                    None if drag_paths.len() > 1 => format!("{} items", drag_paths.len()).into(),
+                    None => entry.name.clone(),
+                };
+                let drag_is_dir = dragged_row.is_some_and(|row| row.entry.is_dir);
                 let drop_directory = if entry.is_dir {
                     Some(entry.path.clone())
                 } else {
@@ -868,15 +1031,20 @@ impl FilesPanel {
                 if rename_input.is_none() {
                     element = element
                         .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                            this.click_row(&entry, event, window, cx)
+                            this.click_row(&entry, event, window, cx);
+                            cx.stop_propagation();
                         }))
                         .on_mouse_down(
                             MouseButton::Right,
                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                                 window.focus(&this.focus_handle);
                                 this.selected = Some(menu_path.clone());
+                                if !this.selection.contains(&menu_path) {
+                                    this.select_only(menu_path.clone());
+                                }
                                 this.menu = Some(FileMenu {
                                     path: menu_path.clone(),
+                                    paths: this.selected_paths(),
                                     position: event.position,
                                     clipboard: platform::read_file_clipboard(),
                                 });
@@ -884,23 +1052,27 @@ impl FilesPanel {
                                 cx.notify();
                             }),
                         )
-                        .on_drag(drag_path, move |_, offset, _, cx| {
+                        .on_drag(drag_paths, move |_, offset, _, cx| {
                             cx.new(|_| DraggedFile {
                                 name: drag_name.clone(),
                                 is_dir: drag_is_dir,
                                 offset,
                             })
                         })
-                        .on_drag_move::<PathBuf>(cx.listener({
+                        .on_drag_move::<Vec<PathBuf>>(cx.listener({
                             let directory = drop_directory.clone();
-                            move |this, event: &DragMoveEvent<PathBuf>, _, cx| {
+                            move |this, event: &DragMoveEvent<Vec<PathBuf>>, _, cx| {
                                 if !event.bounds.contains(&event.event.position) {
                                     return;
                                 }
                                 let Some(directory) = directory.clone() else {
                                     return;
                                 };
-                                if directory.starts_with(event.drag(cx)) {
+                                if event
+                                    .drag(cx)
+                                    .iter()
+                                    .any(|source| directory.starts_with(source))
+                                {
                                     return;
                                 }
                                 this.drop_target = Some(directory);
@@ -917,14 +1089,14 @@ impl FilesPanel {
                                 cx.notify();
                             }
                         }))
-                        .on_drop::<PathBuf>(cx.listener({
+                        .on_drop::<Vec<PathBuf>>(cx.listener({
                             let directory = drop_directory.clone();
-                            move |this, source: &PathBuf, _, cx| {
+                            move |this, sources: &Vec<PathBuf>, _, cx| {
                                 this.drop_target = None;
                                 let Some(directory) = directory.clone() else {
                                     return;
                                 };
-                                this.move_into(source.clone(), directory, cx);
+                                this.move_into(sources.clone(), directory, cx);
                             }
                         }))
                         .on_drop::<ExternalPaths>(cx.listener({
@@ -1041,22 +1213,22 @@ impl FilesPanel {
         );
         if !is_root {
             items.push(separator().into_any_element());
-            let cut_path = path.clone();
+            let cut_paths = menu.paths.clone();
             items.push(
                 item("file-menu-cut", IconName::Scissors, "Cut")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.menu = None;
-                        platform::write_file_clipboard(std::slice::from_ref(&cut_path), true);
+                        platform::write_file_clipboard(&cut_paths, true);
                         cx.notify();
                     }))
                     .into_any_element(),
             );
-            let copy_source = path.clone();
+            let copy_paths = menu.paths.clone();
             items.push(
                 item("file-menu-copy", IconName::Copy, "Copy")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.menu = None;
-                        platform::write_file_clipboard(std::slice::from_ref(&copy_source), false);
+                        platform::write_file_clipboard(&copy_paths, false);
                         cx.notify();
                     }))
                     .into_any_element(),
@@ -1101,13 +1273,21 @@ impl FilesPanel {
                     }))
                     .into_any_element(),
             );
-            let delete_path = path.clone();
+            let delete_paths = menu.paths.clone();
             items.push(
                 item("file-menu-delete", IconName::Trash, "Delete")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.menu = None;
-                        let path = delete_path.clone();
-                        this.run_file_job(move || platform::move_to_trash(&path), cx);
+                        let paths = delete_paths.clone();
+                        this.run_file_job(
+                            move || {
+                                for path in &paths {
+                                    platform::move_to_trash(path)?;
+                                }
+                                Ok(())
+                            },
+                            cx,
+                        );
                     }))
                     .into_any_element(),
             );
@@ -1208,16 +1388,32 @@ impl Render for FilesPanel {
         } else if self.rows.is_empty() {
             self.render_message("This folder is empty.".into())
         } else {
-            uniform_list(
-                "file-tree",
-                self.rows.len(),
-                cx.processor(|this, range, _, cx| this.render_rows(range, cx)),
-            )
-            .track_scroll(self.scroll.clone())
-            .flex_1()
-            .px(px(6.))
-            .pb(px(10.))
-            .into_any_element()
+            div()
+                .id("file-tree-area")
+                .flex_1()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if std::mem::take(&mut this.pressed_while_editing) {
+                        return;
+                    }
+                    this.clear_selection(window, cx);
+                }))
+                .child(
+                    uniform_list(
+                        "file-tree",
+                        self.rows.len(),
+                        cx.processor(|this, range, _, cx| this.render_rows(range, cx)),
+                    )
+                    .track_scroll(self.scroll.clone())
+                    .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, _| {
+                        if event.button == MouseButton::Left {
+                            this.pressed_while_editing = this.editing.is_some();
+                        }
+                    }))
+                    .size_full()
+                    .px(px(6.))
+                    .pb(px(10.)),
+                )
+                .into_any_element()
         };
         let project = self.workspace.as_ref().map(|workspace| {
             let name = workspace
@@ -1276,6 +1472,8 @@ impl Render for FilesPanel {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::extend_selection_previous))
+            .on_action(cx.listener(Self::extend_selection_next))
             .on_action(cx.listener(Self::collapse_or_parent))
             .on_action(cx.listener(Self::expand_or_child))
             .on_action(cx.listener(Self::open_selected))
@@ -1287,6 +1485,7 @@ impl Render for FilesPanel {
                     };
                     window.focus(&this.focus_handle);
                     this.menu = Some(FileMenu {
+                        paths: vec![workspace.clone()],
                         path: workspace,
                         position: event.position,
                         clipboard: platform::read_file_clipboard(),
@@ -1294,22 +1493,28 @@ impl Render for FilesPanel {
                     cx.notify();
                 }),
             )
-            .on_drag_move::<PathBuf>(cx.listener(|this, event: &DragMoveEvent<PathBuf>, _, cx| {
-                if !event.bounds.contains(&event.event.position) {
-                    if this.drop_target.take().is_some() {
-                        cx.notify();
+            .on_drag_move::<Vec<PathBuf>>(cx.listener(
+                |this, event: &DragMoveEvent<Vec<PathBuf>>, _, cx| {
+                    if !event.bounds.contains(&event.event.position) {
+                        if this.drop_target.take().is_some() {
+                            cx.notify();
+                        }
+                        return;
                     }
-                    return;
-                }
-                let Some(workspace) = this.workspace.clone() else {
-                    return;
-                };
-                if workspace.starts_with(event.drag(cx)) {
-                    return;
-                }
-                this.drop_target = Some(workspace);
-                cx.notify();
-            }))
+                    let Some(workspace) = this.workspace.clone() else {
+                        return;
+                    };
+                    if event
+                        .drag(cx)
+                        .iter()
+                        .any(|source| workspace.starts_with(source))
+                    {
+                        return;
+                    }
+                    this.drop_target = Some(workspace);
+                    cx.notify();
+                },
+            ))
             .on_drag_move::<ExternalPaths>(cx.listener(
                 |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
                     if !event.bounds.contains(&event.event.position) {
@@ -1322,12 +1527,12 @@ impl Render for FilesPanel {
                     cx.notify();
                 },
             ))
-            .on_drop::<PathBuf>(cx.listener(|this, source: &PathBuf, _, cx| {
+            .on_drop::<Vec<PathBuf>>(cx.listener(|this, sources: &Vec<PathBuf>, _, cx| {
                 this.drop_target = None;
                 let Some(workspace) = this.workspace.clone() else {
                     return;
                 };
-                this.move_into(source.clone(), workspace, cx);
+                this.move_into(sources.clone(), workspace, cx);
             }))
             .on_drop::<ExternalPaths>(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.drop_target = None;
@@ -1413,11 +1618,11 @@ fn valid_name(name: &str) -> bool {
     true
 }
 
-/// `name` in `directory`, or `name (2)`, `name (3)`… when taken, keeping the
-/// extension on files.
-fn unique_destination(directory: &Path, name: &OsStr) -> PathBuf {
+/// `name` in `directory`, or `name (2)`, `name (3)`… when taken on disk or
+/// already planned in `taken`, keeping the extension on files.
+fn unique_destination(directory: &Path, name: &OsStr, taken: &HashSet<PathBuf>) -> PathBuf {
     let destination = directory.join(name);
-    if !destination.exists() {
+    if !destination.exists() && !taken.contains(&destination) {
         return destination;
     }
     let base = Path::new(name);
@@ -1432,7 +1637,7 @@ fn unique_destination(directory: &Path, name: &OsStr) -> PathBuf {
             None => format!("{stem} ({counter})"),
         };
         let destination = directory.join(candidate);
-        if !destination.exists() {
+        if !destination.exists() && !taken.contains(&destination) {
             return destination;
         }
         counter += 1;
