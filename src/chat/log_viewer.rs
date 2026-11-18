@@ -28,7 +28,10 @@ pub(super) struct LogViewer {
 }
 
 impl ChatView {
-    #[expect(dead_code, reason = "the log button is hidden until the viewer is reworked")]
+    #[expect(
+        dead_code,
+        reason = "the log button is hidden until the viewer is reworked"
+    )]
     pub(super) fn open_log(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Row::Tool { status, log, .. }) = self.rows.get(row) else {
             return;

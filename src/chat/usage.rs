@@ -121,28 +121,6 @@ impl Extra {
     }
 }
 
-/// Session totals as pi's terminal footer shows them, empty parts left out:
-/// "↑509k ↓493k R155M W7.9M CH99.0%". The cache hit rate is the last turn's.
-pub(super) fn session_summary(stats: &Stats, last_turn: Option<&Turn>) -> String {
-    let mut parts = Vec::new();
-    for (prefix, tokens) in [
-        ("↑", stats.input),
-        ("↓", stats.output),
-        ("R", stats.cache_read),
-        ("W", stats.cache_write),
-    ] {
-        if tokens > 0 {
-            parts.push(format!("{prefix}{}", super::format_tokens(tokens)));
-        }
-    }
-    if (stats.cache_read > 0 || stats.cache_write > 0)
-        && let Some(hit) = last_turn.and_then(Turn::cached_fraction)
-    {
-        parts.push(format!("CH{:.1}%", hit * 100.));
-    }
-    parts.join(" ")
-}
-
 pub(super) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -255,11 +233,6 @@ mod tests {
         assert_eq!(extra.cache_left(1_230_000), Some(Duration::from_secs(70)));
         assert_eq!(extra.cache_left(9_000_000), Some(Duration::ZERO));
         assert_eq!(extra.limits[0].window_minutes, 300);
-        assert_eq!(
-            session_summary(&stats, extra.last_turn.as_ref()),
-            "↑509k ↓493k R155M W7.9M CH99.0%"
-        );
-        assert_eq!(session_summary(&Stats::default(), None), "");
     }
 
     #[test]

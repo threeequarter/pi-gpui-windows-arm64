@@ -101,6 +101,78 @@ impl ChatView {
             .into_any_element()
     }
 
+    /// The `@` file menu above the composer, styled like the slash menu.
+    pub(super) fn render_mention_menu(
+        &self,
+        matches: &[mention::Item],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let highlighted = self.mention_highlight.min(matches.len().saturating_sub(1));
+        let rows = matches.iter().enumerate().map(|(position, item)| {
+            let active = position == highlighted;
+            h_flex()
+                .id(("mention-item", position))
+                .h(ui_px(cx, 30.))
+                .px(px(10.))
+                .gap(px(8.))
+                .rounded(px(5.))
+                .cursor_pointer()
+                .when(active, |this| this.bg(colors.element_active))
+                .hover(|style| style.bg(colors.element_hover))
+                .on_click(cx.listener(move |this, _, _, cx| this.accept_mention(position, cx)))
+                .child(
+                    Label::new(item.name.clone())
+                        .size(LabelSize::Small)
+                        .weight(FontWeight::MEDIUM),
+                )
+                .child(
+                    div().flex_1().min_w(px(0.)).child(
+                        Label::new(item.path.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    ),
+                )
+        });
+
+        v_flex()
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom_full()
+            .mb(px(6.))
+            .occlude()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.elevated_surface_background)
+            .shadow_lg()
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("mention-items")
+                    .max_h(px(280.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.mention_scroll)
+                    .p(px(4.))
+                    .children(rows),
+            )
+            .child(
+                h_flex()
+                    .gap(px(12.))
+                    .px(px(12.))
+                    .py(px(6.))
+                    .border_t_1()
+                    .border_color(colors.border_variant)
+                    .child(hint("↑↓", "Select"))
+                    .child(hint("Tab", "Complete"))
+                    .child(hint("Enter", "Complete"))
+                    .child(hint("Esc", "Close")),
+            )
+            .into_any_element()
+    }
+
     pub(super) fn render_tree(&self, view: &TreeView, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
         let body = match &view.lines {
@@ -426,35 +498,6 @@ fn hint(keys: &'static str, label: &'static str) -> AnyElement {
 }
 
 impl ChatView {
-    /// Session token totals and the last turn's cache hit rate, as in pi's
-    /// terminal footer.
-    pub(super) fn render_session_stats(&self) -> Option<AnyElement> {
-        let stats = self.usage_stats.as_ref()?;
-        let last_turn = self
-            .usage_extra
-            .as_ref()
-            .and_then(|extra| extra.last_turn.as_ref());
-        let summary = usage::session_summary(stats, last_turn);
-        (!summary.is_empty()).then(|| {
-            div()
-                .id("session-stats")
-                .min_w(px(0.))
-                // The model chip already pads its side; this evens the gaps.
-                .pr(px(4.))
-                .tooltip(Tooltip::text(
-                    "↑ input, ↓ output, R cache read, W cache write: session totals. \
-                     CH: share of the last prompt served from the cache.",
-                ))
-                .child(
-                    Label::new(summary)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .truncate(),
-                )
-                .into_any_element()
-        })
-    }
-
     /// A small ring filled to the share of the context window in use; a click
     /// opens the usage popover.
     pub(super) fn render_usage_ring(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

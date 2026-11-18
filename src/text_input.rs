@@ -579,6 +579,19 @@ impl TextInput {
         cx.notify();
     }
 
+    /// The cursor offset (selection end), for completion tokens.
+    pub fn cursor(&self) -> usize {
+        self.selected_range.end
+    }
+
+    /// Replaces a range (a completion token) and puts the cursor after it.
+    pub fn replace_range(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        self.record_undo(EditKind::Other);
+        self.replace(range, text);
+        self.plugin_insertion = None;
+        cx.notify();
+    }
+
     /// Inserts at the cursor, replacing the selection. With `replace_last`,
     /// replaces the previous plugin insertion instead, as long as the cursor
     /// still sits right after it (the user has not moved or typed since).

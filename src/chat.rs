@@ -4,6 +4,7 @@ mod ansi;
 mod bootstrap;
 mod dialog;
 mod log_viewer;
+mod mention;
 mod overlays;
 mod plugin_prompt;
 mod plugin_view;
@@ -68,6 +69,10 @@ actions!(
         SlashDown,
         SlashComplete,
         SlashDismiss,
+        MentionUp,
+        MentionDown,
+        MentionComplete,
+        MentionDismiss,
         DialogUp,
         DialogDown,
         DialogConfirm,
@@ -82,6 +87,7 @@ const KEY_CONTEXT: &str = "Chat";
 const MODEL_PICKER_CONTEXT: &str = "ModelPicker";
 const TREE_CONTEXT: &str = "SessionTree";
 const SLASH_CONTEXT: &str = "SlashMenu";
+const MENTION_CONTEXT: &str = "MentionMenu";
 const EDIT_CONTEXT: &str = "MessageEdit";
 const COMPOSER_PLACEHOLDER: &str = "Message pi…";
 /// Ignore the chip click that arrives right after a click outside closed the picker.
@@ -159,6 +165,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("down", SlashDown, Some(SLASH_CONTEXT)),
         KeyBinding::new("tab", SlashComplete, Some(SLASH_CONTEXT)),
         KeyBinding::new("escape", SlashDismiss, Some(SLASH_CONTEXT)),
+        KeyBinding::new("up", MentionUp, Some(MENTION_CONTEXT)),
+        KeyBinding::new("down", MentionDown, Some(MENTION_CONTEXT)),
+        KeyBinding::new("tab", MentionComplete, Some(MENTION_CONTEXT)),
+        KeyBinding::new("escape", MentionDismiss, Some(MENTION_CONTEXT)),
         KeyBinding::new("up", DialogUp, Some(dialog::DIALOG_CONTEXT)),
         KeyBinding::new("down", DialogDown, Some(dialog::DIALOG_CONTEXT)),
         KeyBinding::new("enter", DialogConfirm, Some(dialog::DIALOG_CONTEXT)),
@@ -429,6 +439,16 @@ pub struct ChatView {
     /// Composer text at which the user closed the menu with Esc.
     slash_dismissed: Option<SharedString>,
     slash_scroll: ScrollHandle,
+    /// The `@token` being completed and its current suggestions.
+    mention: Option<mention::Menu>,
+    mention_highlight: usize,
+    /// Composer text at which the user closed the menu with Esc.
+    mention_dismissed: Option<SharedString>,
+    mention_scroll: ScrollHandle,
+    mention_generation: u64,
+    _mention_search: Task<()>,
+    /// fd next to pi or on PATH; `None` falls back to git/a bounded walk.
+    fd: Option<PathBuf>,
     compacting: bool,
     tree: Option<TreeView>,
     /// The full output of one tool call (the row's log button).
@@ -510,7 +530,9 @@ impl ChatView {
         // The send button's state depends on the composer text.
         let composer_subscription = cx.observe(&composer, |this, composer, cx| {
             this.slash_highlight = 0;
-            let menu_open = !this.slash_matches(cx).is_empty();
+            this.sync_mention(cx);
+            let menu_open =
+                !this.slash_matches(cx).is_empty() || !this.mention_matches(cx).is_empty();
             composer.update(cx, |composer, _| {
                 composer.set_vertical_passthrough(menu_open)
             });
@@ -555,6 +577,7 @@ impl ChatView {
         let selection =
             cx.new(|_| TextSelection::new(focus_handle.clone()).with_link_base(link_base));
         let selection_subscription = cx.observe(&selection, |_, _, cx| cx.notify());
+        let fd = mention::fd_binary(&installation);
         let mut this = Self {
             handle: remote::next_handle(),
             plugin_calls: HashMap::new(),
@@ -573,6 +596,13 @@ impl ChatView {
             slash_highlight: 0,
             slash_dismissed: None,
             slash_scroll: ScrollHandle::new(),
+            mention: None,
+            mention_highlight: 0,
+            mention_dismissed: None,
+            mention_scroll: ScrollHandle::new(),
+            mention_generation: 0,
+            _mention_search: Task::ready(()),
+            fd,
             compacting: false,
             tree: None,
             log_viewer: None,
@@ -813,6 +843,14 @@ impl ChatView {
         }
         if let Some(&index) = self.slash_matches(cx).get(self.slash_highlight) {
             self.accept_slash(index, true, window, cx);
+            return;
+        }
+        // Enter on an open `@` menu inserts the path instead of sending.
+        if !self.mention_matches(cx).is_empty() {
+            let index = self
+                .mention_highlight
+                .min(self.mention_matches(cx).len() - 1);
+            self.accept_mention(index, cx);
             return;
         }
         // Chips for pasted files and images become their paths here.
@@ -1465,6 +1503,141 @@ impl ChatView {
             self.composer
                 .update(cx, |composer, cx| composer.set_text(text, cx));
         }
+        cx.notify();
+    }
+
+    /// Tracks the `@token` at the cursor and (re)searches when it changes.
+    /// Runs on every composer change, including cursor moves.
+    fn sync_mention(&mut self, cx: &mut Context<Self>) {
+        let (text, cursor) = {
+            let composer = self.composer.read(cx);
+            (composer.text(), composer.cursor())
+        };
+        let token = if self.tree.is_some() || self.model_picker.is_some() {
+            None
+        } else {
+            mention::typed_token(&text, cursor)
+        };
+        let Some(token) = token else {
+            self.mention = None;
+            return;
+        };
+        let changed = self.mention.as_ref().is_none_or(|menu| {
+            menu.token.query != token.query || menu.token.quoted != token.quoted
+        });
+        if !changed {
+            if let Some(menu) = &mut self.mention {
+                menu.token = token;
+            }
+            return;
+        }
+        self.mention_generation += 1;
+        let generation = self.mention_generation;
+        self.mention = Some(mention::Menu {
+            token: token.clone(),
+            items: Vec::new(),
+            generation,
+        });
+        self.mention_highlight = 0;
+        let workspace = self.workspace.clone();
+        let fd = self.fd.clone();
+        let query = token.query;
+        let search =
+            cx.background_spawn(async move { mention::search(&workspace, fd.as_deref(), &query) });
+        self._mention_search = cx.spawn(async move |this, cx| {
+            let items = search.await;
+            this.update(cx, |this, cx| {
+                let Some(menu) = &mut this.mention else {
+                    return;
+                };
+                if menu.generation != generation {
+                    return;
+                }
+                menu.items = items;
+                this.mention_highlight = 0;
+                let menu_open =
+                    !this.slash_matches(cx).is_empty() || !this.mention_matches(cx).is_empty();
+                this.composer.update(cx, |composer, _| {
+                    composer.set_vertical_passthrough(menu_open)
+                });
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    /// Suggestions for the open `@` menu; empty while none is open.
+    fn mention_matches(&self, cx: &App) -> &[mention::Item] {
+        if self.tree.is_some() || self.model_picker.is_some() {
+            return &[];
+        }
+        let Some(menu) = &self.mention else {
+            return &[];
+        };
+        if self.mention_dismissed.as_ref() == Some(&self.composer.read(cx).text()) {
+            return &[];
+        }
+        &menu.items
+    }
+
+    fn move_mention_highlight(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.mention_matches(cx).len();
+        if count == 0 {
+            cx.propagate();
+            return;
+        }
+        self.mention_highlight =
+            (self.mention_highlight as isize + delta).rem_euclid(count as isize) as usize;
+        self.mention_scroll.scroll_to_item(self.mention_highlight);
+        cx.notify();
+    }
+
+    fn mention_up(&mut self, _: &MentionUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_mention_highlight(-1, cx);
+    }
+
+    fn mention_down(&mut self, _: &MentionDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_mention_highlight(1, cx);
+    }
+
+    fn mention_complete(&mut self, _: &MentionComplete, _: &mut Window, cx: &mut Context<Self>) {
+        let count = self.mention_matches(cx).len();
+        if count == 0 {
+            cx.propagate();
+            return;
+        }
+        self.accept_mention(self.mention_highlight.min(count - 1), cx);
+    }
+
+    fn mention_dismiss(&mut self, _: &MentionDismiss, _: &mut Window, cx: &mut Context<Self>) {
+        if self.mention_matches(cx).is_empty() {
+            cx.propagate();
+            return;
+        }
+        self.mention_dismissed = Some(self.composer.read(cx).text());
+        self.composer
+            .update(cx, |composer, _| composer.set_vertical_passthrough(false));
+        cx.notify();
+    }
+
+    /// Inserts the entry over the `@token`. Directories keep their trailing
+    /// `/` and no space, so the menu reopens scoped inside them; files get a
+    /// space and the menu closes.
+    fn accept_mention(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(menu) = &self.mention else {
+            return;
+        };
+        let Some(item) = menu.items.get(index).cloned() else {
+            return;
+        };
+        let token = menu.token.clone();
+        let mut value = mention::completion_value(&token, &item);
+        if !item.is_directory {
+            value.push(' ');
+        }
+        self.composer.update(cx, |composer, cx| {
+            composer.replace_range(token.range, &value, cx)
+        });
         cx.notify();
     }
 
@@ -3350,6 +3523,9 @@ impl ChatView {
         let slash_matches = self.slash_matches(cx);
         let slash_menu =
             (!slash_matches.is_empty()).then(|| self.render_slash_menu(&slash_matches, cx));
+        let mention_matches = self.mention_matches(cx);
+        let mention_menu =
+            (!mention_matches.is_empty()).then(|| self.render_mention_menu(mention_matches, cx));
         let has_text = !self.composer.read(cx).text().trim().is_empty();
 
         // Fixed height, so the list does not jump when activity appears.
@@ -3444,6 +3620,9 @@ impl ChatView {
                         v_flex()
                             .relative()
                             .when(slash_menu.is_some(), |this| this.key_context(SLASH_CONTEXT))
+                            .when(mention_menu.is_some(), |this| {
+                                this.key_context(MENTION_CONTEXT)
+                            })
                             // Files dropped from Finder become chips, like pasted ones.
                             .on_drop(cx.listener(
                                 |this, paths: &gpui::ExternalPaths, window, cx| {
@@ -3459,6 +3638,7 @@ impl ChatView {
                                 move |style, _, _, _| style.border_color(border)
                             })
                             .children(slash_menu)
+                            .children(mention_menu)
                             .w_full()
                             .rounded(px(8.))
                             .border_1()
@@ -3485,7 +3665,6 @@ impl ChatView {
                                             .min_w(px(0.))
                                             .gap(px(2.))
                                             .child(self.render_model_chip(cx))
-                                            .children(self.render_session_stats())
                                             .children(self.render_usage_ring(cx))
                                             .child(
                                                 IconButton::new("compact", IconName::Compact)
@@ -3631,6 +3810,10 @@ impl Render for ChatView {
             .on_action(cx.listener(Self::slash_down))
             .on_action(cx.listener(Self::slash_complete))
             .on_action(cx.listener(Self::slash_dismiss))
+            .on_action(cx.listener(Self::mention_up))
+            .on_action(cx.listener(Self::mention_down))
+            .on_action(cx.listener(Self::mention_complete))
+            .on_action(cx.listener(Self::mention_dismiss))
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::cancel_run))
             .on_action(cx.listener(Self::toggle_model_picker))

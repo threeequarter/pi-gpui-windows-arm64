@@ -40,7 +40,13 @@ impl Widgets {
         };
         let mut lines: Vec<StyledLine> = record["widgetLines"]
             .as_array()
-            .map(|lines| lines.iter().filter_map(Value::as_str).map(ansi::parse).collect())
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ansi::parse)
+                    .collect()
+            })
             .unwrap_or_default();
         while lines.last().is_some_and(|line| line.text.is_empty()) {
             lines.pop();
@@ -55,7 +61,13 @@ impl Widgets {
             Some(index) if lines.is_empty() => {
                 self.widgets.remove(index);
             }
-            Some(index) => self.widgets[index] = Widget { key: key.to_string(), placement, lines },
+            Some(index) => {
+                self.widgets[index] = Widget {
+                    key: key.to_string(),
+                    placement,
+                    lines,
+                }
+            }
             None if !lines.is_empty() => self.widgets.push(Widget {
                 key: key.to_string(),
                 placement,
@@ -96,10 +108,12 @@ impl Widgets {
                 let key = widget.key.clone();
                 let header = h_flex()
                     .gap(px(6.))
-                    .child(div().flex_1().min_w(px(0.)).child(render_line(
-                        &widget.lines[0],
-                        open,
-                    )))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(render_line(&widget.lines[0], open)),
+                    )
                     .child(disclosure_button(
                         ElementId::Name(format!("widget-disclosure:{key}").into()),
                         open,
@@ -109,7 +123,8 @@ impl Widgets {
                             cx.notify();
                         }),
                     ));
-                let rest = open.then(|| widget.lines[1..].iter().map(|line| render_line(line, true)));
+                let rest =
+                    open.then(|| widget.lines[1..].iter().map(|line| render_line(line, true)));
                 v_flex()
                     .pl(px(8.))
                     .pr(px(4.))
