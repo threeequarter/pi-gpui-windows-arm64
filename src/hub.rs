@@ -185,8 +185,6 @@ enum UpdatePopover {
 
 /// Text fields of the open Settings page (the other controls need no state).
 struct SettingsPage {
-    ui_font: Entity<TextInput>,
-    code_font: Entity<TextInput>,
     /// Text and number fields of plugin settings, by settings.json key.
     plugin_fields: std::collections::HashMap<String, Entity<TextInput>>,
 }
@@ -383,16 +381,6 @@ impl HubView {
                         continue;
                     };
                     let value = setting.text(&setting.value(&settings));
-                    input.update(cx, |input, cx| {
-                        if input.text() != value {
-                            input.set_text(value, cx);
-                        }
-                    });
-                }
-                for (input, value) in [
-                    (page.ui_font.clone(), settings.ui_font_family),
-                    (page.code_font.clone(), settings.buffer_font_family),
-                ] {
                     input.update(cx, |input, cx| {
                         if input.text() != value {
                             input.set_text(value, cx);
@@ -3412,19 +3400,8 @@ impl HubView {
     }
 
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
-        let settings = Settings::get(cx).clone();
-        let text_field =
-            |value: SharedString, placeholder: &'static str, cx: &mut Context<Self>| {
-                cx.new(|cx| {
-                    let mut input = TextInput::single_line(placeholder, cx);
-                    input.set_text(value, cx);
-                    input
-                })
-            };
         if self.settings_page.is_none() {
             self.settings_page = Some(SettingsPage {
-                ui_font: text_field(settings.ui_font_family.clone(), ".SystemUIFont", cx),
-                code_font: text_field(settings.buffer_font_family.clone(), "JetBrains Mono NL", cx),
                 plugin_fields: Default::default(),
             });
             self.ensure_plugin_fields(cx);
@@ -3512,33 +3489,12 @@ impl HubView {
         }
     }
 
-    /// Saves a font field when it is confirmed or loses focus.
-    fn commit_font_field(&mut self, key: &'static str, cx: &mut Context<Self>) {
-        let Some(page) = &self.settings_page else {
-            return;
-        };
-        let input = if key == "ui_font_family" {
-            &page.ui_font
-        } else {
-            &page.code_font
-        };
-        let text = input.read(cx).text().trim().to_string();
-        let current = match key {
-            "ui_font_family" => Settings::get(cx).ui_font_family.to_string(),
-            _ => Settings::get(cx).buffer_font_family.to_string(),
-        };
-        if !text.is_empty() && text != current {
-            settings::set(cx, key, json!(text));
-        }
-    }
-
     /// Zed-style settings: each row explains a setting and changes it in
-    /// place; the JSON file stays the source of truth and is one click away.
+    /// place; the JSON file stays the source of truth.
     fn render_settings_page(&self, page: &SettingsPage, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
         let current = Settings::get(cx).clone();
         let file = cx.global::<settings::SettingsFile>();
-        let path = file.path.clone();
         let error = file.error.clone();
 
         let row = |title: SharedString, description: SharedString, control: AnyElement| {
@@ -3617,12 +3573,6 @@ impl HubView {
             .into_any_element();
 
         let user_themes = cx.global::<settings::UserThemes>();
-        let themes_directory = user_themes.directory.clone();
-        let theme_names: Vec<SharedString> = user_themes
-            .themes
-            .iter()
-            .map(|theme| theme.name.clone())
-            .collect();
         let theme_problems: Vec<String> = user_themes
             .theme_error
             .iter()
@@ -3634,83 +3584,6 @@ impl HubView {
                     .map(|error| format!("Theme not loaded: {error}")),
             )
             .collect();
-        let custom_chips = (!theme_names.is_empty()).then(|| {
-            h_flex()
-                .flex_wrap()
-                .min_w(px(0.))
-                .max_w(px(320.))
-                .p(px(2.))
-                .gap(px(2.))
-                .rounded(px(7.))
-                .border_1()
-                .border_color(colors.border_variant)
-                .bg(colors.element_background)
-                .children(theme_names.into_iter().map(|name| {
-                    let selected = current.theme.eq_ignore_ascii_case(&name);
-                    div()
-                        .id(ElementId::Name(format!("user-theme-{name}").into()))
-                        .h(ui_px(cx, 24.))
-                        .px(px(10.))
-                        .flex()
-                        .items_center()
-                        .rounded(px(5.))
-                        .border_1()
-                        .cursor_pointer()
-                        .when(selected, |this| {
-                            this.bg(colors.elevated_surface_background)
-                                .border_color(colors.border)
-                        })
-                        .when(!selected, |this| {
-                            this.border_color(gpui::transparent_black())
-                                .hover(|style| style.bg(colors.ghost_element_hover))
-                        })
-                        .on_click({
-                            let name = name.clone();
-                            cx.listener(move |_, _, _, cx| {
-                                settings::set(cx, "theme", json!(name.to_string()));
-                            })
-                        })
-                        .child(Label::new(name).size(LabelSize::Small).color(if selected {
-                            Color::Default
-                        } else {
-                            Color::Muted
-                        }))
-                }))
-        });
-        let custom_control = h_flex()
-            .flex_wrap()
-            .justify_end()
-            .gap(px(6.))
-            .children(custom_chips)
-            .child(
-                Button::new("new-theme", "New theme")
-                    .icon(IconName::Plus)
-                    .on_click(
-                        cx.listener(|this, _, _, cx| match settings::create_theme_file() {
-                            Ok((path, name)) => {
-                                settings::set(cx, "theme", json!(name));
-                                open_in_editor(&path);
-                            }
-                            Err(error) => {
-                                this.notice = Some((
-                                    format!("Could not create a theme: {error}"),
-                                    Color::Warning,
-                                ));
-                                cx.notify();
-                            }
-                        }),
-                    ),
-            )
-            .child(
-                IconButton::new("open-themes-folder", IconName::FolderOpen)
-                    .tooltip(Tooltip::text("Open the themes folder"))
-                    .on_click(move |_, _, _| {
-                        std::fs::create_dir_all(&themes_directory).ok();
-                        platform::reveal_in_file_manager(&themes_directory);
-                    }),
-            )
-            .into_any_element();
-        let themes_label = sessions::display_path(&settings::themes_directory());
         let theme_banner = (!theme_problems.is_empty()).then(|| {
             v_flex()
                 .mt(px(8.))
@@ -3764,24 +3637,6 @@ impl HubView {
                 .into_any_element()
         };
 
-        let field = |key: &'static str, input: &Entity<TextInput>, cx: &mut Context<Self>| {
-            div()
-                .w(px(220.))
-                .rounded(px(6.))
-                .border_1()
-                .border_color(colors.border)
-                .bg(colors.editor_background)
-                .key_context(SETTINGS_FIELD_CONTEXT)
-                .on_action(cx.listener(move |this, _: &crate::chat::Submit, _, cx| {
-                    this.commit_font_field(key, cx)
-                }))
-                .on_mouse_down_out(
-                    cx.listener(move |this, _, _, cx| this.commit_font_field(key, cx)),
-                )
-                .child(input.clone())
-                .into_any_element()
-        };
-
         // Each plugin with settings gets its own group after the app's own.
         let mut plugin_rows: Vec<AnyElement> = Vec::new();
         for (name, settings) in self.plugins.read(cx).settings_sections() {
@@ -3796,43 +3651,11 @@ impl HubView {
             }
         }
 
-        let path_label = sessions::display_path(&path);
-        let header = h_flex()
-            .gap(px(12.))
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .gap(px(2.))
-                    .child(
-                        div()
-                            .text_size(px(20.) * Settings::get(cx).ui_scale())
-                            .line_height((px(28.) * Settings::get(cx).ui_scale()).round())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Settings"),
-                    )
-                    .child(
-                        Label::new(format!(
-                            "Saved in {path_label}. The file is the source of truth: edit it by hand or let an agent change it, and the app applies it on save."
-                        ))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                    ),
-            )
-            .child(
-                Button::new("open-settings-file", "Open settings.json")
-                    .icon(IconName::File)
-                    .style(ButtonStyle::Filled)
-                    .on_click({
-                        let path = path.clone();
-                        move |_, _, _| open_in_editor(&path)
-                    }),
-            )
-            .child(
-                IconButton::new("close-settings", IconName::Close)
-                    .tooltip(Tooltip::text("Close settings"))
-                    .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
-            );
+        let header = h_flex().justify_end().child(
+            IconButton::new("close-settings", IconName::Close)
+                .tooltip(Tooltip::text("Close settings"))
+                .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
+        );
 
         let error_banner = error.map(|error| {
             h_flex()
@@ -3872,21 +3695,8 @@ impl HubView {
                         "System follows the system light or dark mode and switches between the two Ayu themes.".into(),
                         theme_control,
                     ))
-                    .child(row(
-                        "Your themes".into(),
-                        format!(
-                            "JSON files in {themes_label}. Six colors are enough; Zed themes work too. Edits apply on save."
-                        )
-                        .into(),
-                        custom_control,
-                    ))
                     .children(theme_banner)
                     .child(group("Fonts".into()))
-                    .child(row(
-                        "Interface font".into(),
-                        "Font family of the whole interface. \".SystemUIFont\" is the system font.".into(),
-                        field("ui_font_family", &page.ui_font, cx),
-                    ))
                     .child(row(
                         "Interface size".into(),
                         "Text size of the title bar, sidebar, panels and tool cards.".into(),
@@ -3901,11 +3711,6 @@ impl HubView {
                         "Message size".into(),
                         "Text size of your messages and the agent's answers.".into(),
                         stepper("agent_font_size", current.agent_font_size, (8., 32.), cx),
-                    ))
-                    .child(row(
-                        "Code font".into(),
-                        "Font family of code blocks, tool output and inline code.".into(),
-                        field("buffer_font_family", &page.code_font, cx),
                     ))
                     .child(row(
                         "Code size".into(),

@@ -242,31 +242,6 @@ pub fn themes_directory() -> PathBuf {
         .join("themes")
 }
 
-/// Writes a new theme file from the template; returns its path and name.
-pub fn create_theme_file() -> Result<(PathBuf, String), String> {
-    let directory = themes_directory();
-    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    let path = (1..)
-        .map(|number| {
-            directory.join(if number == 1 {
-                "my-theme.json".to_string()
-            } else {
-                format!("my-theme-{number}.json")
-            })
-        })
-        .find(|path| !path.exists())
-        .unwrap_or_default();
-    let name = path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .replace("my-theme", "My Theme")
-        .replace('-', " ");
-    let text = user_theme::TEMPLATE.replace("\"My Theme\"", &format!("\"{name}\""));
-    std::fs::write(&path, text).map_err(|error| error.to_string())?;
-    Ok((path, name))
-}
-
 pub fn path() -> PathBuf {
     crate::sessions::app_data_directory()
         .unwrap_or_default()
