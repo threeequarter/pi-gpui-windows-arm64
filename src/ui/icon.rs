@@ -84,11 +84,13 @@ icons! {
     Sparkle => "sparkle",
     Star => "star",
     StarFilled => "star_filled",
+    Stash => "stash",
     Stop => "stop",
     Terminal => "terminal",
     Tool => "tool",
     Trash => "trash",
     Undo => "undo",
+    Unstash => "unstash",
     Warning => "warning",
 }
 

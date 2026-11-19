@@ -269,6 +269,8 @@ pub struct RepoStatus {
     pub nested: Vec<String>,
     /// Names of the configured remotes, filled by `remotes`.
     pub remotes: Vec<String>,
+    /// The Changes panel holds a stash entry, filled by `panel_stash`.
+    pub stashed: bool,
 }
 
 /// One changed path, as porcelain v2 reports it.
@@ -707,6 +709,104 @@ pub fn commit(root: &Path, mode: CommitMode, message: &str) -> Result<String, Gi
     git_with_env(root, &arguments, &[("GIT_EDITOR", "true")])
 }
 
+/// The message that marks the Changes panel's own stash entry. Other stash
+/// entries are never touched.
+const PANEL_STASH: &str = "pi-gpui: stashed from the Changes panel";
+
+/// The panel's stash entry, e.g. `stash@{2}`: other stashes pushed since move
+/// it down the stack.
+pub fn panel_stash(root: &Path) -> Result<Option<String>, GitError> {
+    let output = git(root, &["stash", "list", "--format=%gd%x00%gs"])?;
+    // The subject is "On <branch>: <message>".
+    let suffix = format!(": {PANEL_STASH}");
+    Ok(output.lines().find_map(|line| {
+        let (name, subject) = line.split_once('\0')?;
+        subject.ends_with(&suffix).then(|| name.to_string())
+    }))
+}
+
+/// Stashes the staged files as the panel's one stash entry. A partly staged
+/// file is staged fully first, so it leaves the work tree whole and comes
+/// back whole, staged. `--staged` rather than a pathspec: a pathspec cannot
+/// name a staged deletion or a rename source, which are no longer in the index.
+pub fn stash_staged(root: &Path) -> Result<(), GitError> {
+    if panel_stash(root)?.is_some() {
+        return Err(GitError::Failed(
+            "the panel already holds a stash; unstash it first".to_string(),
+        ));
+    }
+    let status = status(root)?;
+    if status.has_conflicts() {
+        return Err(GitError::Failed(
+            "the index has unresolved conflicts; resolve them before stashing".to_string(),
+        ));
+    }
+    if !status.has_staged() {
+        return Err(GitError::Failed(
+            "stage the files to stash first".to_string(),
+        ));
+    }
+    let partial: Vec<&StatusEntry> = status
+        .entries
+        .iter()
+        .filter(|entry| entry.staged && entry.unstaged)
+        .collect();
+    stage(root, &partial)?;
+    git(
+        root,
+        &[
+            "stash",
+            "push",
+            "--staged",
+            "--quiet",
+            "--message",
+            PANEL_STASH,
+        ],
+    )
+    .map(|_| ())
+}
+
+/// Restores the panel's stash entry, staged as it was, and drops it. Nothing
+/// changes when that would not apply cleanly: while anything is staged (git
+/// would refuse and unstage it as well), or when a stashed file was changed
+/// since, by uncommitted changes or by a commit.
+pub fn unstash(root: &Path) -> Result<(), GitError> {
+    let Some(entry) = panel_stash(root)? else {
+        return Err(GitError::Failed("the panel holds no stash".to_string()));
+    };
+    let status = status(root)?;
+    if status.has_staged() {
+        return Err(GitError::Failed(
+            "unstage everything first; git cannot restore a stash over staged changes".to_string(),
+        ));
+    }
+    let base = format!("{entry}^1");
+    let names = |from: &str, to: &str| {
+        git(
+            root,
+            &["diff", "--name-only", "--no-renames", "-z", from, to, "--"],
+        )
+    };
+    let stashed = names(&base, &entry)?;
+    let committed = names(&base, "HEAD")?;
+    let dirty = entry_paths(&status.entries.iter().collect::<Vec<_>>());
+    let changed = stashed.split('\0').find(|path| {
+        !path.is_empty()
+            && (dirty.contains(path)
+                || committed.split('\0').any(|other| other == *path)
+                || status
+                    .nested
+                    .iter()
+                    .any(|dir| path.starts_with(dir.as_str())))
+    });
+    if let Some(path) = changed {
+        return Err(GitError::Failed(format!(
+            "{path} changed since it was stashed; commit or discard that change first"
+        )));
+    }
+    git(root, &["stash", "pop", "--index", "--quiet", &entry]).map(|_| ())
+}
+
 /// The raw diff of what `mode` would commit, as the input for a generated commit
 /// message. Same argument set as `diff::load_changes`.
 pub fn generation_diff(root: &Path, mode: CommitMode) -> Result<String, GitError> {
@@ -772,8 +872,155 @@ pub fn pull(root: &Path) -> Result<String, String> {
     network(root, &["pull", "--ff-only"])
 }
 
+/// Pushes the current branch, first rebased onto the commits its push target
+/// has and it lacks (`rebase_onto_remote`).
 pub fn push(root: &Path) -> Result<String, String> {
+    if let Some((remote, tracking)) = push_destination(root) {
+        rebase_onto_remote(root, &remote, &tracking)?;
+    }
     network(root, &["push"])
+}
+
+/// The remote and remote-tracking ref of `@{push}`, where a bare `git push`
+/// goes. `None` while HEAD is detached or when git resolves no push target.
+fn push_destination(root: &Path) -> Option<(String, String)> {
+    let head = git(root, &["symbolic-ref", "--quiet", "HEAD"]).ok()?;
+    let output = git(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(push:remotename)%00%(push)",
+            head.trim(),
+        ],
+    )
+    .ok()?;
+    let (remote, tracking) = output.trim_end().split_once('\0')?;
+    (!remote.is_empty() && !tracking.is_empty()).then(|| (remote.to_string(), tracking.to_string()))
+}
+
+/// Fetches `remote`, then rebases the current branch onto `tracking` when it
+/// has commits the branch lacks, so the push that follows is a fast-forward
+/// instead of a rejection. Uncommitted changes are stashed around the rebase
+/// and come back staged as they were. When the rebase cannot apply cleanly
+/// nothing changes: uncommitted changes to a file the remote also changed
+/// stop it before it starts, and a conflicting commit aborts it.
+fn rebase_onto_remote(root: &Path, remote: &str, tracking: &str) -> Result<(), String> {
+    network(root, &["fetch", remote])?;
+    let upstream = tracking.strip_prefix("refs/remotes/").unwrap_or(tracking);
+    let range = format!("HEAD..{tracking}");
+    // Fails when the remote does not have the branch yet: nothing to rebase onto.
+    let behind = git(root, &["rev-list", "--count", &range, "--"]);
+    if !behind.is_ok_and(|count| count.trim() != "0") {
+        return Ok(());
+    }
+    if operation_in_progress(root) {
+        return Err(format!(
+            "{upstream} has new commits; finish the merge or rebase in progress first"
+        ));
+    }
+    let status = status(root).map_err(GitError::message)?;
+    let local = entry_paths(&status.entries.iter().collect::<Vec<_>>());
+    let changed = git(
+        root,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            &format!("HEAD...{tracking}"),
+            "--",
+        ],
+    )
+    .map_err(GitError::message)?;
+    let touched = changed.split('\0').find(|path| {
+        !path.is_empty()
+            && (local.contains(path)
+                || status
+                    .nested
+                    .iter()
+                    .any(|dir| path.starts_with(dir.as_str())))
+    });
+    if let Some(path) = touched {
+        return Err(format!(
+            "{upstream} has new commits that change {path}, which has uncommitted changes; \
+             commit or discard them, then push again"
+        ));
+    }
+    let stashed = if status.entries.iter().any(|entry| !entry.untracked) {
+        let before = stash_top(root);
+        git(
+            root,
+            &[
+                "stash",
+                "push",
+                "--quiet",
+                "--message",
+                "pi-gpui: before rebase",
+            ],
+        )
+        .map_err(GitError::message)?;
+        stash_top(root) != before
+    } else {
+        false
+    };
+    let rebased = git_with_env(root, &["rebase", tracking], &[("GIT_EDITOR", "true")]);
+    // A rebase stopped at a conflict leaves its state behind; one that never
+    // started (a hook, an untracked file in the way) does not.
+    let stopped = rebased.is_err() && operation_in_progress(root);
+    if stopped {
+        git(root, &["rebase", "--abort"]).ok();
+    }
+    let restored = if stashed {
+        git(root, &["stash", "pop", "--index", "--quiet"]).map(|_| ())
+    } else {
+        Ok(())
+    };
+    let failure = match rebased {
+        Ok(_) => None,
+        Err(_) if stopped => Some(format!(
+            "your commits conflict with the new ones on {upstream}; nothing was changed"
+        )),
+        Err(error) => Some(format!(
+            "could not rebase onto {upstream}: {}",
+            error.message()
+        )),
+    };
+    match (failure, restored) {
+        (None, Ok(())) => Ok(()),
+        (Some(failure), Ok(())) => Err(failure),
+        (failure, Err(error)) => Err(format!(
+            "{}restoring the uncommitted changes failed, they are kept in the stash: {}",
+            failure
+                .map(|failure| format!("{failure}; "))
+                .unwrap_or_default(),
+            error.message()
+        )),
+    }
+}
+
+/// The newest stash entry, to tell whether `git stash push` saved one.
+fn stash_top(root: &Path) -> Option<String> {
+    git(root, &["rev-parse", "--verify", "--quiet", "refs/stash"]).ok()
+}
+
+/// A merge, rebase, cherry-pick or revert waiting to be finished. True when
+/// git cannot tell, so no rebase starts or aborts on a guess.
+fn operation_in_progress(root: &Path) -> bool {
+    let mut arguments = vec!["rev-parse"];
+    for marker in [
+        "rebase-merge",
+        "rebase-apply",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+    ] {
+        arguments.extend(["--git-path", marker]);
+    }
+    match git(root, &arguments) {
+        // Relative to `root`, which `git -C` made the working directory.
+        Ok(output) => output.lines().any(|path| root.join(path).exists()),
+        Err(_) => true,
+    }
 }
 
 /// Where Pull and Push go when the user picks a remote: the upstream branch
@@ -815,7 +1062,10 @@ pub fn pull_from(root: &Path, target: &RemoteTarget) -> Result<String, String> {
     )
 }
 
+/// Pushes the current branch to the target, first rebased onto it like `push`.
 pub fn push_to(root: &Path, target: &RemoteTarget) -> Result<String, String> {
+    let tracking = format!("refs/remotes/{}/{}", target.remote, target.remote_branch);
+    rebase_onto_remote(root, &target.remote, &tracking)?;
     let refspec = format!("{}:{}", target.local_branch, target.remote_branch);
     let mut arguments = vec!["push"];
     if target.set_upstream {

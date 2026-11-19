@@ -95,7 +95,7 @@ On Linux `⌘` is `Ctrl` and `⌥` is `Alt`, with one exception: compact is `Ctr
 
 The Changes panel is a small git client for the active session's project.
 
-- **Staging.** Each file has a checkbox showing the git index: empty (unstaged or untracked), a dash (partly staged), checked (staged). Clicking stages the file fully, or unstages it when it is checked. Stage All / Unstage All work on everything. Clicking the row still opens the diff, which always shows the working tree against HEAD.
+- **Staging.** Each file has a checkbox showing the git index: empty (unstaged or untracked), a dash (partly staged), checked (staged). Clicking stages the file fully, or unstages it when it is checked. Stage All / Unstage All work on everything. Stash, shown once something is staged, stashes the staged files (a partly staged file goes whole) as the panel's one stash; while it exists the button reads Unstash and brings them back staged. Unstash changes nothing and shows an error while anything is staged or when a stashed file was changed since. Stashes made outside the panel are left alone. Clicking the row still opens the diff, which always shows the working tree against HEAD.
 - **Commit.** What the Commit button does depends on the Amend checkbox and on whether anything is staged:
 
   | Amend | Staged | Button | Commits |
@@ -108,7 +108,7 @@ The Changes panel is a small git client for the active session's project.
   Untracked files are never committed unless you stage them. An amend with an empty message keeps the last commit's message. Git never opens an editor, and a conflicted index blocks the commit.
 - **Keys.** In the message box `↩` is a new line and `⌘↩` commits.
 - **Generate** (the sparkle button) asks your installed pi to write the message from exactly what Commit would take, in one-shot print mode with no session file and no tools. The prompt is `commit_message_instructions` and the model `commit_message_model` in `settings.json` (an empty model means pi's default). The button is off when pi is missing or too old for print mode.
-- **Branch bar.** Branch name, commits ahead/behind the upstream, and Fetch, Pull and Push. Pull is `git pull --ff-only`: a diverged branch fails with git's message instead of creating a merge. Network calls never wait for a typed password: terminal and askpass prompts are off, so missing credentials fail at once with git's error, while a credential manager or ssh-agent keeps working. Errors show in a strip above the message box.
+- **Branch bar.** Branch name, commits ahead/behind the upstream, and Fetch, Pull and Push. Pull is `git pull --ff-only`: a diverged branch fails with git's message instead of creating a merge. Push first fetches the remote and, when the target branch has commits yours lacks, rebases your branch onto them; uncommitted changes are stashed around the rebase and come back staged as they were. When the rebase would conflict, or the new commits touch a file you have uncommitted changes in, nothing changes and Push shows an error. Network calls never wait for a typed password: terminal and askpass prompts are off, so missing credentials fail at once with git's error, while a credential manager or ssh-agent keeps working. Errors show in a strip above the message box.
 
 ## Settings
 

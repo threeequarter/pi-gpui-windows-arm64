@@ -146,6 +146,8 @@ enum GitAction {
     ToggleFile,
     StageAll,
     UnstageAll,
+    Stash,
+    Unstash,
     Discard,
     SwitchBranch,
     CreateBranch,
@@ -163,6 +165,8 @@ impl GitAction {
         match self {
             GitAction::ToggleFile | GitAction::StageAll => "Staging…",
             GitAction::UnstageAll => "Unstaging…",
+            GitAction::Stash => "Stashing…",
+            GitAction::Unstash => "Unstashing…",
             GitAction::Discard => "Discarding…",
             GitAction::SwitchBranch => "Switching branch…",
             GitAction::CreateBranch => "Creating branch…",
@@ -180,6 +184,8 @@ impl GitAction {
             GitAction::ToggleFile => "Staging failed",
             GitAction::StageAll => "Stage All failed",
             GitAction::UnstageAll => "Unstage All failed",
+            GitAction::Stash => "Stash failed",
+            GitAction::Unstash => "Unstash failed",
             GitAction::Discard => "Discarding changes failed",
             GitAction::SwitchBranch => "Switching branch failed",
             GitAction::CreateBranch => "Creating the branch failed",
@@ -668,6 +674,23 @@ impl DiffPanel {
             |root| git::unstage_all(root).map_err(GitError::message),
             cx,
         );
+    }
+
+    /// Stashes the staged files, or restores the panel's stash when it holds one.
+    fn toggle_stash(&mut self, cx: &mut Context<Self>) {
+        if self.status().is_some_and(|status| status.stashed) {
+            self.run_git(
+                GitAction::Unstash,
+                |root| git::unstash(root).map_err(GitError::message),
+                cx,
+            );
+        } else {
+            self.run_git(
+                GitAction::Stash,
+                |root| git::stash_staged(root).map_err(GitError::message),
+                cx,
+            );
+        }
     }
 
     /// Pull and Push ask for the remote first when there are several.
@@ -1213,12 +1236,28 @@ impl DiffPanel {
             .into_any_element()
     }
 
-    /// The diff summary and the bulk staging buttons.
+    /// The diff summary, the stash button and the bulk staging buttons.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
         let staging = self.status().map(|status| {
             let can_stage = status.entries.iter().any(|entry| entry.unstaged);
             (can_stage, status.has_staged())
+        });
+        // Unstash while the panel holds a stash, Stash once something is staged.
+        let stash = self.status().and_then(|status| {
+            if status.stashed {
+                Some((
+                    IconName::Unstash,
+                    GitAction::Unstash,
+                    "Unstash: restore the stashed files, staged, and drop the stash",
+                ))
+            } else {
+                status.has_staged().then_some((
+                    IconName::Stash,
+                    GitAction::Stash,
+                    "Stash: put the staged files aside; a partly staged file goes whole",
+                ))
+            }
         });
         h_flex()
             .flex_none()
@@ -1239,6 +1278,17 @@ impl DiffPanel {
                             .truncate()
                     })),
             )
+            .when_some(stash, |this, (icon, action, tooltip)| {
+                this.child(
+                    IconButton::new("stash", icon)
+                        .size(ButtonSize::Compact)
+                        .icon_size(IconSize::XSmall)
+                        .loading(self.busy == Some(action))
+                        .disabled(self.busy.is_some())
+                        .tooltip(Tooltip::text(tooltip))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_stash(cx))),
+                )
+            })
             .when_some(staging, |this, (can_stage, can_unstage)| {
                 this.child(
                     IconButton::new("stage-all", IconName::Plus)
@@ -1484,16 +1534,23 @@ fn load_repository(
         return Ok(None);
     };
     // Every git run here is independent, so they all run at once.
-    let (changes, status, remotes) = std::thread::scope(|scope| {
+    let (changes, status, remotes, stash) = std::thread::scope(|scope| {
         let status = scope.spawn(|| git::status(&root));
         let remotes = scope.spawn(|| git::remotes(&root));
+        let stash = scope.spawn(|| git::panel_stash(&root));
         let changes = load_changes(root.clone());
-        (changes, git::joined(status), git::joined(remotes))
+        (
+            changes,
+            git::joined(status),
+            git::joined(remotes),
+            git::joined(stash),
+        )
     });
     let changes = changes?;
     let mut status = status.map_err(GitError::message)?;
     // The remotes only feed the remote picker; the panel works without them.
     status.remotes = remotes.unwrap_or_default();
+    status.stashed = stash.is_ok_and(|stash| stash.is_some());
     Ok(Some((repositories, changes, status)))
 }
 
