@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use gpui::{
-    AnyElement, Bounds, ClickEvent, Context, DragMoveEvent, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable as _, KeyBinding, MouseButton, MouseDownEvent, Pixels, Point,
-    ScrollStrategy, SharedString, Task, UniformListScrollHandle, Window, actions, anchored, canvas,
-    deferred, div, px, uniform_list,
+    AnyElement, Bounds, ClickEvent, Context, DragMoveEvent, ElementId, Entity, EventEmitter,
+    ExternalPaths, FocusHandle, Focusable as _, KeyBinding, MouseButton, MouseDownEvent, Pixels,
+    Point, ScrollStrategy, SharedString, Task, UniformListScrollHandle, Window, actions, anchored,
+    canvas, deferred, div, px, uniform_list,
 };
 
 use crate::diff::FileStatus;
@@ -343,6 +343,30 @@ impl FilesPanel {
     }
 
     fn push_rows(&self, directory: &Path, depth: usize, rows: &mut Vec<VisibleRow>) {
+        self.push_edit_row(directory, depth, rows);
+        let Some(entries) = self.children.get(directory) else {
+            return;
+        };
+        for entry in entries {
+            rows.push(VisibleRow {
+                entry: entry.clone(),
+                depth,
+                editing: false,
+            });
+            if entry.is_dir && self.expanded.contains(&entry.path) {
+                // A folded ancestor lists nothing but the next folder, so
+                // its input row appears here, above the leaf's children.
+                for folder in &entry.folded {
+                    self.push_edit_row(folder, depth + 1, rows);
+                }
+                self.push_rows(&entry.path, depth + 1, rows);
+            }
+        }
+    }
+
+    /// The input row for a new file or folder, at the top of `directory`'s
+    /// listing; a no-op for every other directory.
+    fn push_edit_row(&self, directory: &Path, depth: usize, rows: &mut Vec<VisibleRow>) {
         if let Some(editing) = &self.editing
             && !matches!(editing.kind, EditKind::Rename(_))
             && editing.directory == directory
@@ -357,19 +381,6 @@ impl FilesPanel {
                 depth,
                 editing: true,
             });
-        }
-        let Some(entries) = self.children.get(directory) else {
-            return;
-        };
-        for entry in entries {
-            rows.push(VisibleRow {
-                entry: entry.clone(),
-                depth,
-                editing: false,
-            });
-            if entry.is_dir && self.expanded.contains(&entry.path) {
-                self.push_rows(&entry.path, depth + 1, rows);
-            }
         }
     }
 
@@ -666,6 +677,17 @@ impl FilesPanel {
             input.update(cx, |input, cx| input.select_all_text(cx));
         } else {
             self.expanded.insert(directory.clone());
+            // A new item in a folded ancestor opens the whole chain, so
+            // the input row has a listing to appear in.
+            if let Some(entry) = self
+                .rows
+                .iter()
+                .map(|row| &row.entry)
+                .find(|entry| entry.folded.contains(&directory))
+            {
+                self.expanded.extend(entry.folded.iter().cloned());
+                self.expanded.insert(entry.path.clone());
+            }
             self.refresh(cx);
         }
         self.editing = Some(Editing {
@@ -731,7 +753,19 @@ impl FilesPanel {
         window.focus(&self.focus_handle);
         self.edit_anchor = None;
         self.rebuild_rows();
-        self.select_only(destination.clone());
+        let mut selected_path = destination.clone();
+        if let EditKind::Rename(source) = &editing.kind
+            && let Some(row) = self
+                .rows
+                .iter()
+                .find(|row| row.entry.folded.contains(source))
+        {
+            // Renaming a folded ancestor moves the whole chain; keep the
+            // cursor on the row, whose path moves with it.
+            selected_path =
+                destination.join(row.entry.path.strip_prefix(source).unwrap_or(Path::new("")));
+        }
+        self.select_only(selected_path);
         match editing.kind {
             EditKind::Rename(source) => self.run_file_job(
                 move || {
@@ -1006,13 +1040,17 @@ impl FilesPanel {
                 };
                 let rename_input = match &self.editing {
                     Some(editing) => match &editing.kind {
-                        EditKind::Rename(path) if *path == entry.path => {
+                        EditKind::Rename(path)
+                            if *path == entry.path || entry.folded.contains(path) =>
+                        {
                             Some(editing.input.clone())
                         }
                         _ => None,
                     },
                     None => None,
                 };
+                let folded = entry.folded.clone();
+                let leaf_path = entry.path.clone();
                 let mut element = h_flex()
                     .id(("file-row", index))
                     .w_full()
@@ -1037,19 +1075,13 @@ impl FilesPanel {
                         .on_mouse_down(
                             MouseButton::Right,
                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                window.focus(&this.focus_handle);
-                                this.selected = Some(menu_path.clone());
-                                if !this.selection.contains(&menu_path) {
-                                    this.select_only(menu_path.clone());
-                                }
-                                this.menu = Some(FileMenu {
-                                    path: menu_path.clone(),
-                                    paths: this.selected_paths(),
-                                    position: event.position,
-                                    clipboard: platform::read_file_clipboard(),
-                                });
-                                cx.stop_propagation();
-                                cx.notify();
+                                this.open_menu(
+                                    menu_path.clone(),
+                                    menu_path.clone(),
+                                    event.position,
+                                    window,
+                                    cx,
+                                );
                             }),
                         )
                         .on_drag(drag_paths, move |_, offset, _, cx| {
@@ -1116,16 +1148,67 @@ impl FilesPanel {
                         .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
                         .child(match rename_input {
                             Some(_) => self.edit_anchor_canvas(cx),
-                            None => div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .child(
+                            None => {
+                                let label = if folded.is_empty() {
                                     Label::new(name)
                                         .size(LabelSize::Small)
                                         .color(color)
-                                        .truncate(),
-                                )
-                                .into_any_element(),
+                                        .truncate()
+                                        .into_any_element()
+                                } else {
+                                    // Each segment of a folded chain opens
+                                    // the menu for its own folder.
+                                    let mut segments = h_flex().w_full();
+                                    for (segment, folder) in
+                                        folded.iter().chain(std::iter::once(&leaf_path)).enumerate()
+                                    {
+                                        if segment > 0 {
+                                            segments = segments.child(div().flex_none().child(
+                                                Label::new("/").size(LabelSize::Small).color(color),
+                                            ));
+                                        }
+                                        let target = folder.clone();
+                                        let row_path = leaf_path.clone();
+                                        segments = segments.child(
+                                            div()
+                                                .id(ElementId::Path(folder.clone().into()))
+                                                .min_w(px(0.))
+                                                .cursor_pointer()
+                                                .on_mouse_down(
+                                                    MouseButton::Right,
+                                                    cx.listener(
+                                                        move |this,
+                                                              event: &MouseDownEvent,
+                                                              window,
+                                                              cx| {
+                                                            this.open_menu(
+                                                                target.clone(),
+                                                                row_path.clone(),
+                                                                event.position,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    ),
+                                                )
+                                                .child(
+                                                    Label::new(
+                                                        folder
+                                                            .file_name()
+                                                            .unwrap_or_default()
+                                                            .to_string_lossy()
+                                                            .into_owned(),
+                                                    )
+                                                    .size(LabelSize::Small)
+                                                    .color(color)
+                                                    .truncate(),
+                                                ),
+                                        );
+                                    }
+                                    segments.into_any_element()
+                                };
+                                div().flex_1().min_w(px(0.)).child(label).into_any_element()
+                            }
                         })
                         .when(additions > 0, |this| {
                             this.child(
@@ -1145,6 +1228,37 @@ impl FilesPanel {
                 )
             })
             .collect()
+    }
+
+    /// The right-click menu for one path of a row. A folded row's segments
+    /// each pass their own folder; the selection stays on the row, and a
+    /// segment above the leaf is a single-target menu.
+    fn open_menu(
+        &mut self,
+        target: PathBuf,
+        row_path: PathBuf,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle);
+        self.selected = Some(row_path.clone());
+        if !self.selection.contains(&row_path) {
+            self.select_only(row_path.clone());
+        }
+        let paths = if target == row_path {
+            self.selected_paths()
+        } else {
+            vec![target.clone()]
+        };
+        self.menu = Some(FileMenu {
+            path: target,
+            paths,
+            position,
+            clipboard: platform::read_file_clipboard(),
+        });
+        cx.stop_propagation();
+        cx.notify();
     }
 
     fn render_menu(&self, menu: &FileMenu, cx: &mut Context<Self>) -> AnyElement {
