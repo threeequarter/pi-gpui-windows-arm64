@@ -22,6 +22,7 @@ use crate::diff::{DiffPanel, DiffPanelEvent};
 use crate::dock::{DockSide, Docks, PanelKind};
 use crate::file_tree::{FilesEvent, FilesPanel};
 use crate::file_viewer::{FileViewer, ViewMode};
+use crate::mcp;
 use crate::pi::{self, Installation};
 use crate::pi_updates;
 use crate::platform;
@@ -348,6 +349,12 @@ pub struct HubView {
     /// What `pi update` is doing right now.
     pi_updating: Option<String>,
     _pi_updates_task: Task<()>,
+    /// User-level MCP servers as `pi mcp list` last reported them.
+    mcp_servers: Vec<mcp::Server>,
+    /// Why the last MCP check gave no report.
+    mcp_error: Option<String>,
+    mcp_checking: bool,
+    _mcp_task: Task<()>,
     focus_handle: FocusHandle,
     plugins: Entity<PluginRegistry>,
     _plugin_subscriptions: Vec<Subscription>,
@@ -504,6 +511,10 @@ impl HubView {
             update_popover_closed_at: None,
             pi_updating: None,
             _pi_updates_task: Task::ready(()),
+            mcp_servers: Vec::new(),
+            mcp_error: None,
+            mcp_checking: false,
+            _mcp_task: Task::ready(()),
             focus_handle: cx.focus_handle(),
             plugins,
             _plugin_subscriptions: plugin_subscriptions,
@@ -666,6 +677,7 @@ impl HubView {
                             Color::Default,
                         ));
                         this.check_pi_updates(cx);
+                        this.check_mcp(cx);
                     }
                     Err(error) => {
                         eprintln!("pi-gpui: {error}");
@@ -766,6 +778,7 @@ impl HubView {
                         this.installation = InstallationState::Ready(installation);
                         this.sync_diff_installation(cx);
                         this.check_pi_updates(cx);
+                        this.check_mcp(cx);
                         match this.pending_open.take() {
                             Some((path, Some(session))) => this.open_session(&path, session, cx),
                             Some((path, None)) => this.start_chat(&path, None, cx),
@@ -1616,6 +1629,9 @@ impl HubView {
                 let workspace = chat.read(cx).workspace().to_path_buf();
                 self.start_chat(&workspace, None, cx);
             }
+            // Every session reports at startup; one check answers them all.
+            ChatEvent::McpAttention if !self.mcp_checking => self.check_mcp(cx),
+            ChatEvent::McpAttention => {}
             ChatEvent::Settled => {
                 // The run is written to disk now; refresh titles and order.
                 let workspace = chat.read(cx).workspace().to_path_buf();
@@ -3124,13 +3140,16 @@ impl HubView {
                     .child(Spinner::new().size(IconSize::XSmall))
                     .child(LoadingLabel::new("Checking pi…").size(LabelSize::Small)),
             ),
-            InstallationState::Ready(_) => {
+            InstallationState::Ready(installation) => {
                 let buttons = self.render_update_buttons(cx);
-                // Nothing to report: no footer at all, not an empty strip.
-                if buttons.is_empty() {
-                    return div();
-                }
-                footer.child(h_flex().gap(px(6.)).child(div().flex_1()).children(buttons))
+                footer.children(self.render_mcp_status(cx)).child(
+                    h_flex()
+                        .gap(px(6.))
+                        .child(self.render_pi_version(installation))
+                        .child(div().flex_1())
+                        .children(buttons)
+                        .child(self.render_session_count(cx)),
+                )
             }
             InstallationState::Failed(error) => {
                 let (color, label) = match error {
@@ -3152,10 +3171,12 @@ impl HubView {
                     ),
                 };
                 footer.child(
-                    h_flex()
-                        .gap(px(6.))
-                        .child(Indicator::dot(color))
-                        .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
+                    h_flex().gap(px(6.)).child(Indicator::dot(color)).child(
+                        div()
+                            .relative()
+                            .top(px(-1.))
+                            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
+                    ),
                 )
             }
         }
@@ -3841,6 +3862,42 @@ impl HubView {
         });
     }
 
+    fn check_mcp(&mut self, cx: &mut Context<Self>) {
+        let InstallationState::Ready(installation) = &self.installation else {
+            return;
+        };
+        let installation = installation.clone();
+        self.mcp_checking = true;
+        let check = cx.background_spawn(async move { mcp::list(&installation) });
+        self._mcp_task = cx.spawn(async move |this, cx| {
+            let result = check.await;
+            this.update(cx, |this, cx| {
+                this.mcp_checking = false;
+                match result {
+                    Ok(servers) => {
+                        this.mcp_servers = servers;
+                        this.mcp_error = None;
+                    }
+                    Err(error) => {
+                        eprintln!("pi-gpui: pi mcp list: {error}");
+                        this.mcp_error = Some(error);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        cx.notify();
+    }
+
+    /// Reconnects `server` in every open session, then checks it again.
+    fn reconnect_mcp(&mut self, server: &str, cx: &mut Context<Self>) {
+        for chat in self.open_chats() {
+            chat.update(cx, |chat, _| chat.reconnect_mcp(server));
+        }
+        self.check_mcp(cx);
+    }
+
     fn toggle_update_popover(&mut self, popover: UpdatePopover, cx: &mut Context<Self>) {
         if self.update_popover == Some(popover) {
             self.update_popover = None;
@@ -3920,7 +3977,150 @@ impl HubView {
         cx.notify();
     }
 
-    /// Sidebar footer buttons: a pi update and package updates.
+    fn render_pi_version(&self, installation: &Installation) -> AnyElement {
+        let untested = pi::is_untested(installation.version);
+        h_flex()
+            .id("pi-version")
+            .gap(px(6.))
+            .child(Indicator::dot(if untested {
+                Color::Warning
+            } else {
+                Color::Success
+            }))
+            .child(
+                div().relative().top(px(-1.)).child(
+                    Label::new(if untested {
+                        format!("pi {} · not tested yet", installation.version)
+                    } else {
+                        format!("pi {}", installation.version)
+                    })
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                ),
+            )
+            .when(untested, |this| {
+                this.tooltip(Tooltip::text(format!(
+                    "This app was tested with pi up to {}.{}.x. It should work; check for app updates.",
+                    pi::TESTED_PI.major,
+                    pi::TESTED_PI.minor
+                )))
+            })
+            .into_any_element()
+    }
+
+    /// One line per MCP server, above the pi line.
+    fn render_mcp_status(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        if let Some(error) = &self.mcp_error {
+            return vec![
+                h_flex()
+                    .id("mcp-error")
+                    .gap(px(6.))
+                    .child(Indicator::dot(Color::Warning))
+                    .child(
+                        Label::new("MCP status unavailable")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .tooltip(Tooltip::text(error.clone()))
+                    .into_any_element(),
+            ];
+        }
+        self.mcp_servers
+            .iter()
+            .enumerate()
+            .map(|(index, server)| {
+                let color = match server.state {
+                    mcp::State::Connected => Color::Success,
+                    mcp::State::NeedsAuth => Color::Warning,
+                    mcp::State::Failed | mcp::State::Other => Color::Error,
+                    mcp::State::Disabled => Color::Placeholder,
+                };
+                let name = server.name.clone();
+                h_flex()
+                    .id(("mcp-server", index))
+                    .gap(px(6.))
+                    .child(Indicator::dot(color))
+                    .child(
+                        // A pixel up: at this size Segoe UI sets lowercase text
+                        // below the line box's middle, under the dot and icons.
+                        h_flex()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .relative()
+                            .top(px(-1.))
+                            .gap(px(6.))
+                            .child(
+                                Label::new(server.name.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
+                            // The green dot already says connected.
+                            .when(server.state != mcp::State::Connected, |this| {
+                                this.child(
+                                    Label::new(server.summary())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Placeholder),
+                                )
+                            }),
+                    )
+                    .when_some(server.error.clone(), |this, error| {
+                        this.tooltip(Tooltip::text(error))
+                    })
+                    .when(server.state != mcp::State::Disabled, |this| {
+                        this.child(
+                            IconButton::new(("mcp-reconnect", index), IconName::Refresh)
+                                .size(ButtonSize::Compact)
+                                .icon_size(IconSize::XSmall)
+                                .loading(self.mcp_checking)
+                                .tooltip(Tooltip::text(format!("Reconnect {name}")))
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.reconnect_mcp(&name, cx)
+                                    }),
+                                ),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// How many pi processes the open sessions run, and a restart for all.
+    fn render_session_count(&self, cx: &mut Context<Self>) -> AnyElement {
+        let chats = self.open_chats();
+        let live = chats
+            .iter()
+            .filter(|chat| chat.read(cx).status() != ChatStatus::Stopped)
+            .count();
+        let label = match live {
+            1 => "1 session".to_string(),
+            count => format!("{count} sessions"),
+        };
+        h_flex()
+            .gap(px(2.))
+            .child(
+                div()
+                    .relative()
+                    .top(px(-1.))
+                    .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
+            )
+            .when(!chats.is_empty(), |this| {
+                this.child(
+                    IconButton::new("restart-pi-processes", IconName::Refresh)
+                        .size(ButtonSize::Compact)
+                        .icon_size(IconSize::XSmall)
+                        .loading(self.reloading_sessions)
+                        .tooltip(Tooltip::with_keys("Restart all pi processes", "⌘⇧R"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.reload_sessions(&ReloadSessions, window, cx)
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Buttons next to the pi version: a pi update and package updates.
     fn render_update_buttons(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut buttons = Vec::new();
         if let Some(label) = &self.pi_updating {
@@ -4216,10 +4416,10 @@ impl HubView {
             Color::Muted
         };
 
-        let (breadcrumb, status) = match &self.active_chat {
+        let breadcrumb = match &self.active_chat {
             Some(chat) => {
                 let chat = chat.read(cx);
-                let breadcrumb = Self::project_crumb(chat.workspace(), cx)
+                Self::project_crumb(chat.workspace(), cx)
                     .child(
                         div().relative().top(px(1.)).child(
                             Icon::new(IconName::ChevronRight)
@@ -4236,53 +4436,24 @@ impl HubView {
                                 .truncate(),
                         ),
                     )
-                    .into_any_element();
-                let status = match chat.status() {
-                    ChatStatus::Busy => h_flex()
-                        .gap(px(6.))
-                        .child(Spinner::new().size(IconSize::XSmall).color(Color::Accent))
-                        .child(LoadingLabel::new("Working").size(LabelSize::Small)),
-                    ChatStatus::Ready => h_flex()
-                        .gap(px(6.))
-                        .child(Indicator::dot(Color::Success))
-                        .child(
-                            Label::new("Ready")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
-                    ChatStatus::Stopped => h_flex()
-                        .gap(px(6.))
-                        .child(Indicator::dot(Color::Error))
-                        .child(
-                            Label::new("Stopped")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
-                };
-                (breadcrumb, Some(status))
+                    .into_any_element()
             }
             None => match &self.selected_project {
-                Some(workspace) => (Self::project_crumb(workspace, cx).into_any_element(), None),
-                None => (
-                    Label::new("Pi GPUI")
-                        .size(LabelSize::Small)
-                        .color(Color::Placeholder)
-                        .into_any_element(),
-                    None,
-                ),
+                Some(workspace) => Self::project_crumb(workspace, cx).into_any_element(),
+                None => Label::new("Pi GPUI")
+                    .size(LabelSize::Small)
+                    .color(Color::Placeholder)
+                    .into_any_element(),
             },
         };
-        let (breadcrumb, status) = if self.settings_page.is_some() {
-            (
-                Label::new("Settings")
-                    .size(LabelSize::Small)
-                    .weight(FontWeight::MEDIUM)
-                    .color(text_color)
-                    .into_any_element(),
-                None,
-            )
+        let breadcrumb = if self.settings_page.is_some() {
+            Label::new("Settings")
+                .size(LabelSize::Small)
+                .weight(FontWeight::MEDIUM)
+                .color(text_color)
+                .into_any_element()
         } else {
-            (breadcrumb, status)
+            breadcrumb
         };
 
         let plugin_statuses: Vec<AnyElement> = self
@@ -4403,21 +4574,7 @@ impl HubView {
                         }
                     })
                     .children(plugin_statuses)
-                    .children(status)
                     .children(self.render_update_chip(cx))
-                    .when(
-                        !self.workspaces.iter().all(|entry| entry.chats.is_empty()),
-                        |this| {
-                            this.child(
-                                IconButton::new("reload-sessions", IconName::Refresh)
-                                    .loading(self.reloading_sessions)
-                                    .tooltip(Tooltip::with_keys("Reload all open sessions", "⌘⇧R"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.reload_sessions(&ReloadSessions, window, cx)
-                                    })),
-                            )
-                        },
-                    )
                     .child({
                         let expanded = cx.global::<DetailsExpanded>().expanded;
                         IconButton::new(

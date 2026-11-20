@@ -260,6 +260,9 @@ pub enum ChatEvent {
     Settled,
     /// `/new`: start a new session in the same project.
     NewSession,
+    /// pi reported MCP servers that failed or need sign-in; the sidebar
+    /// shows MCP status, so the chat does not.
+    McpAttention,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -433,6 +436,11 @@ pub struct ChatView {
     /// The session this chat was forked from, used to nest it in the sidebar
     /// before pi writes the fork file to disk.
     fork_parent: Option<PathBuf>,
+    /// `/mcp reconnect` prompts the sidebar sent, by request id: server name.
+    mcp_requests: HashMap<String, String>,
+    /// Servers whose reconnect result notice is still to come; it is not
+    /// shown, the sidebar's MCP status reports the outcome.
+    mcp_reconnects: Vec<String>,
     /// Built-in commands plus pi's (`get_commands`).
     slash_commands: Vec<slash::SlashCommand>,
     slash_highlight: usize,
@@ -592,6 +600,8 @@ impl ChatView {
             editing: None,
             send_after_reload: None,
             forked: false,
+            mcp_requests: HashMap::new(),
+            mcp_reconnects: Vec::new(),
             slash_commands: slash::builtin(),
             slash_highlight: 0,
             slash_dismissed: None,
@@ -752,6 +762,8 @@ impl ChatView {
         self.editing = None;
         self.send_after_reload = None;
         self.forked = false;
+        self.mcp_requests.clear();
+        self.mcp_reconnects.clear();
         self.compacting = false;
         self.navigating = None;
         self.tree = None;
@@ -1190,6 +1202,20 @@ impl ChatView {
 
     fn apply_response(&mut self, record: &Value, cx: &mut Context<Self>) {
         if self.finish_plugin_call(record, cx) {
+            return;
+        }
+        // Not a user prompt: it must not end the wait for one the user sent.
+        if let Some(server) = record["id"]
+            .as_str()
+            .and_then(|id| self.mcp_requests.remove(id))
+        {
+            if record["success"].as_bool() == Some(false) {
+                eprintln!(
+                    "pi-gpui: /mcp reconnect {server}: {}",
+                    record["error"].as_str().unwrap_or("unknown error")
+                );
+                self.mcp_reconnects.retain(|pending| *pending != server);
+            }
             return;
         }
         let command = record["command"].as_str().unwrap_or("?");
@@ -2434,7 +2460,12 @@ impl ChatView {
                     _ => Tone::Info,
                 };
                 let text = record["message"].as_str().unwrap_or_default().to_string();
-                self.push_notice(tone, text);
+                if text.starts_with("MCP servers need attention:") {
+                    eprintln!("pi-gpui: {text}");
+                    cx.emit(ChatEvent::McpAttention);
+                } else if !self.take_mcp_reconnect_notice(tone, &text) {
+                    self.push_notice(tone, text);
+                }
             }
             "set_editor_text" => {
                 if let Some(text) = record["text"].as_str() {
@@ -2478,6 +2509,46 @@ impl ChatView {
         }
         self.connection = Connection::Exited(text.clone());
         self.push_notice(Tone::Error, text);
+    }
+
+    /// Asks this session's pi to reconnect one MCP server, without showing
+    /// anything in the transcript. Only when pi's own `/mcp` command is
+    /// there: an unknown slash command would reach the model as a prompt.
+    pub fn reconnect_mcp(&mut self, server: &str) {
+        let has_mcp = self
+            .slash_commands
+            .iter()
+            .any(|command| command.name == "mcp" && command.source == slash::Source::Extension);
+        if !has_mcp {
+            return;
+        }
+        let message = format!("/mcp reconnect {server}");
+        match self.send(json!({ "type": "prompt", "message": message })) {
+            Ok(id) => {
+                self.mcp_requests.insert(id, server.to_string());
+                self.mcp_reconnects.push(server.to_string());
+            }
+            Err(error) => eprintln!("pi-gpui: /mcp reconnect {server}: {error}"),
+        }
+    }
+
+    /// Whether `text` answers a reconnect the sidebar asked for. Success names
+    /// the server; a failure is the bare error, so the oldest pending
+    /// reconnect takes it.
+    fn take_mcp_reconnect_notice(&mut self, tone: Tone, text: &str) -> bool {
+        let index = if tone == Tone::Error {
+            (!self.mcp_reconnects.is_empty()).then_some(0)
+        } else {
+            self.mcp_reconnects.iter().position(|server| {
+                text.starts_with(&format!("Reconnected to MCP server \"{server}\""))
+            })
+        };
+        let Some(index) = index else {
+            return false;
+        };
+        let server = self.mcp_reconnects.remove(index);
+        eprintln!("pi-gpui: /mcp reconnect {server}: {text}");
+        true
     }
 
     fn push_notice(&mut self, tone: Tone, text: String) {

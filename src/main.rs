@@ -13,6 +13,7 @@ mod hub;
 mod jsonl;
 mod keys;
 mod markdown;
+mod mcp;
 mod open_url;
 mod pi;
 mod pi_updates;

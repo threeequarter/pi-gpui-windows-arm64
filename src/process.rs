@@ -2,7 +2,7 @@
 //! call these from a background task, never from the UI.
 
 use std::io::{Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,36 @@ pub(crate) fn run_with_timeout(
     stdin: Option<&[u8]>,
     timeout: Duration,
 ) -> Result<String, String> {
+    let output = run_to_end(command, stdin, timeout)?;
+    if output.status.success() {
+        return Ok(output.stdout);
+    }
+    match output
+        .stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+    {
+        Some(line) => Err(line.to_string()),
+        None => Err(format!("exited with {}", output.status)),
+    }
+}
+
+/// What a finished child wrote, whatever its exit status.
+pub(crate) struct Output {
+    pub status: ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Like `run_with_timeout`, but a non-zero exit is not an error: for commands
+/// that report failures in their regular output (`pi mcp list --json`).
+pub(crate) fn run_to_end(
+    command: &mut Command,
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<Output, String> {
     let mut child = command
         .without_console_window()
         .stdin(if stdin.is_some() {
@@ -62,24 +92,16 @@ pub(crate) fn run_with_timeout(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let text = reader
+                let stdout = reader
                     .join()
                     .map_err(|_| "the reader thread panicked".to_string())?
                     .map_err(|error| error.to_string())?;
-                let error_text = error_reader.join().unwrap_or_default();
-                return if status.success() {
-                    Ok(text)
-                } else {
-                    match error_text
-                        .lines()
-                        .rev()
-                        .map(str::trim)
-                        .find(|line| !line.is_empty())
-                    {
-                        Some(line) => Err(line.to_string()),
-                        None => Err(format!("exited with {status}")),
-                    }
-                };
+                let stderr = error_reader.join().unwrap_or_default();
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
             }
             Ok(None) if started.elapsed() > timeout => {
                 // The tree, not just the child: on Windows `pi` runs through
