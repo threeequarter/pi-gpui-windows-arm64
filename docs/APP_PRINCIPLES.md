@@ -39,42 +39,13 @@ models, tools, extensions and project files
 
 Shell commands the agent runs as a tool are part of pi's work. They are not a transport between the app and the agent.
 
-## 3. The app supports a range of pi versions
+## 3. Pi detection does not enforce a version range
 
-The app has its own version (semver, currently `0.x`). pi support is a range kept in `src/pi.rs`:
+The app resolves the exact pi executable and runs `--version` with a timeout. If it reads a version, the sidebar shows that version with a green dot and the app can attempt to start RPC. It does not refuse a connection based on the version number. If pi cannot be found or its version cannot be read, the dot is red and the setup screen explains why.
 
-- `MIN_PI`: the oldest supported pi. Older versions are refused.
-- The major of `MIN_PI`: a new pi major is refused until an app release supports it.
-- `TESTED_PI`: the newest pi minor the app was tested with. Newer minors of the same major run, with a note in the sidebar ("not tested yet").
+Detection is not a compatibility guarantee. Features can check for the capabilities they need.
 
-```text
-supported(pi) = pi >= MIN_PI AND pi.major == MIN_PI.major
-untested(pi)  = (pi.major, pi.minor) > (TESTED_PI.major, TESTED_PI.minor)
-```
-
-| `MIN_PI` / `TESTED_PI` | Installed pi | Result |
-|---|---|---|
-| 1.4.0 / 1.4 | 1.3.9 | Refused: update pi |
-| 1.4.0 / 1.4 | 1.4.7 | Supported |
-| 1.4.0 / 1.4 | 1.6.0 | Runs, marked "not tested yet" |
-| 1.4.0 / 1.4 | 2.0.0 | Refused: check for app updates |
-
-This is common practice for clients of tools made by others (compare kubectl's version skew or the `engines` range of VS Code extensions): a new pi minor does not break the app, and the app version describes the app.
-
-Connection check:
-
-1. Resolve the exact pi executable.
-2. Read its version with `--version`, with a timeout.
-3. Check the range above.
-4. Start RPC only for a supported pi. Check again every time a process is started.
-
-If the version cannot be read or parsed, the connection is refused. The app shows the executable path, the detected version or error, and what to do: update pi, or check for app updates.
-
-Within the range, features that need something pi lacks are switched off one by one (feature detection), instead of refusing the whole connection.
-
-We never update pi without the user and never swap the executable.
-
-Each release publishes `pi-compat.json` (`pi-gpui --pi-compat`) with this range, so the updater only offers releases that support the installed pi. Raise `MIN_PI` only when the app needs something newer; raise `TESTED_PI` after testing a new pi minor.
+Update offers are separate. A pi update can be applied from the app if the target is at least `MIN_PI` and has the same major. Each app release publishes `pi-compat.json` with its advertised range and latest tested minor; the app updater uses the candidate release's range. We never update pi without the user and never swap the executable.
 
 ## 4. pi owns the agent and its data
 

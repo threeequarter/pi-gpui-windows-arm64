@@ -1,10 +1,6 @@
 //! Updates for pi itself and its installed packages (extensions), checked
 //! against the npm registry and applied only when the user asks, through
 //! pi's own `pi update` commands.
-//!
-//! A pi update is judged against the app's support range first: a newer
-//! minor is offered with an "untested" note, a new major is not offered
-//! until an app release supports it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,31 +21,11 @@ pub struct PackageUpdate {
     pub latest: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PiCompatibility {
-    /// Within the tested range.
-    Supported,
-    /// Same major, newer minor than the app was tested with.
-    Untested,
-    /// A new major: the app needs an update that supports it first.
-    NeedsAppUpdate,
-}
-
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Updates {
     /// Newer pi on npm, if any.
     pub pi: Option<Version>,
     pub packages: Vec<PackageUpdate>,
-}
-
-pub fn compatibility(version: Version) -> PiCompatibility {
-    if !pi::supports(version) {
-        PiCompatibility::NeedsAppUpdate
-    } else if pi::is_untested(version) {
-        PiCompatibility::Untested
-    } else {
-        PiCompatibility::Supported
-    }
 }
 
 /// Looks up what can be updated. Blocking (runs `pi list` and curl).
@@ -210,12 +186,5 @@ mod tests {
         assert!(is_newer("0.85.0", "0.83.1"));
         assert!(is_newer("0.10.0", "0.9.9"));
         assert!(!is_newer("1.0.0", "1.0.0"));
-        let version = |text| Version::find_in(text).unwrap();
-        assert_eq!(compatibility(version("1.5.9")), PiCompatibility::Supported);
-        assert_eq!(compatibility(version("1.6.0")), PiCompatibility::Untested);
-        assert_eq!(
-            compatibility(version("2.0.0")),
-            PiCompatibility::NeedsAppUpdate
-        );
     }
 }

@@ -73,30 +73,22 @@ impl fmt::Display for Version {
     }
 }
 
-/// The oldest pi the app supports. Newer pi versions with the same major are
-/// supported too; a new major is not (see docs/APP_PRINCIPLES.md).
+/// The minimum pi version in this release's advertised update range.
 pub const MIN_PI: Version = Version {
     major: 1,
     minor: 4,
     patch: 0,
 };
 
-/// The newest pi minor the app was tested with. Newer minors of the same
-/// major still run, with a note that they are untested.
+/// The latest pi minor verified for the release manifest.
 pub const TESTED_PI: Version = Version {
     major: 1,
     minor: 5,
     patch: 0,
 };
 
-/// Whether this app supports `pi`: at least `MIN_PI`, same major.
-pub fn supports(pi: Version) -> bool {
+pub fn within_update_range(pi: Version) -> bool {
     pi >= MIN_PI && pi.major == MIN_PI.major
-}
-
-/// Supported, but newer than anything the app was tested with.
-pub fn is_untested(pi: Version) -> bool {
-    (pi.major, pi.minor) > (TESTED_PI.major, TESTED_PI.minor)
 }
 
 /// The app's pi support as JSON, published next to each release so the
@@ -126,9 +118,6 @@ pub enum CheckError {
         executable: PathBuf,
         details: String,
     },
-    Unsupported {
-        installation: Installation,
-    },
 }
 
 impl fmt::Display for CheckError {
@@ -146,24 +135,11 @@ impl fmt::Display for CheckError {
                 "Could not read the version of {}: {details}",
                 executable.display()
             ),
-            CheckError::Unsupported { installation } if installation.version < MIN_PI => write!(
-                formatter,
-                "Installed pi {} ({}) is too old: this app needs pi {MIN_PI} or newer. Update pi, then reopen the app.",
-                installation.version,
-                installation.executable.display(),
-            ),
-            CheckError::Unsupported { installation } => write!(
-                formatter,
-                "Installed pi {} ({}) is a new major version: this app supports pi {}.x. Check for app updates.",
-                installation.version,
-                installation.executable.display(),
-                MIN_PI.major,
-            ),
         }
     }
 }
 
-/// Finds pi, reads its version and checks that the app supports it.
+/// Finds pi and reads its version.
 pub fn check_installation() -> Result<Installation, CheckError> {
     let executable = discover().ok_or(CheckError::NotFound)?;
     let output = run_with_timeout(
@@ -183,15 +159,10 @@ pub fn check_installation() -> Result<Installation, CheckError> {
         details: format!("unexpected output `{}`", output.trim()),
     })?;
 
-    let installation = Installation {
+    Ok(Installation {
         executable,
         version,
-    };
-    if supports(installation.version) {
-        Ok(installation)
-    } else {
-        Err(CheckError::Unsupported { installation })
-    }
+    })
 }
 
 /// Explicit `PI_EXECUTABLE` first, then the general lookup.
@@ -503,16 +474,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn supports_the_minimum_and_newer_minors_of_the_same_major() {
+    fn limits_update_offers_to_the_minimum_and_newer_minors_of_the_same_major() {
         let version = |text| Version::find_in(text).expect("version");
-        assert!(!supports(version("1.3.9")));
-        assert!(supports(version("1.4.0")));
-        assert!(supports(version("1.4.7")));
-        assert!(supports(version("1.9.0")));
-        assert!(!supports(version("2.0.0")));
-        assert!(!is_untested(version("1.4.7")));
-        assert!(!is_untested(version("1.5.2")));
-        assert!(is_untested(version("1.6.0")));
+        assert!(!within_update_range(version("1.3.9")));
+        assert!(within_update_range(version("1.4.0")));
+        assert!(within_update_range(version("1.4.7")));
+        assert!(within_update_range(version("1.9.0")));
+        assert!(!within_update_range(version("2.0.0")));
     }
 
     #[test]

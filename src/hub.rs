@@ -3152,26 +3152,12 @@ impl HubView {
                 )
             }
             InstallationState::Failed(error) => {
-                let (color, label) = match error {
-                    pi::CheckError::NotFound => (Color::Error, "pi not installed".to_string()),
-                    pi::CheckError::VersionUnreadable { .. } => {
-                        (Color::Error, "pi did not start".to_string())
-                    }
-                    pi::CheckError::Unsupported { installation }
-                        if installation.version < pi::MIN_PI =>
-                    {
-                        (
-                            Color::Warning,
-                            format!("pi {} · update needed", installation.version),
-                        )
-                    }
-                    pi::CheckError::Unsupported { installation } => (
-                        Color::Accent,
-                        format!("pi {} · not supported yet", installation.version),
-                    ),
+                let label = match error {
+                    pi::CheckError::NotFound => "pi not installed",
+                    pi::CheckError::VersionUnreadable { .. } => "pi did not start",
                 };
                 footer.child(
-                    h_flex().gap(px(6.)).child(Indicator::dot(color)).child(
+                    h_flex().gap(px(6.)).child(Indicator::dot(Color::Error)).child(
                         div()
                             .relative()
                             .top(px(-1.))
@@ -3192,26 +3178,6 @@ impl HubView {
                 Color::Muted,
                 "Install pi to get started".to_string(),
                 "Pi GPUI is a window for the pi coding agent. Install pi once; your models, extensions and sessions are shared with the terminal.".to_string(),
-            ),
-            pi::CheckError::Unsupported { installation } if installation.version < pi::MIN_PI => (
-                IconName::Warning,
-                Color::Warning,
-                "Update pi".to_string(),
-                format!(
-                    "pi {} is installed. This app needs pi {} or newer.",
-                    installation.version,
-                    pi::MIN_PI
-                ),
-            ),
-            pi::CheckError::Unsupported { installation } => (
-                IconName::Refresh,
-                Color::Accent,
-                format!("pi {}.{} is newer than this app", installation.version.major, installation.version.minor),
-                format!(
-                    "This version of Pi GPUI supports pi {}.x. A newer app version may support pi {}.",
-                    pi::MIN_PI.major,
-                    installation.version.major
-                ),
             ),
             pi::CheckError::VersionUnreadable { .. } => (
                 IconName::Warning,
@@ -3309,39 +3275,6 @@ impl HubView {
                         .to_string(),
                 );
             }
-            pi::CheckError::Unsupported { installation } if installation.version < pi::MIN_PI => {
-                body.push(command(
-                    "copy-update",
-                    "Run in a terminal",
-                    "pi update".to_string(),
-                ));
-                body.push(hint(
-                    "Installed with npm? Run the npm install command again instead.".to_string(),
-                ));
-                actions = actions.child(check_again);
-                details = Some(format!("Found {}", installation.executable.display()));
-            }
-            pi::CheckError::Unsupported { installation } => {
-                actions = actions
-                    .child(
-                        Button::new("setup-app-update", "Check for Updates")
-                            .icon(IconName::Refresh)
-                            .style(ButtonStyle::Tinted(TintColor::Accent))
-                            .on_click(|_, _, cx| {
-                                AutoUpdater::global(cx)
-                                    .update(cx, |updater, cx| updater.check(true, cx))
-                            }),
-                    )
-                    .child(
-                        Button::new("setup-check-pi", "Check pi again")
-                            .on_click(cx.listener(|this, _, _, cx| this.check_installation(cx))),
-                    );
-                details = Some(format!(
-                    "Found pi {} at {}",
-                    installation.version,
-                    installation.executable.display()
-                ));
-            }
             pi::CheckError::VersionUnreadable {
                 executable,
                 details: error,
@@ -3354,10 +3287,6 @@ impl HubView {
                 details = Some(format!("Found {}", executable.display()));
             }
         }
-        let shows_auto_check = !matches!(
-            error,
-            pi::CheckError::Unsupported { installation } if installation.version >= pi::MIN_PI
-        );
 
         div()
             .flex_1()
@@ -3394,7 +3323,7 @@ impl HubView {
                     )
                     .children(body)
                     .child(actions)
-                    .when(shows_auto_check, |this| this.child(auto_check))
+                    .child(auto_check)
                     .when_some(details, |this, details| {
                         this.child(
                             div()
@@ -3964,7 +3893,7 @@ impl HubView {
                     Err(error) => (format!("{label} failed: {error}"), Color::Warning),
                 });
                 if updates_pi {
-                    // The version gate runs again and then looks for updates.
+                    // Read the new version and refresh update offers.
                     this.check_installation(cx);
                 } else {
                     this.check_pi_updates(cx);
@@ -3978,33 +3907,17 @@ impl HubView {
     }
 
     fn render_pi_version(&self, installation: &Installation) -> AnyElement {
-        let untested = pi::is_untested(installation.version);
         h_flex()
             .id("pi-version")
             .gap(px(6.))
-            .child(Indicator::dot(if untested {
-                Color::Warning
-            } else {
-                Color::Success
-            }))
+            .child(Indicator::dot(Color::Success))
             .child(
                 div().relative().top(px(-1.)).child(
-                    Label::new(if untested {
-                        format!("pi {} · not tested yet", installation.version)
-                    } else {
-                        format!("pi {}", installation.version)
-                    })
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                    Label::new(format!("pi {}", installation.version))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                 ),
             )
-            .when(untested, |this| {
-                this.tooltip(Tooltip::text(format!(
-                    "This app was tested with pi up to {}.{}.x. It should work; check for app updates.",
-                    pi::TESTED_PI.major,
-                    pi::TESTED_PI.minor
-                )))
-            })
             .into_any_element()
     }
 
@@ -4171,8 +4084,7 @@ impl HubView {
                 }))
         };
         if let Some(version) = self.pi_updates.pi {
-            let accent =
-                pi_updates::compatibility(version) != pi_updates::PiCompatibility::NeedsAppUpdate;
+            let accent = pi::within_update_range(version);
             let element = chip(
                 "pi-update",
                 format!("pi {version}"),
@@ -4255,31 +4167,7 @@ impl HubView {
             InstallationState::Ready(installation) => installation.version.to_string(),
             _ => "?".to_string(),
         };
-        let (note, color, allowed) = match pi_updates::compatibility(latest) {
-            pi_updates::PiCompatibility::Supported => (
-                "Works with this version of Pi GPUI.".to_string(),
-                Color::Success,
-                true,
-            ),
-            pi_updates::PiCompatibility::Untested => (
-                format!(
-                    "Not tested with this app yet (tested up to {}.{}.x). It should work; if something breaks, check for app updates.",
-                    pi::TESTED_PI.major,
-                    pi::TESTED_PI.minor
-                ),
-                Color::Warning,
-                true,
-            ),
-            pi_updates::PiCompatibility::NeedsAppUpdate => (
-                format!(
-                    "This app supports pi {}.x. Update Pi GPUI first, or wait for a version that supports pi {}.",
-                    pi::MIN_PI.major,
-                    latest.major
-                ),
-                Color::Error,
-                false,
-            ),
-        };
+        let allowed = pi::within_update_range(latest);
         self.update_popover_frame(cx)
             .child(
                 Label::new("pi update")
@@ -4287,7 +4175,15 @@ impl HubView {
                     .color(Color::Placeholder),
             )
             .child(Label::new(format!("{current} → {latest}")).weight(FontWeight::MEDIUM))
-            .child(Label::new(note).size(LabelSize::Small).color(color))
+            .when(!allowed, |this| {
+                this.child(
+                    Label::new(format!(
+                        "pi {latest} is outside this app's update range. Check for an app update first."
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Error),
+                )
+            })
             .child(
                 h_flex()
                     .gap(px(8.))

@@ -276,7 +276,7 @@ pub struct RepoStatus {
 /// One changed path, as porcelain v2 reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusEntry {
-    /// Repo-relative, printed as it is on disk (`core.quotePath=false`).
+    /// Repo-relative path from NUL-terminated status output.
     pub path: String,
     /// The source of a rename or copy.
     pub original_path: Option<String>,
@@ -471,19 +471,23 @@ fn parse_unpushed(output: &str) -> Vec<UnpushedBranch> {
 
 /// Branch header and entries of `git status --porcelain=v2 -z`.
 pub fn status(root: &Path) -> Result<RepoStatus, GitError> {
-    let output = git(
-        root,
-        &[
-            "-c",
-            "core.quotePath=false",
-            "status",
-            "--porcelain=v2",
-            "-z",
-            "--branch",
-            "--untracked-files=all",
-        ],
-    )?;
-    Ok(parse_status(&output))
+    read_status(root, &[])
+}
+
+pub(crate) fn status_without_renames(root: &Path) -> Result<RepoStatus, GitError> {
+    read_status(root, &["--no-renames"])
+}
+
+fn read_status(root: &Path, options: &[&str]) -> Result<RepoStatus, GitError> {
+    let mut arguments = vec![
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--branch",
+        "--untracked-files=all",
+    ];
+    arguments.extend_from_slice(options);
+    git(root, &arguments).map(|output| parse_status(&output))
 }
 
 /// Parses porcelain v2 output. With `-z` every record, the `# branch.*` headers
@@ -588,7 +592,7 @@ fn header_value(value: &str, placeholder: &str) -> Option<String> {
 
 /// Splits an entry record into its two status columns and its path: `fields`
 /// git-owned columns sit between them. The remainder is the path, which may
-/// contain spaces and is never quoted (`core.quotePath=false`), so it is taken
+/// contain spaces and is never quoted with `-z`, so it is taken
 /// whole and never split.
 fn entry_parts(record: &str, fields: usize) -> Option<(&str, &str)> {
     let columns = record.get(..2)?;
@@ -1244,13 +1248,13 @@ impl Discard {
     }
 }
 
-/// Index and work tree of `path` back to HEAD.
-pub fn restore_from_head(root: &Path, path: &str) -> Result<(), GitError> {
+/// Restore both the index and worktree from the approved commit.
+pub(crate) fn restore_from_commit(root: &Path, commit: &str, path: &str) -> Result<(), GitError> {
     git(
         root,
         &[
             "restore",
-            "--source=HEAD",
+            &format!("--source={commit}"),
             "--staged",
             "--worktree",
             "--",

@@ -1,5 +1,5 @@
-//! The Changes panel: `git diff` of the selected project against
-//! HEAD, untracked files included, with the git client around it: staging
+//! The Changes panel: uncommitted paths from Git status, with line totals
+//! against HEAD and the git client around it: staging
 //! from the index, discarding a file's changes, commit and amend, branch
 //! switching, fetch/pull/push and a commit message written by pi. A project
 //! holding nested repositories shows one at a time, picked as in Zed's git
@@ -7,15 +7,16 @@
 //! separate arguments, never through a shell; every git and pi call runs in
 //! the background.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Context, Corner, ElementId, Entity, EventEmitter, FocusHandle, FontWeight,
-    Hsla, KeyBinding, Subscription, Task, Window, actions, anchored, deferred, div, px,
+    AnyElement, App, Context, Corner, Div, ElementId, Entity, EventEmitter, FocusHandle,
+    FontWeight, Hsla, KeyBinding, Subscription, Task, Window, actions, anchored, deferred, div, px,
+    uniform_list,
 };
 
 use crate::git::{self, Discard, GitError, RepoOverview, RepoStatus, StatusEntry, git};
@@ -27,9 +28,15 @@ use crate::ui::prelude::*;
 use crate::ui::{AnimationTicker, SyntaxColors};
 
 use branch_picker::{BRANCH_PICKER_CONTEXT, BranchPicker};
+use discard::PreparedDiscard;
+use stats::{ChangeStats, LineStats};
+use tree::{ChangeRow, ChangeRowKind};
 
 mod branch_picker;
 mod commit;
+mod discard;
+mod stats;
+mod tree;
 
 actions!(diff, [CommitNow, DismissBranchPicker]);
 
@@ -41,6 +48,7 @@ const COMMIT_CONTEXT: &str = "GitCommit";
 const POPOVER_REOPEN_GUARD: Duration = Duration::from_millis(250);
 /// Untracked files larger than this are listed without content.
 const MAX_UNTRACKED_BYTES: u64 = 512 * 1024;
+const ROW_INDENT: f32 = 14.;
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -70,6 +78,20 @@ pub enum FileStatus {
 }
 
 impl FileStatus {
+    fn from_entry(entry: &StatusEntry) -> Self {
+        if entry.untracked {
+            Self::Untracked
+        } else if entry.original_path.is_some() {
+            Self::Renamed
+        } else if entry.code.contains(&'D') {
+            Self::Deleted
+        } else if entry.code.contains(&'A') {
+            Self::Added
+        } else {
+            Self::Modified
+        }
+    }
+
     fn letter(self) -> &'static str {
         match self {
             FileStatus::Modified => "M",
@@ -116,8 +138,6 @@ pub struct DiffLine {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileDiff {
     pub path: String,
-    pub old_path: Option<String>,
-    pub status: FileStatus,
     pub binary: bool,
     pub additions: usize,
     pub deletions: usize,
@@ -125,9 +145,10 @@ pub struct FileDiff {
 }
 
 #[derive(Clone, Debug)]
-pub struct Changes {
-    pub root: PathBuf,
-    pub files: Vec<FileDiff>,
+struct Changes {
+    root: PathBuf,
+    stats: ChangeStats,
+    rows: Vec<ChangeRow>,
 }
 
 enum State {
@@ -287,6 +308,7 @@ pub struct DiffPanel {
     chosen_repositories: HashMap<PathBuf, PathBuf>,
     /// The repositories shown before, by root, as last read.
     stashed: HashMap<PathBuf, (Changes, RepoStatus)>,
+    collapsed: HashMap<PathBuf, HashSet<String>>,
     repository_menu: bool,
     /// What each repository has not pushed, by root, as read when the
     /// repository menu last opened.
@@ -314,6 +336,7 @@ pub struct DiffPanel {
     print_mode: Option<bool>,
     _task: Task<()>,
     _action_task: Task<()>,
+    _discard_task: Task<()>,
     _probe_task: Task<()>,
     _overview_task: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -335,6 +358,7 @@ impl DiffPanel {
             repository: None,
             chosen_repositories: HashMap::new(),
             stashed: HashMap::new(),
+            collapsed: HashMap::new(),
             repository_menu: false,
             overviews: HashMap::new(),
             state: State::NoProject,
@@ -352,6 +376,7 @@ impl DiffPanel {
             print_mode: None,
             _task: Task::ready(()),
             _action_task: Task::ready(()),
+            _discard_task: Task::ready(()),
             _probe_task: Task::ready(()),
             _overview_task: Task::ready(()),
             _subscriptions: subscriptions,
@@ -437,6 +462,7 @@ impl DiffPanel {
         self.refreshing = false;
         self.refresh_pending = false;
         self._action_task = Task::ready(());
+        self._discard_task = Task::ready(());
         self.busy = None;
         self.action_error = None;
         self.amend = false;
@@ -561,13 +587,13 @@ impl DiffPanel {
         let State::Loaded(changes, _) = &self.state else {
             return None;
         };
-        if changes.files.is_empty() {
-            return None;
-        }
-        let additions: usize = changes.files.iter().map(|file| file.additions).sum();
-        let deletions: usize = changes.files.iter().map(|file| file.deletions).sum();
-        let files = match changes.files.len() {
-            1 => "1 file".to_string(),
+        let LineStats {
+            additions,
+            deletions,
+        } = changes.stats.lines;
+        let files = match changes.stats.files {
+            0 => return None,
+            1 => "1 file".to_owned(),
             count => format!("{count} files"),
         };
         Some(format!("{files}  +{additions} −{deletions}"))
@@ -630,15 +656,15 @@ impl DiffPanel {
     }
 
     /// Unstaged or partly staged → stage it fully; staged → unstage it.
-    fn toggle_staged(&mut self, path: &str, cx: &mut Context<Self>) {
-        let Some(entry) = self
+    fn toggle_staged(&mut self, entry: &StatusEntry, cx: &mut Context<Self>) {
+        if !self
             .status()
-            .and_then(|status| status.entries.iter().find(|entry| entry.path == path))
-            .cloned()
-        else {
+            .is_some_and(|status| status.entries.contains(entry))
+        {
             return;
-        };
-        let stage = stage_state(&entry) != ToggleState::Selected;
+        }
+        let stage = stage_state(entry) != ToggleState::Selected;
+        let entry = entry.clone();
         self.run_git(
             GitAction::ToggleFile,
             move |root| {
@@ -764,53 +790,70 @@ impl DiffPanel {
         self.run_git(action, move |root| operation(root, &target).map(|_| ()), cx);
     }
 
-    fn confirm_discard(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(status) = self.status() else {
+    fn confirm_discard(&mut self, entry: StatusEntry, window: &mut Window, cx: &mut Context<Self>) {
+        let State::Loaded(changes, status) = &self.state else {
             return;
         };
-        let Some(entry) = status
-            .entries
-            .iter()
-            .find(|entry| entry.path == path)
-            .cloned()
-        else {
+        if self.busy.is_some() || entry.conflicted || !status.entries.contains(&entry) {
             return;
-        };
+        }
+        let root = changes.root.clone();
+        let head = status.head.clone();
         let steps = Discard::plan(&entry, status.is_unborn());
         let deletes = steps
             .iter()
             .any(|step| matches!(step, Discard::Remove { .. }));
-        let name = path.rsplit('/').next().unwrap_or(path).to_string();
-        let answer = window.prompt(
-            gpui::PromptLevel::Warning,
-            &format!("Discard all changes to \"{name}\"?"),
-            Some(if deletes {
-                "The file is new since the last commit: it moves to the Trash."
-            } else {
-                "The file goes back to its last committed version. This cannot be undone."
-            }),
-            &["Discard", "Cancel"],
-            cx,
-        );
-        cx.spawn(async move |this, cx| {
-            if answer.await.ok() != Some(0) {
-                return;
-            }
-            this.update(cx, |this, cx| {
-                if this.busy.is_some() {
-                    this.show_error(GitAction::Discard, "another git action is running".into());
-                    cx.notify();
+        let name = entry
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&entry.path)
+            .to_owned();
+        let mut window = window.to_async(cx);
+        self.busy = Some(GitAction::Discard);
+        self.action_error = None;
+        let prepare =
+            cx.background_spawn(async move { PreparedDiscard::prepare(root, head, entry, steps) });
+        self._discard_task = cx.spawn(async move |this, cx| {
+            let prepared = match prepare.await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.busy = None;
+                        this.show_error(GitAction::Discard, error);
+                        cx.notify();
+                    })
+                    .ok();
                     return;
                 }
-                this.run_git(
-                    GitAction::Discard,
-                    move |root| discard(root, &entry, &steps),
+            };
+            let answer = window.update(|window, cx| {
+                window.prompt(
+                    gpui::PromptLevel::Warning,
+                    &format!("Discard all changes to \"{name}\"?"),
+                    Some(if deletes {
+                        "The file is new since the last commit: it moves to the Trash."
+                    } else {
+                        "The file goes back to its last committed version. This cannot be undone."
+                    }),
+                    &["Discard", "Cancel"],
                     cx,
                 )
+            });
+            let accepted = match answer {
+                Ok(answer) => answer.await.ok() == Some(0),
+                Err(_) => false,
+            };
+            this.update(cx, |this, cx| {
+                this.busy = None;
+                if accepted {
+                    this.run_git(GitAction::Discard, move |root| prepared.run(root), cx);
+                }
+                cx.notify();
             })
             .ok();
-        })
-        .detach();
+        });
+        cx.notify();
     }
 
     fn render_message(&self, message: String) -> AnyElement {
@@ -1316,17 +1359,7 @@ impl DiffPanel {
             .into_any_element()
     }
 
-    fn render_stage_checkbox(
-        &self,
-        file: &FileDiff,
-        entry: Option<&StatusEntry>,
-        cx: &mut Context<Self>,
-    ) -> Checkbox {
-        let id = ElementId::Name(format!("stage:{}", file.path).into());
-        let Some(entry) = entry else {
-            // git status has not caught up with the diff yet.
-            return Checkbox::new(id, ToggleState::Unselected).disabled(true);
-        };
+    fn render_stage_checkbox(&self, entry: &StatusEntry, cx: &mut Context<Self>) -> Checkbox {
         let state = stage_state(entry);
         let tooltip = match state {
             ToggleState::Selected => "Unstage",
@@ -1334,109 +1367,139 @@ impl DiffPanel {
             ToggleState::Indeterminate => "Stage the rest of this file",
             ToggleState::Unselected => "Stage",
         };
-        let path = file.path.clone();
-        Checkbox::new(id, state)
+        let entry = entry.clone();
+        Checkbox::new("stage", state)
             .disabled(self.busy.is_some())
             .tooltip(Tooltip::text(tooltip))
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_staged(&path, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_staged(&entry, cx)))
     }
 
-    fn render_file(
-        &self,
-        file: &FileDiff,
-        root: &Path,
-        entry: Option<&StatusEntry>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let colors = cx.theme().colors.clone();
-        let (directory, name) = match file.path.rsplit_once('/') {
-            Some((directory, name)) => (format!("{directory}/"), name.to_string()),
-            None => (String::new(), file.path.clone()),
-        };
-        let full_path = root.join(&file.path);
-        let tooltip = match &file.old_path {
-            Some(old_path) => format!("{} from {old_path}", file.status.description()),
-            None => format!(
-                "{}: {}",
-                file.status.description(),
-                sessions::display_path(&full_path)
-            ),
-        };
-        let checkbox = self.render_stage_checkbox(file, entry, cx);
-        let group: gpui::SharedString = format!("diff-file:{}", file.path).into();
-        let title = file.path.clone();
-        let discard_path = file.path.clone();
-        let discard = IconButton::new(
-            ElementId::Name(format!("discard:{}", file.path).into()),
-            IconName::Undo,
-        )
-        .size(ButtonSize::Compact)
-        .icon_size(IconSize::XSmall)
-        .disabled(self.busy.is_some() || entry.is_none_or(|entry| entry.conflicted))
-        .tooltip(Tooltip::text(
-            if entry.is_some_and(|entry| entry.conflicted) {
-                "Resolve the conflict first"
-            } else {
-                "Discard changes"
-            },
-        ))
-        .on_click(
-            cx.listener(move |this, _, window, cx| this.confirm_discard(&discard_path, window, cx)),
-        );
-
+    fn change_row(depth: usize, cx: &App) -> Div {
+        let hover = cx.theme().colors.element_hover;
         h_flex()
-            .id(ElementId::Name(group.clone()))
-            .group(group.clone())
+            .w_full()
             .h(ui_px(cx, 28.))
-            .pl(px(4.))
+            .pl(px(4. + depth as f32 * ROW_INDENT))
             .pr(px(4.))
             .gap(px(6.))
             .rounded(px(5.))
             .cursor_pointer()
-            .hover(|style| style.bg(colors.element_hover))
+            .hover(|style| style.bg(hover))
+    }
+
+    fn render_folder(
+        depth: usize,
+        path: &str,
+        name: &str,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let path = path.to_owned();
+        let (chevron, folder) = if expanded {
+            (IconName::ChevronDown, IconName::FolderOpen)
+        } else {
+            (IconName::ChevronRight, IconName::Folder)
+        };
+        Self::change_row(depth, cx)
+            .id(ElementId::Name(format!("diff-folder:{path}").into()))
+            .tooltip(Tooltip::text(path.clone()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let State::Loaded(changes, _) = &this.state else {
+                    return;
+                };
+                let collapsed = this.collapsed.entry(changes.root.clone()).or_default();
+                if !collapsed.remove(&path) {
+                    collapsed.insert(path.clone());
+                }
+                cx.notify();
+            }))
+            .child(
+                Icon::new(chevron)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(Icon::new(folder).size(IconSize::XSmall).color(Color::Muted))
+            .child(
+                div().min_w(px(0.)).child(
+                    Label::new(name.to_owned())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                ),
+            )
+            .into_any_element()
+    }
+
+    fn render_file(
+        &self,
+        depth: usize,
+        entry: &StatusEntry,
+        root: &Path,
+        stats: LineStats,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+        let full_path = root.join(&entry.path);
+        let status = FileStatus::from_entry(entry);
+        let tooltip = match &entry.original_path {
+            Some(old_path) => format!("{} from {old_path}", status.description()),
+            None => format!(
+                "{}: {}",
+                status.description(),
+                sessions::display_path(&full_path)
+            ),
+        };
+        let checkbox = self.render_stage_checkbox(entry, cx);
+        let group: gpui::SharedString =
+            format!("diff-file:{}:{}", entry.untracked, entry.path).into();
+        let title = entry.path.clone();
+        let discard_entry = entry.clone();
+        let discard = IconButton::new("discard", IconName::Undo)
+            .size(ButtonSize::Compact)
+            .icon_size(IconSize::XSmall)
+            .disabled(self.busy.is_some() || entry.conflicted)
+            .tooltip(Tooltip::text(if entry.conflicted {
+                "Resolve the conflict first"
+            } else {
+                "Discard changes"
+            }))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.confirm_discard(discard_entry.clone(), window, cx);
+            }));
+
+        Self::change_row(depth, cx)
+            .id(ElementId::Name(group.clone()))
+            .group(group.clone())
             .tooltip(Tooltip::text(tooltip))
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(DiffPanelEvent::OpenDiff(full_path.clone(), title.clone()))
             }))
-            .child(checkbox)
+            .child(div().flex_none().w(IconSize::XSmall.pixels()))
             .child(
-                div().flex_none().w(px(12.)).child(
-                    Label::new(file.status.letter())
+                div().flex_none().w(IconSize::XSmall.pixels()).child(
+                    Label::new(status.letter())
                         .size(LabelSize::XSmall)
                         .weight(FontWeight::MEDIUM)
-                        .color(file.status.color()),
+                        .color(status.color()),
                 ),
             )
             .child(
-                h_flex()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .gap(px(4.))
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .flex_none()
-                            .child(Label::new(name).size(LabelSize::Small)),
-                    )
-                    .child(
-                        div().min_w(px(0.)).child(
-                            Label::new(directory)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Placeholder)
-                                .truncate(),
-                        ),
-                    ),
+                div().flex_1().min_w(px(0.)).child(
+                    Label::new(name.to_owned())
+                        .size(LabelSize::Small)
+                        .truncate(),
+                ),
             )
-            .when(file.additions > 0, |this| {
+            .when(stats.additions > 0, |this| {
                 this.child(
-                    Label::new(format!("+{}", file.additions))
+                    Label::new(format!("+{}", stats.additions))
                         .size(LabelSize::XSmall)
                         .color(Color::Success),
                 )
             })
-            .when(file.deletions > 0, |this| {
+            .when(stats.deletions > 0, |this| {
                 this.child(
-                    Label::new(format!("−{}", file.deletions))
+                    Label::new(format!("−{}", stats.deletions))
                         .size(LabelSize::XSmall)
                         .color(Color::Error),
                 )
@@ -1450,7 +1513,39 @@ impl DiffPanel {
                     .group_hover(group, |style| style.opacity(1.))
                     .child(discard),
             )
+            .child(checkbox)
             .into_any_element()
+    }
+
+    fn render_change_rows(
+        &self,
+        indexes: &[usize],
+        range: Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let State::Loaded(changes, status) = &self.state else {
+            return Vec::new();
+        };
+        let collapsed = self.collapsed.get(&changes.root);
+        range
+            .filter_map(|index| changes.rows.get(*indexes.get(index)?))
+            .map(|row| match &row.kind {
+                ChangeRowKind::Folder { path, name, .. } => {
+                    let expanded = !collapsed.is_some_and(|paths| paths.contains(path));
+                    Self::render_folder(row.depth, path, name, expanded, cx)
+                }
+                ChangeRowKind::File(index) => {
+                    let entry = &status.entries[*index];
+                    self.render_file(
+                        row.depth,
+                        entry,
+                        &changes.root,
+                        changes.stats.for_entry(entry),
+                        cx,
+                    )
+                }
+            })
+            .collect()
     }
 }
 
@@ -1472,27 +1567,27 @@ impl Render for DiffPanel {
                 self.render_message("This project is not a git repository.".into())
             }
             State::Failed(error) => self.render_message(format!("git diff failed: {error}")),
-            State::Loaded(changes, _) if changes.files.is_empty() => {
-                self.render_message("No changes against HEAD.".into())
+            State::Loaded(changes, _) if changes.rows.is_empty() => {
+                self.render_message("No uncommitted changes.".into())
             }
-            State::Loaded(changes, status) => {
-                let root = changes.root.clone();
-                let files: Vec<AnyElement> = changes
-                    .files
-                    .iter()
-                    .map(|file| {
-                        let entry = status.entries.iter().find(|entry| entry.path == file.path);
-                        self.render_file(file, &root, entry, cx)
-                    })
-                    .collect();
+            State::Loaded(changes, _) => {
+                let rows = tree::visible_rows(&changes.rows, self.collapsed.get(&changes.root));
                 div()
-                    .id("diff-files")
                     .flex_1()
                     .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .px(px(6.))
-                    .pb(px(10.))
-                    .children(files)
+                    .overflow_hidden()
+                    .child(
+                        uniform_list(
+                            "diff-files",
+                            rows.len(),
+                            cx.processor(move |this, range, _, cx| {
+                                this.render_change_rows(&rows, range, cx)
+                            }),
+                        )
+                        .size_full()
+                        .px(px(6.))
+                        .pb(px(10.)),
+                    )
                     .into_any_element()
             }
         };
@@ -1533,73 +1628,43 @@ fn load_repository(
     else {
         return Ok(None);
     };
-    // Every git run here is independent, so they all run at once.
-    let (changes, status, remotes, stash) = std::thread::scope(|scope| {
-        let status = scope.spawn(|| git::status(&root));
+    let (loaded, remotes, stash) = std::thread::scope(|scope| {
         let remotes = scope.spawn(|| git::remotes(&root));
         let stash = scope.spawn(|| git::panel_stash(&root));
-        let changes = load_changes(root.clone());
-        (
-            changes,
-            git::joined(status),
-            git::joined(remotes),
-            git::joined(stash),
-        )
+        let loaded = load_changes(&root);
+        (loaded, git::joined(remotes), git::joined(stash))
     });
-    let changes = changes?;
-    let mut status = status.map_err(GitError::message)?;
+    let (changes, mut status) = loaded.map_err(GitError::message)?;
     // The remotes only feed the remote picker; the panel works without them.
     status.remotes = remotes.unwrap_or_default();
     status.stashed = stash.is_ok_and(|stash| stash.is_some());
     Ok(Some((repositories, changes, status)))
 }
 
-fn load_changes(root: PathBuf) -> Result<Changes, String> {
-    let (diff, untracked) = std::thread::scope(|scope| {
-        let untracked =
-            scope.spawn(|| git(&root, &["ls-files", "--others", "--exclude-standard", "-z"]));
-        let diff = diff_base(&root).and_then(|base| {
-            git(
-                &root,
-                &[
-                    "-c",
-                    "core.quotePath=false",
-                    "diff",
-                    "--no-color",
-                    "--no-ext-diff",
-                    "--find-renames",
-                    &base,
-                ],
-            )
-            .map_err(GitError::message)
-        });
-        (diff, git::joined(untracked))
-    });
-    let mut files = parse_diff(&diff?);
-    let untracked = untracked.map_err(GitError::message)?;
-    // A folder is a nested repository, which keeps its own changes.
-    for path in untracked
-        .split('\0')
-        .filter(|path| !path.is_empty() && !path.ends_with('/'))
-    {
-        files.push(untracked_file(&root, path));
-    }
-    files.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(Changes { root, files })
+fn load_changes(root: &Path) -> Result<(Changes, RepoStatus), GitError> {
+    let status = git::status(root)?;
+    let stats = ChangeStats::read(root, &status)?;
+    let rows = tree::build_rows(status.entries.iter().map(|entry| entry.path.as_str()));
+    let changes = Changes {
+        root: root.to_path_buf(),
+        stats,
+        rows,
+    };
+    Ok((changes, status))
 }
 
 /// HEAD, or the empty tree in a fresh repository that has no HEAD yet.
 fn diff_base(directory: &Path) -> Result<String, String> {
     match git(directory, &["rev-parse", "--verify", "--quiet", "HEAD"]) {
         Ok(_) => Ok("HEAD".to_string()),
-        Err(_) => Ok(git(directory, &["hash-object", "-t", "tree", "/dev/null"])
+        Err(_) => Ok(git(directory, &["hash-object", "-t", "tree", "--stdin"])
             .map_err(GitError::message)?
             .trim()
             .to_string()),
     }
 }
 
-/// The change of one file against HEAD, as the Changes panel shows it.
+/// A file's combined diff, or its staged diff when the worktree cancels it.
 /// `Ok(None)` when the file is unchanged, ignored or outside a git work tree.
 pub fn load_file_diff(path: &Path) -> Result<Option<FileDiff>, String> {
     // A deleted file may have taken its folders with it; git runs from the
@@ -1619,24 +1684,28 @@ pub fn load_file_diff(path: &Path) -> Result<Option<FileDiff>, String> {
         Ok(base) => base,
         Err(_) => return Ok(None),
     };
-    let diff = match git(
-        directory,
-        &[
-            "-c",
-            "core.quotePath=false",
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            &base,
-            "--",
-            &relative,
-        ],
-    ) {
-        Ok(diff) => diff,
+    let mut command = vec![
+        "diff",
+        "--patch",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-renames",
+        base.as_str(),
+        "--",
+        relative.as_str(),
+    ];
+    let patch = match git(directory, &command) {
+        Ok(patch) => patch,
         Err(GitError::Failed(_)) => return Ok(None),
         Err(GitError::Spawn(error)) => return Err(error),
     };
-    if let Some(file) = parse_diff(&diff).into_iter().next() {
+    if let Some(file) = parse_file_diff(&patch, &relative) {
+        return Ok(Some(file));
+    }
+    // A worktree edit can cancel a staged edit in the combined diff.
+    command.insert(1, "--cached");
+    let staged = git(directory, &command).map_err(GitError::message)?;
+    if let Some(file) = parse_file_diff(&staged, &relative) {
         return Ok(Some(file));
     }
     let untracked = git(
@@ -1657,48 +1726,10 @@ pub fn load_file_diff(path: &Path) -> Result<Option<FileDiff>, String> {
     Ok(Some(untracked_diff(path, relative)))
 }
 
-/// Runs the steps of a discard in order; a file new since HEAD goes to the
-/// Trash, so it can still be brought back. The steps were planned when the
-/// user was asked; if the file's status moved on since (the agent committed
-/// or renamed it), nothing runs.
-fn discard(root: &Path, planned_for: &StatusEntry, steps: &[Discard]) -> Result<(), String> {
-    let status = git::status(root).map_err(GitError::message)?;
-    let current = status
-        .entries
-        .iter()
-        .find(|entry| entry.path == planned_for.path);
-    if current != Some(planned_for) {
-        return Err("the file changed since you asked; nothing was discarded".to_string());
-    }
-    for step in steps {
-        match step {
-            Discard::Restore(path) => {
-                git::restore_from_head(root, path).map_err(GitError::message)?;
-            }
-            Discard::Remove { path, staged } => {
-                if *staged {
-                    git::remove_from_index(root, path).map_err(GitError::message)?;
-                }
-                let full_path = root.join(path);
-                if full_path.exists() {
-                    crate::platform::move_to_trash(&full_path)?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn untracked_file(root: &Path, path: &str) -> FileDiff {
-    untracked_diff(&root.join(path), path.to_string())
-}
-
 /// An untracked file as a diff that adds all of it; `path` is the one shown.
 fn untracked_diff(full_path: &Path, path: String) -> FileDiff {
     let mut file = FileDiff {
         path,
-        old_path: None,
-        status: FileStatus::Untracked,
         binary: false,
         additions: 0,
         deletions: 0,
@@ -1723,32 +1754,22 @@ fn untracked_diff(full_path: &Path, path: String) -> FileDiff {
     file
 }
 
-/// Parses `git diff` output (unified format, no color).
-pub fn parse_diff(output: &str) -> Vec<FileDiff> {
-    let mut files: Vec<FileDiff> = Vec::new();
+/// The path comes from the single-file request, not Git's patch headers.
+fn parse_file_diff(output: &str, path: &str) -> Option<FileDiff> {
+    let mut lines = output.lines();
+    lines.find(|line| line.starts_with("diff --git "))?;
+    let mut file = FileDiff {
+        path: path.to_owned(),
+        binary: false,
+        additions: 0,
+        deletions: 0,
+        lines: Vec::new(),
+    };
     let mut in_hunk = false;
-    for line in output.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ") {
-            in_hunk = false;
-            let path = rest
-                .split_once(" b/")
-                .map(|(_, path)| path)
-                .unwrap_or(rest)
-                .to_string();
-            files.push(FileDiff {
-                path,
-                old_path: None,
-                status: FileStatus::Modified,
-                binary: false,
-                additions: 0,
-                deletions: 0,
-                lines: Vec::new(),
-            });
-            continue;
+    for line in lines {
+        if line.starts_with("diff --git ") {
+            return None;
         }
-        let Some(file) = files.last_mut() else {
-            continue;
-        };
         if line.starts_with("@@") {
             in_hunk = true;
             file.lines.push(DiffLine {
@@ -1758,19 +1779,8 @@ pub fn parse_diff(output: &str) -> Vec<FileDiff> {
             continue;
         }
         if !in_hunk {
-            if line.starts_with("new file mode") {
-                file.status = FileStatus::Added;
-            } else if line.starts_with("deleted file mode") {
-                file.status = FileStatus::Deleted;
-            } else if let Some(from) = line.strip_prefix("rename from ") {
-                file.status = FileStatus::Renamed;
-                file.old_path = Some(from.to_string());
-            } else if let Some(to) = line.strip_prefix("rename to ") {
-                file.path = to.to_string();
-            } else if line.starts_with("Binary files ") {
+            if line.starts_with("Binary files ") {
                 file.binary = true;
-            } else if let Some(path) = line.strip_prefix("+++ b/") {
-                file.path = path.to_string();
             }
             continue;
         }
@@ -1791,7 +1801,7 @@ pub fn parse_diff(output: &str) -> Vec<FileDiff> {
             text: text.to_string(),
         });
     }
-    files
+    Some(file)
 }
 
 /// Syntax colors for each diff line, as ranges within the line's text. The
@@ -1906,52 +1916,29 @@ mod tests {
     }
 
     #[test]
-    fn parses_modified_added_deleted_and_renamed_files() {
+    fn parses_a_single_file_patch_without_using_header_paths() {
         let output = "\
-diff --git a/src/main.rs b/src/main.rs
+diff --git a/src/main file.rs b/src/main file.rs
 index 1111111..2222222 100644
---- a/src/main.rs
-+++ b/src/main.rs
-@@ -1,3 +1,3 @@ fn main() {
+--- a/src/main file.rs\t
++++ b/src/main file.rs\t
+@@ -1,2 +1,2 @@ fn main() {
  keep
 -old
 +new
 \\ No newline at end of file
-diff --git a/new.txt b/new.txt
-new file mode 100644
-index 0000000..3333333
---- /dev/null
-+++ b/new.txt
-@@ -0,0 +1 @@
-+hello
-diff --git a/gone.txt b/gone.txt
-deleted file mode 100644
---- a/gone.txt
-+++ /dev/null
-@@ -1 +0,0 @@
--bye
-diff --git a/a b.txt b/c d.txt
-similarity index 100%
-rename from a b.txt
-rename to c d.txt
+";
+        let file = parse_file_diff(output, "src/main file.rs").unwrap();
+        assert_eq!(file.path, "src/main file.rs");
+        assert_eq!((file.additions, file.deletions), (1, 1));
+        assert_eq!(file.lines.len(), 4);
+        assert_eq!(file.lines[0].kind, LineKind::Hunk);
+
+        let binary = "\
 diff --git a/logo.png b/logo.png
 index 4444444..5555555 100644
 Binary files a/logo.png and b/logo.png differ
 ";
-        let files = parse_diff(output);
-        assert_eq!(files.len(), 5);
-        assert_eq!(files[0].path, "src/main.rs");
-        assert_eq!(files[0].status, FileStatus::Modified);
-        assert_eq!((files[0].additions, files[0].deletions), (1, 1));
-        assert_eq!(files[0].lines.len(), 4);
-        assert_eq!(files[0].lines[0].kind, LineKind::Hunk);
-        assert_eq!(files[1].status, FileStatus::Added);
-        assert_eq!(files[1].additions, 1);
-        assert_eq!(files[2].status, FileStatus::Deleted);
-        assert_eq!(files[2].path, "gone.txt");
-        assert_eq!(files[3].status, FileStatus::Renamed);
-        assert_eq!(files[3].path, "c d.txt");
-        assert_eq!(files[3].old_path.as_deref(), Some("a b.txt"));
-        assert!(files[4].binary);
+        assert!(parse_file_diff(binary, "logo.png").unwrap().binary);
     }
 }
