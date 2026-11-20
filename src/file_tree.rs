@@ -667,6 +667,9 @@ impl FilesPanel {
                 .unwrap_or_default(),
             _ => String::new(),
         };
+        // The previous edit's anchor would place the overlay on its row
+        // until this row's canvas reports its own bounds.
+        self.edit_anchor = None;
         let input = cx.new(|cx| {
             let mut input = TextInput::single_line(placeholder, cx).compact();
             input.set_text(initial, cx);
@@ -904,16 +907,20 @@ impl FilesPanel {
     }
 
     /// The label area of the edited row, in window coordinates. The input
-    /// overlays it from a deferred root: uniform_list lays rows out outside
+    /// overlays it from the tree area: uniform_list lays rows out outside
     /// the normal flex tree, which collapses a TextInput placed in a row.
     fn edit_anchor_canvas(&self, cx: &mut Context<Self>) -> AnyElement {
         let entity = cx.entity();
         canvas(
-            move |bounds, _, cx| {
+            move |bounds, window, cx| {
                 entity.update(cx, |this, cx| {
                     if this.edit_anchor != Some(bounds) {
                         this.edit_anchor = Some(bounds);
-                        cx.notify();
+                        // A notify during draw only marks the view dirty
+                        // without scheduling a frame, so the overlay would
+                        // wait for the next input event to move.
+                        let id = cx.entity_id();
+                        window.on_next_frame(move |_, cx| cx.notify(id));
                     }
                 });
             },
@@ -929,8 +936,9 @@ impl FilesPanel {
         let editing = self.editing.as_ref()?;
         let anchor = self.edit_anchor?;
         Some(
-            deferred(
-                anchored().position(anchor.origin).child(
+            anchored()
+                .position(anchor.origin)
+                .child(
                     div()
                         .w(anchor.size.width)
                         .occlude()
@@ -941,11 +949,19 @@ impl FilesPanel {
                             cx.listener(|this, _, window, cx| this.commit_edit(window, cx)),
                         )
                         .child(editing.input.clone()),
-                ),
-            )
-            .with_priority(1)
-            .into_any_element(),
+                )
+                .into_any_element(),
         )
+    }
+
+    /// The row hosting the edit input: the placeholder row of a new item,
+    /// or the renamed entry's row, which a folded chain shares.
+    fn edit_row(&self) -> Option<usize> {
+        let editing = self.editing.as_ref()?;
+        self.rows.iter().position(|row| match &editing.kind {
+            EditKind::Rename(path) => row.entry.path == *path || row.entry.folded.contains(path),
+            _ => row.editing,
+        })
     }
 
     fn render_edit_row(&self, depth: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -969,9 +985,22 @@ impl FilesPanel {
             .into_any_element()
     }
 
-    fn render_rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn render_rows(
+        &mut self,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let colors = cx.theme().colors.clone();
         let selected_paths = self.selected_paths();
+        let edit_row = self.edit_row();
+        if self.edit_anchor.is_some() && !edit_row.is_some_and(|row| range.contains(&row)) {
+            // The edited row scrolled out, so no canvas refreshes the
+            // anchor; drop it to hide the overlay until the row returns.
+            self.edit_anchor = None;
+            let id = cx.entity_id();
+            window.on_next_frame(move |_, cx| cx.notify(id));
+        }
         range
             .filter_map(|index| {
                 let row = self.rows.get(index)?.clone();
@@ -1038,17 +1067,11 @@ impl FilesPanel {
                 } else {
                     entry.path.parent().map(Path::to_path_buf)
                 };
-                let rename_input = match &self.editing {
-                    Some(editing) => match &editing.kind {
-                        EditKind::Rename(path)
-                            if *path == entry.path || entry.folded.contains(path) =>
-                        {
-                            Some(editing.input.clone())
-                        }
-                        _ => None,
-                    },
-                    None => None,
-                };
+                let rename_input = self
+                    .editing
+                    .as_ref()
+                    .filter(|_| edit_row == Some(index))
+                    .map(|editing| editing.input.clone());
                 let folded = entry.folded.clone();
                 let leaf_path = entry.path.clone();
                 let mut element = h_flex()
@@ -1505,6 +1528,8 @@ impl Render for FilesPanel {
             div()
                 .id("file-tree-area")
                 .flex_1()
+                // Clips the edit overlay to the list as its row scrolls.
+                .overflow_hidden()
                 .on_click(cx.listener(|this, _, window, cx| {
                     if std::mem::take(&mut this.pressed_while_editing) {
                         return;
@@ -1515,7 +1540,7 @@ impl Render for FilesPanel {
                     uniform_list(
                         "file-tree",
                         self.rows.len(),
-                        cx.processor(|this, range, _, cx| this.render_rows(range, cx)),
+                        cx.processor(|this, range, window, cx| this.render_rows(range, window, cx)),
                     )
                     .track_scroll(self.scroll.clone())
                     .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, _| {
@@ -1527,6 +1552,7 @@ impl Render for FilesPanel {
                     .px(px(6.))
                     .pb(px(10.)),
                 )
+                .children(self.render_edit_overlay(cx))
                 .into_any_element()
         };
         let project = self.workspace.as_ref().map(|workspace| {
@@ -1659,7 +1685,6 @@ impl Render for FilesPanel {
             .children(project)
             .children(action_error)
             .child(content)
-            .children(self.render_edit_overlay(cx))
             .children(menu)
     }
 }
