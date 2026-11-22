@@ -3968,14 +3968,16 @@ impl HubView {
                                     .color(Color::Muted)
                                     .truncate(),
                             )
-                            // The green dot already says connected.
-                            .when(server.state != mcp::State::Connected, |this| {
-                                this.child(
-                                    Label::new(server.summary())
-                                        .size(LabelSize::Small)
-                                        .color(Color::Placeholder),
-                                )
-                            }),
+                            .when(
+                                !matches!(server.state, mcp::State::Connected | mcp::State::Failed),
+                                |this| {
+                                    this.child(
+                                        Label::new(server.summary())
+                                            .size(LabelSize::Small)
+                                            .color(Color::Placeholder),
+                                    )
+                                },
+                            ),
                     )
                     .when_some(server.error.clone(), |this, error| {
                         this.tooltip(Tooltip::text(error))
