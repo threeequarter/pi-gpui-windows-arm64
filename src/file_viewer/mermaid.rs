@@ -31,7 +31,16 @@ pub(super) fn render(
     font_family: &str,
 ) -> Result<RasterPreview, String> {
     let svg = render_svg(source, colors, dark, font_family)?;
-    rasterize(&svg)
+    let (pixmap, natural) = rasterize(&svg)?;
+    preview(pixmap, natural)
+}
+
+pub(super) fn render_png(source: &str) -> Result<(Vec<u8>, u32), String> {
+    let theme = crate::ui::Theme::ayu(false);
+    let svg = render_svg(source, &theme.colors, false, "Arial")?;
+    let (pixmap, natural) = rasterize(&svg)?;
+    let png = pixmap.encode_png().map_err(|error| error.to_string())?;
+    Ok((png, natural.width().ceil() as u32))
 }
 
 fn render_svg(
@@ -58,7 +67,7 @@ fn render_svg(
     Ok(svg.svg().to_string())
 }
 
-fn rasterize(svg: &str) -> Result<RasterPreview, String> {
+fn rasterize(svg: &str) -> Result<(Pixmap, usvg::Size), String> {
     let tree =
         usvg::Tree::from_data(svg.as_bytes(), &SVG_OPTIONS).map_err(|error| error.to_string())?;
     let natural = tree.size();
@@ -76,6 +85,11 @@ fn rasterize(svg: &str) -> Result<RasterPreview, String> {
         Transform::from_scale(RASTER_SCALE, RASTER_SCALE),
         &mut pixmap.as_mut(),
     );
+    Ok((pixmap, natural))
+}
+
+fn preview(pixmap: Pixmap, natural: usvg::Size) -> Result<RasterPreview, String> {
+    let (width, height) = (pixmap.width(), pixmap.height());
     let mut bytes = pixmap.take();
     for pixel in bytes.chunks_exact_mut(4) {
         let alpha = u16::from(pixel[3]);
@@ -88,7 +102,8 @@ fn rasterize(svg: &str) -> Result<RasterPreview, String> {
             pixel.swap(0, 2);
         }
     }
-    let pixels = RgbaImage::from_raw(width, height, bytes).ok_or_else(invalid_size)?;
+    let pixels = RgbaImage::from_raw(width, height, bytes)
+        .ok_or_else(|| "the diagram raster size is invalid".to_string())?;
     RasterPreview::new(pixels, size(px(natural.width()), px(natural.height())))
 }
 

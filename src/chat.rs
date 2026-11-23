@@ -100,6 +100,7 @@ const STREAM_OPEN_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECORDS_PER_UPDATE: usize = 256;
 const LIST_OVERDRAW: f32 = 600.;
 const CONTENT_MAX_WIDTH: f32 = 1100.;
+const ROW_VERTICAL_PADDING: f32 = 6.;
 const MESSAGE_HEADLINE_CHARS: usize = 160;
 /// Horizontal row padding; the fork button sits in the left one.
 const ROW_GUTTER: f32 = 28.;
@@ -3134,7 +3135,7 @@ impl ChatView {
             .flex()
             .justify_center()
             .px(px(ROW_GUTTER))
-            .py(px(6.))
+            .py(px(ROW_VERTICAL_PADDING))
             .child(
                 div()
                     .relative()
@@ -3662,20 +3663,26 @@ impl ChatView {
                     .on_click(cx.listener(|this, _, window, cx| this.submit(&Submit, window, cx))),
             );
 
+        let above_composer = self.widgets.render(widgets::Placement::AboveComposer, cx);
+        let top_padding = if above_composer.is_some() {
+            ROW_VERTICAL_PADDING
+        } else {
+            2.
+        };
         div()
             .flex_none()
             .w_full()
             .flex()
             .justify_center()
             .px(px(20.))
-            .pt(px(2.))
+            .pt(px(top_padding))
             .pb(px(14.))
             .child(
                 v_flex()
                     .w_full()
                     .max_w(px(CONTENT_MAX_WIDTH))
                     .gap(px(6.))
-                    .children(self.widgets.render(widgets::Placement::AboveComposer, cx))
+                    .children(above_composer)
                     .child(activity_line)
                     .child(
                         v_flex()
