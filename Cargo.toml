@@ -27,6 +27,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 dunce = "1"
 # Watches the active project so the Files and Changes panels update on their own.
 notify = "8"
+# Isolates the PDF converter and stages its output before replacing the destination.
+tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"

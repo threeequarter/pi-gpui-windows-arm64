@@ -1,19 +1,20 @@
 //! A read-only view of one project file in its own window, opened from the
 //! Files and Changes panels: markdown rendered, other text with syntax colors
-//! and line numbers, binary files left blank. A file changed against HEAD can
-//! also be shown as an inline or a side-by-side diff. The view follows
-//! changes made to the file on disk.
+//! and line numbers, and common raster images shown as previews. A file changed
+//! against HEAD can also be shown as an inline or a side-by-side diff. The view
+//! follows changes made to the file on disk.
 
 use std::io::Read as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use futures::channel::mpsc;
 use gpui::{
     AnyElement, ClipboardItem, Context, Corners, Entity, FocusHandle, FontWeight, Hsla, KeyBinding,
-    ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, ScrollHandle,
-    ScrollWheelEvent, SharedString, Subscription, Task, Window, WindowControlArea, actions, div,
-    list, point, px,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Pixels,
+    RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, StyledImage, Subscription, Task,
+    Window, WindowControlArea, actions, div, img, list, point, px,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 
@@ -31,6 +32,8 @@ use crate::ui::{SyntaxColors, Tooltip};
 use diff_view::{DiffView, RowStyle};
 
 mod diff_view;
+mod image_preview;
+mod pdf;
 
 actions!(file_viewer, [Close, CopySelection]);
 
@@ -85,6 +88,7 @@ enum DiffState {
 enum Content {
     Loading,
     Binary,
+    Image(Arc<RenderImage>),
     Failed(String),
     Markdown(Vec<Node>),
     Text {
@@ -120,6 +124,7 @@ pub struct FileViewer {
     selection: Entity<TextSelection>,
     focus: FocusHandle,
     focused: bool,
+    exporting_pdf: bool,
     _selection_subscription: Subscription,
     _load: Task<()>,
     _diff_load: Task<()>,
@@ -150,6 +155,7 @@ impl FileViewer {
             selection,
             focus,
             focused: false,
+            exporting_pdf: false,
             _selection_subscription: selection_subscription,
             _load: Task::ready(()),
             _diff_load: Task::ready(()),
@@ -229,12 +235,18 @@ impl FileViewer {
     }
 
     fn start_load(&mut self, cx: &mut Context<Self>) {
-        self.content = Content::Loading;
+        self.set_content(Content::Loading, cx);
         self.cut = false;
         self.markdown_as_text = false;
         self.size = 0;
         self.diff = DiffState::Loading;
         self.read(false, cx);
+    }
+
+    fn set_content(&mut self, content: Content, cx: &mut Context<Self>) {
+        if let Content::Image(image) = std::mem::replace(&mut self.content, content) {
+            cx.defer(move |cx| cx.drop_image(image, None));
+        }
     }
 
     /// Keeps the shown content and the scroll position until the new content
@@ -255,9 +267,9 @@ impl FileViewer {
                         this.cut = loaded.cut;
                         this.size = loaded.size;
                         this.markdown_as_text = loaded.markdown_as_text;
-                        this.content = loaded.content;
+                        this.set_content(loaded.content, cx);
                     }
-                    Err(error) => this.content = Content::Failed(error),
+                    Err(error) => this.set_content(Content::Failed(error), cx),
                 }
                 if reload {
                     // The selected offsets point into the old text.
@@ -357,6 +369,50 @@ impl FileViewer {
 
     fn shows_markdown(&self) -> bool {
         self.mode == ViewMode::File && matches!(self.content, Content::Markdown(_))
+    }
+
+    fn export_pdf(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.exporting_pdf || !is_markdown(&self.path) {
+            return;
+        }
+        let source = self.path.clone();
+        let Some(directory) = source.parent() else {
+            return;
+        };
+        let default_path = source.with_extension("pdf");
+        let suggested_name = default_path.file_name().map(|name| name.to_string_lossy());
+        let picker = cx.prompt_for_new_path(directory, suggested_name.as_deref());
+        let executor = cx.background_executor().clone();
+        self.exporting_pdf = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = match picker.await {
+                Ok(Ok(Some(destination))) if extension(&destination).as_deref() == Some("pdf") => {
+                    executor
+                        .spawn(async move { pdf::export(&source, &destination) })
+                        .await
+                }
+                Ok(Ok(Some(_))) => Err("Choose a filename ending in .pdf.".into()),
+                Ok(Ok(None)) => Ok(()),
+                Ok(Err(error)) => Err(format!("Could not open the save dialog: {error}")),
+                Err(_) => Err("The save dialog closed without a result.".into()),
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.exporting_pdf = false;
+                if let Err(error) = result {
+                    drop(window.prompt(
+                        gpui::PromptLevel::Critical,
+                        "Could not export PDF",
+                        Some(&error),
+                        &["OK"],
+                        cx,
+                    ));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
@@ -551,6 +607,16 @@ impl FileViewer {
         match &self.content {
             Content::Loading => render_message("Loading…".to_string()),
             Content::Binary => div().flex_1().into_any_element(),
+            Content::Image(image) => div()
+                .flex_1()
+                .min_h(px(0.))
+                .p(px(12.))
+                .child(
+                    img(image.clone())
+                        .size_full()
+                        .object_fit(ObjectFit::ScaleDown),
+                )
+                .into_any_element(),
             Content::Failed(error) => render_message(format!("Could not read the file: {error}")),
             Content::Text { lines, .. } if lines.is_empty() => {
                 render_message("Empty file.".to_string())
@@ -750,8 +816,9 @@ impl FileViewer {
             .window_control_area(WindowControlArea::Drag)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _, _| {
-                    this.title_bar_drag_pending = event.click_count == 1;
+                cx.listener(|this, event: &MouseDownEvent, window, _| {
+                    this.title_bar_drag_pending =
+                        event.click_count == 1 && !window.default_prevented();
                 }),
             )
             .on_mouse_up(
@@ -838,6 +905,16 @@ impl FileViewer {
                             .tooltip(Tooltip::text("Open in editor"))
                             .on_click(move |_, _, _| crate::hub::open_in_editor(&path)),
                     )
+                    .when(is_markdown(&self.path), |this| {
+                        this.child(
+                            Button::new("file-viewer-export-pdf", "Export to PDF")
+                                .size(ButtonSize::Compact)
+                                .loading(self.exporting_pdf)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.export_pdf(window, cx);
+                                })),
+                        )
+                    })
                     .children(render_window_controls(window, |window, _| {
                         window.remove_window()
                     })),
@@ -951,9 +1028,33 @@ fn render_message(text: String) -> AnyElement {
         .into_any_element()
 }
 
+fn is_markdown(path: &Path) -> bool {
+    is_markdown_extension(extension(path).as_deref())
+}
+
+fn is_markdown_extension(extension: Option<&str>) -> bool {
+    matches!(extension, Some("md" | "markdown" | "mdx"))
+}
+
+fn extension(path: &Path) -> Option<String> {
+    path.file_name()?
+        .to_string_lossy()
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+}
+
 fn load(path: &Path, syntax: &SyntaxColors) -> Result<Loaded, String> {
     let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     let size = file.metadata().map_or(0, |metadata| metadata.len());
+    let extension = extension(path);
+    if let Some(format) = extension.as_deref().and_then(image_preview::format) {
+        return Ok(Loaded {
+            content: Content::Image(image_preview::load(file, format)?),
+            cut: false,
+            size,
+            markdown_as_text: false,
+        });
+    }
     let mut bytes = Vec::new();
     file.take(MAX_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
@@ -978,10 +1079,8 @@ fn load(path: &Path, syntax: &SyntaxColors) -> Result<Loaded, String> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let extension = name
-        .rsplit_once('.')
-        .map(|(_, extension)| extension.to_ascii_lowercase());
-    let is_markdown = matches!(extension.as_deref(), Some("md" | "markdown" | "mdx"));
+
+    let is_markdown = is_markdown_extension(extension.as_deref());
     if is_markdown && text.len() <= MAX_MARKDOWN_BYTES {
         return Ok(Loaded {
             content: Content::Markdown(markdown::parse(&text)),
@@ -990,7 +1089,7 @@ fn load(path: &Path, syntax: &SyntaxColors) -> Result<Loaded, String> {
             markdown_as_text: false,
         });
     }
-    let language = extension.unwrap_or_else(|| name.clone());
+    let language = extension.unwrap_or(name);
     let lines = split_lines(&text);
     let highlights = line_highlights(&text, &lines, &language, syntax);
     let lines = lines
