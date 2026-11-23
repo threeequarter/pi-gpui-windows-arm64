@@ -3,17 +3,20 @@
 //! Zed's `markdown` crate). The source is parsed once per change into a small
 //! tree; every text block renders as one selectable text element.
 
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, ClipboardItem, ElementId, Entity, FontWeight, Hsla, Pixels, SharedString,
-    TextRun, Window, div, px,
+    AnyElement, App, ClipboardItem, ElementId, Entity, FontWeight, Hsla, Pixels, RenderImage,
+    SharedString, Size, TextRun, Window, div, img, px,
 };
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::selectable::{SelectableText, SpanStyle, TextSelection};
 use crate::settings::Settings;
 use crate::ui::prelude::*;
+use crate::ui::zoom::{self, DiagramZoom};
 
 /// Text plus styled byte ranges (sorted, not overlapping).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -331,6 +334,51 @@ fn heading_level(level: HeadingLevel) -> u8 {
 const PARAGRAPH_SPACING: f32 = 8.;
 const TABLE_MIN_COLUMN_WIDTH: f32 = 48.;
 
+/// A rendered mermaid block: the raster and its logical size.
+pub struct Diagram {
+    pub image: Arc<RenderImage>,
+    pub size: Size<Pixels>,
+}
+
+/// Rendered mermaid blocks by the node keys `render` assigns; an `Err`
+/// keeps the source visible with the error.
+pub type Diagrams = HashMap<String, Result<Diagram, String>>;
+
+/// The mermaid blocks in `nodes`, keyed as `render_with_diagrams` looks them
+/// up.
+pub fn mermaid_sources(key: &str, nodes: &[Node]) -> Vec<(String, String)> {
+    let mut sources = Vec::new();
+    collect_mermaid(key, nodes, true, &mut sources);
+    sources
+}
+
+fn collect_mermaid(key: &str, nodes: &[Node], root: bool, sources: &mut Vec<(String, String)>) {
+    for (index, node) in nodes.iter().enumerate() {
+        let node_key = if root {
+            format!("{key}:{index}")
+        } else {
+            format!("{key}.{index}")
+        };
+        match node {
+            Node::Code { language, text } if language.as_deref() == Some("mermaid") => {
+                sources.push((node_key, text.clone()));
+            }
+            Node::Quote(children) => collect_mermaid(&node_key, children, false, sources),
+            Node::List { items, .. } => {
+                for (index, item) in items.iter().enumerate() {
+                    collect_mermaid(
+                        &format!("{node_key}.{index}"),
+                        &item.children,
+                        false,
+                        sources,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Renders parsed markdown. `key` must be unique and stable per message: it
 /// identifies text blocks for selection and element ids.
 pub fn render(
@@ -340,10 +388,26 @@ pub fn render(
     window: &mut Window,
     cx: &App,
 ) -> AnyElement {
+    render_with_diagrams(key, nodes, selection, &Diagrams::new(), None, window, cx)
+}
+
+/// Like `render`, but mermaid blocks present in `diagrams` show the rendered
+/// image instead of the source.
+pub fn render_with_diagrams(
+    key: &str,
+    nodes: &[Node],
+    selection: &Entity<TextSelection>,
+    diagrams: &Diagrams,
+    zoom: Option<&DiagramZoom>,
+    window: &mut Window,
+    cx: &App,
+) -> AnyElement {
     let settings = Settings::get(cx);
     let renderer = Renderer {
         selection,
         cx,
+        diagrams,
+        zoom,
         body: settings.agent_font_size,
         body_line: settings.agent_line_height(),
         code: settings.buffer_font_size,
@@ -375,6 +439,8 @@ struct Edges {
 struct Renderer<'a> {
     selection: &'a Entity<TextSelection>,
     cx: &'a App,
+    diagrams: &'a Diagrams,
+    zoom: Option<&'a DiagramZoom>,
     body: f32,
     body_line: f32,
     code: f32,
@@ -421,7 +487,14 @@ impl Renderer<'_> {
                     )
                     .into_any_element()
             }
-            Node::Code { language, text } => self.code_block(key, text, language.as_deref(), edges),
+            Node::Code { language, text } => {
+                if language.as_deref() == Some("mermaid")
+                    && let Some(result) = self.diagrams.get(key)
+                {
+                    return self.diagram(key, text, result, edges);
+                }
+                self.code_block(key, text, language.as_deref(), edges)
+            }
             Node::Rule => div()
                 .mt(top(PARAGRAPH_SPACING))
                 .mb(bottom(PARAGRAPH_SPACING))
@@ -489,8 +562,6 @@ impl Renderer<'_> {
                         .collect()
                 })
                 .unwrap_or_default();
-        let code = text.to_string();
-        let group = SharedString::from(format!("{key}:code"));
         let mut scroller = div()
             .id(ElementId::Name(format!("{key}:scroll").into()))
             .flex()
@@ -504,7 +575,74 @@ impl Renderer<'_> {
             );
         // Vertical wheel scrolling must keep moving the transcript.
         scroller.style().restrict_scroll_to_axis = Some(true);
+        self.code_frame(key, text, edges, scroller.into_any_element(), None)
+    }
 
+    /// A rendered mermaid block at its zoomed size, scrolling sideways when
+    /// wider than the view, as Zed's preview does. A failed render keeps the
+    /// source with the error above it.
+    fn diagram(
+        &self,
+        key: &str,
+        text: &str,
+        result: &Result<Diagram, String>,
+        edges: Edges,
+    ) -> AnyElement {
+        let diagram = match result {
+            Ok(diagram) => diagram,
+            Err(error) => {
+                return div()
+                    .mt(if edges.first { px(0.) } else { px(8.) })
+                    .mb(if edges.last { px(0.) } else { px(12.) })
+                    .child(
+                        Label::new(format!("Mermaid: {error}"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Warning),
+                    )
+                    .child(self.code_block(
+                        key,
+                        text,
+                        Some("mermaid"),
+                        Edges {
+                            first: true,
+                            last: true,
+                        },
+                    ))
+                    .into_any_element();
+            }
+        };
+        let factor = self.zoom.map_or(1., |zoom| zoom.factor(key));
+        let sink = self.zoom.map(|zoom| zoom.sink(key));
+        let mut image = img(diagram.image.clone())
+            .w(diagram.size.width * factor)
+            .h(diagram.size.height * factor);
+        if let Some(sink) = &sink {
+            image = image.on_scroll_wheel(zoom::wheel(sink.clone()));
+        }
+        let mut scroller = div()
+            .id(ElementId::Name(format!("{key}:diagram").into()))
+            .flex()
+            .overflow_x_scroll()
+            .child(image);
+        scroller.style().restrict_scroll_to_axis = Some(true);
+        let controls =
+            sink.map(|sink| zoom::controls(key, factor, sink, self.cx).into_any_element());
+        self.code_frame(key, text, edges, scroller.into_any_element(), controls)
+    }
+
+    /// The bordered frame around a code block or diagram, with a copy button
+    /// that appears on hover and copies `text`.
+    fn code_frame(
+        &self,
+        key: &str,
+        text: &str,
+        edges: Edges,
+        body: AnyElement,
+        controls: Option<AnyElement>,
+    ) -> AnyElement {
+        let colors = &self.cx.theme().colors;
+        let code = text.to_string();
+        let group = SharedString::from(format!("{key}:code"));
         div()
             .group(group.clone())
             .relative()
@@ -516,7 +654,10 @@ impl Renderer<'_> {
             .border_1()
             .border_color(colors.border_variant)
             .bg(colors.code_block_background)
-            .child(scroller)
+            .child(body)
+            .when_some(controls, |this, controls| {
+                this.child(div().absolute().top(px(4.)).left(px(4.)).child(controls))
+            })
             .child(
                 h_flex()
                     .absolute()
@@ -779,6 +920,18 @@ mod tests {
         };
         assert!(header);
         assert_eq!(rows[1][1].text, "2");
+    }
+
+    #[test]
+    fn mermaid_sources_use_render_keys() {
+        let nodes = parse("```mermaid\ngraph TD\n```\n\n> ```mermaid\n> pie\n> ```\n");
+        assert_eq!(
+            mermaid_sources("file", &nodes),
+            vec![
+                ("file:0".to_string(), "graph TD".to_string()),
+                ("file:1.0".to_string(), "pie".to_string()),
+            ]
+        );
     }
 
     #[test]

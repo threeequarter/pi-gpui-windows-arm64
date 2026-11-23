@@ -29,6 +29,33 @@ dunce = "1"
 notify = "8"
 # Isolates the PDF converter and stages its output before replacing the destination.
 tempfile = "3"
+# Zed's Mermaid backend: diagram text to raster-safe SVG, no browser. Pinned
+# and feature-selected like Zed's mermaid_render crate (cytoscape layout, no
+# ELK, so no EPL-2.0 notice ships with the binary).
+merman = { version = "=0.9.3", default-features = false, features = [
+    "diagram-class",
+    "diagram-er",
+    "diagram-flowchart",
+    "diagram-gantt",
+    "diagram-git-graph",
+    "diagram-journey",
+    "diagram-mindmap",
+    "diagram-pie",
+    "diagram-quadrant-chart",
+    "diagram-sequence",
+    "diagram-state",
+    "diagram-timeline",
+    "diagram-xychart",
+    "layout-cytoscape",
+    "svg",
+] }
+# Already come with gpui; rasterize the diagram SVG with the system fonts.
+resvg = { version = "0.45", default-features = false, features = [
+    "text",
+    "system-fonts",
+    "memmap-fonts",
+] }
+usvg = "0.45"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"

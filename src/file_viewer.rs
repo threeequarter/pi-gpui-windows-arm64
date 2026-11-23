@@ -4,9 +4,11 @@
 //! against HEAD can also be shown as an inline or a side-by-side diff. The view
 //! follows changes made to the file on disk.
 
+use std::collections::HashMap;
 use std::io::Read as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use futures::channel::mpsc;
@@ -27,12 +29,14 @@ use crate::selectable::{SelectableText, SpanStyle, TextSelection};
 use crate::settings::Settings;
 use crate::ui::prelude::*;
 use crate::ui::scrollbar::{ScrollDrag, thumb_height};
-use crate::ui::{SyntaxColors, Tooltip};
+use crate::ui::zoom::{self, DiagramZoom, Zoom};
+use crate::ui::{SyntaxColors, ThemeColors, Tooltip};
 
 use diff_view::{DiffView, RowStyle};
 
 mod diff_view;
 mod image_preview;
+mod mermaid;
 mod pdf;
 
 actions!(file_viewer, [Close, CopySelection]);
@@ -90,7 +94,10 @@ enum Content {
     Binary,
     Image(Arc<RenderImage>),
     Failed(String),
-    Markdown(Vec<Node>),
+    Markdown {
+        nodes: Vec<Node>,
+        diagrams: markdown::Diagrams,
+    },
     Text {
         lines: Vec<SharedString>,
         highlights: Vec<Vec<(Range<usize>, Hsla)>>,
@@ -119,6 +126,9 @@ pub struct FileViewer {
     size: u64,
     list: ListState,
     markdown_scroll: ScrollHandle,
+    image_scroll: ScrollHandle,
+    image_zoom: f32,
+    diagram_zooms: HashMap<String, f32>,
     scroll_drag: Option<ScrollDrag>,
     title_bar_drag_pending: bool,
     selection: Entity<TextSelection>,
@@ -150,6 +160,9 @@ impl FileViewer {
             size: 0,
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             markdown_scroll: ScrollHandle::new(),
+            image_scroll: ScrollHandle::new(),
+            image_zoom: 1.,
+            diagram_zooms: HashMap::new(),
             scroll_drag: None,
             title_bar_drag_pending: false,
             selection,
@@ -174,6 +187,9 @@ impl FileViewer {
         self.mode = mode;
         self.list = ListState::new(0, ListAlignment::Top, px(400.));
         self.markdown_scroll = ScrollHandle::new();
+        self.image_scroll = ScrollHandle::new();
+        self.image_zoom = 1.;
+        self.diagram_zooms.clear();
         self.scroll_drag = None;
         // A fresh selection also clears the old one and re-points links.
         self.selection = cx.new(|_| Self::selection_for(&self.path, self.focus.clone()));
@@ -244,7 +260,16 @@ impl FileViewer {
     }
 
     fn set_content(&mut self, content: Content, cx: &mut Context<Self>) {
-        if let Content::Image(image) = std::mem::replace(&mut self.content, content) {
+        let images = match std::mem::replace(&mut self.content, content) {
+            Content::Image(image) => vec![image],
+            Content::Markdown { diagrams, .. } => diagrams
+                .into_values()
+                .filter_map(Result::ok)
+                .map(|diagram| diagram.image)
+                .collect(),
+            _ => Vec::new(),
+        };
+        for image in images {
             cx.defer(move |cx| cx.drop_image(image, None));
         }
     }
@@ -256,9 +281,14 @@ impl FileViewer {
     }
 
     fn read(&mut self, reload: bool, cx: &mut Context<Self>) {
-        let syntax = cx.theme().colors.syntax;
+        let theme = cx.theme();
+        let syntax = theme.colors.syntax;
+        let colors = theme.colors.clone();
+        let dark = theme.is_dark();
+        let font_family = Settings::get(cx).ui_font_family.clone();
         let read_path = self.path.clone();
-        let read = cx.background_spawn(async move { load(&read_path, &syntax) });
+        let read =
+            cx.background_spawn(async move { load(&read_path, &colors, dark, &font_family) });
         self._load = cx.spawn(async move |this, cx| {
             let result = read.await;
             this.update(cx, |this, cx| {
@@ -368,7 +398,19 @@ impl FileViewer {
     }
 
     fn shows_markdown(&self) -> bool {
-        self.mode == ViewMode::File && matches!(self.content, Content::Markdown(_))
+        self.mode == ViewMode::File && matches!(self.content, Content::Markdown { .. })
+    }
+
+    fn zoom_image(&mut self, direction: Zoom, cx: &mut Context<Self>) {
+        self.image_zoom = zoom::step(self.image_zoom, direction);
+        cx.notify();
+    }
+
+    fn zoom_diagram(&mut self, key: String, direction: Zoom, cx: &mut Context<Self>) {
+        let factor = self.diagram_zooms.get(&key).copied().unwrap_or(1.);
+        self.diagram_zooms
+            .insert(key, zoom::step(factor, direction));
+        cx.notify();
     }
 
     fn export_pdf(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -607,22 +649,73 @@ impl FileViewer {
         match &self.content {
             Content::Loading => render_message("Loading…".to_string()),
             Content::Binary => div().flex_1().into_any_element(),
-            Content::Image(image) => div()
-                .flex_1()
-                .min_h(px(0.))
-                .p(px(12.))
-                .child(
+            Content::Image(image) => {
+                let natural = image.size(0).map(|edge| px(u32::from(edge) as f32));
+                let viewport = self.image_scroll.bounds().size;
+                let entity = cx.entity();
+                let sink: zoom::ZoomSink = Rc::new(move |direction, _, cx| {
+                    entity.update(cx, |this, cx| this.zoom_image(direction, cx));
+                });
+                let preview = if viewport.width > px(0.) && viewport.height > px(0.) {
+                    let fit = (viewport.width / natural.width)
+                        .min(viewport.height / natural.height)
+                        .min(1.);
+                    let size = natural.map(|edge| edge * (fit * self.image_zoom));
+                    img(image.clone())
+                        .w(size.width)
+                        .h(size.height)
+                        .object_fit(ObjectFit::Fill)
+                        .into_any_element()
+                } else {
                     img(image.clone())
                         .size_full()
-                        .object_fit(ObjectFit::ScaleDown),
-                )
-                .into_any_element(),
+                        .object_fit(ObjectFit::ScaleDown)
+                        .into_any_element()
+                };
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .p(px(12.))
+                    .relative()
+                    .child(
+                        div()
+                            .id("file-viewer-image")
+                            .size_full()
+                            .overflow_scroll()
+                            .track_scroll(&self.image_scroll)
+                            .child(
+                                div()
+                                    .min_w_full()
+                                    .min_h_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .on_scroll_wheel(zoom::wheel(sink.clone()))
+                                    .child(preview),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(16.))
+                            .left(px(16.))
+                            .child(zoom::controls("file-image", self.image_zoom, sink, cx)),
+                    )
+                    .into_any_element()
+            }
             Content::Failed(error) => render_message(format!("Could not read the file: {error}")),
             Content::Text { lines, .. } if lines.is_empty() => {
                 render_message("Empty file.".to_string())
             }
-            Content::Markdown(nodes) => {
+            Content::Markdown { nodes, diagrams } => {
                 let settings = Settings::get(cx);
+                let entity = cx.entity();
+                let zoom = DiagramZoom::new(
+                    self.diagram_zooms.clone(),
+                    Rc::new(move |key, direction, _, cx| {
+                        entity.update(cx, |this, cx| this.zoom_diagram(key, direction, cx));
+                    }),
+                );
                 div()
                     .id("file-viewer-markdown")
                     .flex_1()
@@ -633,7 +726,15 @@ impl FileViewer {
                     .py(px(14.))
                     .text_size(px(settings.agent_font_size))
                     .line_height(px(settings.agent_line_height()))
-                    .child(markdown::render("file", nodes, &self.selection, window, cx))
+                    .child(markdown::render_with_diagrams(
+                        "file",
+                        nodes,
+                        &self.selection,
+                        diagrams,
+                        Some(&zoom),
+                        window,
+                        cx,
+                    ))
                     .into_any_element()
             }
             Content::Text { lines, .. } => {
@@ -1036,6 +1137,10 @@ fn is_markdown_extension(extension: Option<&str>) -> bool {
     matches!(extension, Some("md" | "markdown" | "mdx"))
 }
 
+fn is_mermaid_extension(extension: Option<&str>) -> bool {
+    matches!(extension, Some("mmd" | "mermaid"))
+}
+
 fn extension(path: &Path) -> Option<String> {
     path.file_name()?
         .to_string_lossy()
@@ -1043,7 +1148,12 @@ fn extension(path: &Path) -> Option<String> {
         .map(|(_, extension)| extension.to_ascii_lowercase())
 }
 
-fn load(path: &Path, syntax: &SyntaxColors) -> Result<Loaded, String> {
+fn load(
+    path: &Path,
+    colors: &ThemeColors,
+    dark: bool,
+    font_family: &str,
+) -> Result<Loaded, String> {
     let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     let size = file.metadata().map_or(0, |metadata| metadata.len());
     let extension = extension(path);
@@ -1081,9 +1191,23 @@ fn load(path: &Path, syntax: &SyntaxColors) -> Result<Loaded, String> {
         .unwrap_or_default();
 
     let is_markdown = is_markdown_extension(extension.as_deref());
-    if is_markdown && text.len() <= MAX_MARKDOWN_BYTES {
+    let is_mermaid = is_mermaid_extension(extension.as_deref());
+    if (is_markdown || is_mermaid) && text.len() <= MAX_MARKDOWN_BYTES {
+        // A standalone diagram file is one mermaid block.
+        let nodes = if is_mermaid {
+            vec![Node::Code {
+                language: Some("mermaid".to_string()),
+                text: text.trim_end_matches('\n').to_string(),
+            }]
+        } else {
+            markdown::parse(&text)
+        };
+        let mut diagrams = markdown::Diagrams::new();
+        for (key, source) in markdown::mermaid_sources("file", &nodes) {
+            diagrams.insert(key, mermaid::render(&source, colors, dark, font_family));
+        }
         return Ok(Loaded {
-            content: Content::Markdown(markdown::parse(&text)),
+            content: Content::Markdown { nodes, diagrams },
             cut,
             size,
             markdown_as_text: false,
@@ -1091,7 +1215,7 @@ fn load(path: &Path, syntax: &SyntaxColors) -> Result<Loaded, String> {
     }
     let language = extension.unwrap_or(name);
     let lines = split_lines(&text);
-    let highlights = line_highlights(&text, &lines, &language, syntax);
+    let highlights = line_highlights(&text, &lines, &language, &colors.syntax);
     let lines = lines
         .into_iter()
         .map(|(_, line)| SharedString::from(line.to_string()))

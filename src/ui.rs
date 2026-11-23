@@ -15,6 +15,7 @@ pub mod pi_gui_theme;
 pub mod scrollbar;
 mod theme;
 pub mod user_theme;
+pub mod zoom;
 
 pub use animation::AnimationTicker;
 pub use button::{Button, ButtonSize, ButtonStyle, IconButton, TintColor};

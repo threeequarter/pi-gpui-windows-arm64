@@ -4502,7 +4502,11 @@ impl HubView {
                                 .toggle_state(self.settings_page.is_some())
                                 .tooltip(Tooltip::with_keys("Settings", "⌘,"))
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_settings(&OpenSettings, window, cx)
+                                    if this.settings_page.is_some() {
+                                        this.close_settings(cx);
+                                    } else {
+                                        this.open_settings(&OpenSettings, window, cx);
+                                    }
                                 })),
                         )
                     })
