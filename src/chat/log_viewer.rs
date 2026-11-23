@@ -293,7 +293,6 @@ impl ChatView {
                         .w(px(980.))
                         .max_w(relative(0.94))
                         .h(relative(0.86))
-                        .rounded(px(10.))
                         .border_1()
                         .border_color(colors.border)
                         .bg(colors.editor_background)
@@ -306,8 +305,6 @@ impl ChatView {
                                 .gap(px(8.))
                                 .px(px(14.))
                                 .py(px(8.))
-                                // overflow_hidden clips to a rectangle, so the header rounds itself.
-                                .rounded_t(px(9.))
                                 .border_b_1()
                                 .border_color(colors.border_variant)
                                 .bg(colors.panel_background)

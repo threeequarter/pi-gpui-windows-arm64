@@ -323,7 +323,6 @@ impl DiffPanel {
             .key_context(BRANCH_PICKER_CONTEXT)
             .w(px(340.))
             .mt(px(4.))
-            .rounded(px(8.))
             .border_1()
             .border_color(colors.border)
             .bg(colors.elevated_surface_background)
@@ -436,7 +435,6 @@ impl DiffPanel {
                         .id(("branch-local", index))
                         .flex_none()
                         .px(px(4.))
-                        .rounded(px(3.))
                         .border_1()
                         .border_color(colors.border_variant)
                         .tooltip(Tooltip::text(

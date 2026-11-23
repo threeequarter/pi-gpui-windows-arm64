@@ -1081,7 +1081,6 @@ impl FilesPanel {
                     .pl(px(8. + row.depth as f32 * INDENT))
                     .pr(px(8.))
                     .gap(px(4.))
-                    .rounded(px(4.))
                     .cursor_pointer()
                     .when(selected, |this| this.bg(colors.ghost_element_selected))
                     .when(
@@ -1299,7 +1298,6 @@ impl FilesPanel {
                 .h(ui_px(cx, 28.))
                 .px(px(8.))
                 .gap(px(8.))
-                .rounded(px(5.))
                 .cursor_pointer()
                 .hover(|style| style.bg(colors.element_hover))
                 .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Default))
@@ -1470,7 +1468,6 @@ impl FilesPanel {
                     .id("file-menu")
                     .w(px(220.))
                     .p(px(4.))
-                    .rounded(px(8.))
                     .border_1()
                     .border_color(colors.border)
                     .bg(colors.elevated_surface_background)
@@ -1549,7 +1546,6 @@ impl Render for FilesPanel {
                         }
                     }))
                     .size_full()
-                    .px(px(6.))
                     .pb(px(10.)),
                 )
                 .children(self.render_edit_overlay(cx))
@@ -1709,7 +1705,6 @@ impl Render for DraggedFile {
                     .gap(px(4.))
                     .px(px(8.))
                     .py(px(4.))
-                    .rounded(px(6.))
                     .border_1()
                     .border_color(colors.border)
                     .bg(colors.elevated_surface_background)

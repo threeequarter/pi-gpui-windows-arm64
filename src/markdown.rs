@@ -654,7 +654,6 @@ impl Renderer<'_> {
             .mt(if edges.first { px(0.) } else { px(8.) })
             .mb(if edges.last { px(0.) } else { px(12.) })
             .p(px(8.))
-            .rounded(px(8.))
             .border_1()
             .border_color(colors.border_variant)
             .bg(colors.code_block_background)
@@ -668,7 +667,6 @@ impl Renderer<'_> {
                     .top(px(4.))
                     .right(px(4.))
                     .bg(colors.elevated_surface_background)
-                    .rounded(px(4.))
                     .opacity(0.)
                     .group_hover(group, |style| style.opacity(1.))
                     .child(
@@ -702,7 +700,6 @@ impl Renderer<'_> {
                     .flex_none()
                     .items_center()
                     .justify_center()
-                    .rounded(px(2.))
                     .border_1()
                     .border_color(colors.border)
                     .bg(colors.element_background)
@@ -758,7 +755,6 @@ impl Renderer<'_> {
             .min_w(px(0.))
             .border_1()
             .border_color(border)
-            .rounded(px(2.))
             .overflow_hidden()
             .children(rows.iter().enumerate().map(|(row_index, row)| {
                 let is_header = header && row_index == 0;

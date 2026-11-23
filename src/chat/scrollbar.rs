@@ -142,7 +142,6 @@ impl ChatView {
                         .w(px(6.))
                         .top(thumb_y)
                         .h(thumb)
-                        .rounded(px(3.))
                         .bg(colors.text_placeholder.opacity(0.45))
                         .hover(|style| style.bg(colors.text_placeholder.opacity(0.7)))
                         // On the thumb, a drag keeps the grab point.

@@ -75,7 +75,6 @@ pub fn controls(id: &str, factor: f32, minimum: f32, sink: ZoomSink, cx: &App) -
     h_flex()
         .gap(px(2.))
         .p(px(2.))
-        .rounded(px(4.))
         .bg(colors.elevated_surface_background)
         .child(
             IconButton::new(

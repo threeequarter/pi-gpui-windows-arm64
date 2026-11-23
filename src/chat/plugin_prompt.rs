@@ -175,7 +175,6 @@ impl ChatView {
         let field_box = h_flex()
             .flex_1()
             .min_w(px(0.))
-            .rounded(px(6.))
             .border_1()
             .border_color(if focused {
                 colors.border_focused

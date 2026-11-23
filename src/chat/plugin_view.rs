@@ -71,7 +71,6 @@ impl ChatView {
             .w(px(MAX_VIEW_WIDTH))
             .max_w_full()
             .overflow_hidden()
-            .rounded(px(6.))
             .border_1()
             .border_color(if focused {
                 colors.border_focused

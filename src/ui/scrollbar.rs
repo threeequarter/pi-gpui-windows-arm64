@@ -79,7 +79,6 @@ impl PreviewScroll {
                 };
                 let active = scroll.grab.get().is_some();
                 let mut quad = fill(thumb, color.opacity(if active { 0.7 } else { 0.45 }));
-                quad.corner_radii = px(3.).into();
                 window.paint_quad(quad);
 
                 let sync =

@@ -1579,7 +1579,7 @@ impl Element for TextElement {
             }
         }
 
-        // A rounded tag behind each chip, one per visual row it spans.
+        // A tag behind each chip, one per visual row it spans.
         let mut chips = Vec::new();
         if !input.content.is_empty() {
             for (range, index) in input.chips() {
@@ -1694,8 +1694,7 @@ impl TextInput {
                     gpui::img(attachment.path.clone())
                         .max_w(px(320.))
                         .max_h(px(240.))
-                        .object_fit(gpui::ObjectFit::Contain)
-                        .rounded(px(4.)),
+                        .object_fit(gpui::ObjectFit::Contain),
                 )
                 .into_any_element(),
             AttachmentKind::File => div()
@@ -1720,7 +1719,6 @@ impl TextInput {
                     .child(
                         div()
                             .mb(px(6.))
-                            .rounded(px(8.))
                             .border_1()
                             .border_color(colors.border)
                             .bg(colors.elevated_surface_background)

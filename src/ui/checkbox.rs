@@ -100,7 +100,6 @@ impl RenderOnce for Checkbox {
             .items_center()
             .justify_center()
             .size(px(HIT_SIZE))
-            .rounded(px(4.))
             .when(interactive, |this| {
                 this.cursor_pointer()
                     .hover(|style| style.bg(colors.ghost_element_hover))
@@ -126,7 +125,6 @@ impl RenderOnce for Checkbox {
                     .items_center()
                     .justify_center()
                     .size(px(BOX_SIZE))
-                    .rounded(px(3.))
                     .border_1()
                     .border_color(border)
                     .bg(background)

@@ -129,7 +129,6 @@ impl Widgets {
                     .pl(px(8.))
                     .pr(px(4.))
                     .py(px(2.))
-                    .rounded(px(6.))
                     .border_1()
                     .border_color(colors.border_variant)
                     .bg(colors.panel_background)

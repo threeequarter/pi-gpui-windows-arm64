@@ -707,7 +707,6 @@ impl ChatView {
                             .gap(px(8.))
                             .px(px(8.))
                             .py(px(5.))
-                            .rounded(px(5.))
                             .cursor_pointer()
                             .when(active, |this| this.bg(colors.element_selected))
                             .hover(|style| style.bg(colors.element_hover))
@@ -757,7 +756,6 @@ impl ChatView {
                                 .gap(px(8.))
                                 .px(px(8.))
                                 .py(px(5.))
-                                .rounded(px(5.))
                                 .cursor_pointer()
                                 .hover(|style| style.bg(colors.element_hover))
                                 .child(
@@ -860,7 +858,6 @@ impl ChatView {
             .gap(px(8.))
             .px(px(12.))
             .py(px(10.))
-            .rounded(px(8.))
             .border_1()
             .border_color(if pending {
                 colors.border_focused

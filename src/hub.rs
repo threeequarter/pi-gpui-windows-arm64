@@ -211,7 +211,6 @@ impl Render for DraggedWorkspace {
             .gap(px(6.))
             .h(ui_px(cx, 26.))
             .px(px(8.))
-            .rounded(px(5.))
             .bg(colors.elevated_surface_background)
             .border_1()
             .border_color(colors.border)
@@ -244,7 +243,6 @@ impl Render for DraggedTab {
             .h(ui_px(cx, 26.))
             .max_w(px(220.))
             .px(px(10.))
-            .rounded(px(5.))
             .bg(colors.elevated_surface_background)
             .border_1()
             .border_color(colors.border)
@@ -1724,7 +1722,6 @@ impl HubView {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
-                    .px(px(6.))
                     .pb(px(10.))
                     .children(workspaces),
             )
@@ -2047,7 +2044,6 @@ impl HubView {
                         .h(ui_px(cx, 24.))
                         .px(px(6.))
                         .gap(px(5.))
-                        .rounded(px(5.))
                         .cursor_pointer()
                         .when(selected, |this| this.bg(colors.ghost_element_selected))
                         .hover(|style| style.bg(colors.ghost_element_hover))
@@ -2125,7 +2121,6 @@ impl HubView {
                 .h(ui_px(cx, 28.))
                 .px(px(8.))
                 .gap(px(8.))
-                .rounded(px(5.))
                 .cursor_pointer()
                 .hover(|style| style.bg(colors.element_hover))
                 .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Default))
@@ -2152,7 +2147,6 @@ impl HubView {
                     .id("panel-menu")
                     .w(px(180.))
                     .p(px(4.))
-                    .rounded(px(8.))
                     .border_1()
                     .border_color(colors.border)
                     .bg(colors.elevated_surface_background)
@@ -2482,7 +2476,6 @@ impl HubView {
         v_flex()
             .id(workspace_id("workspace-block"))
             .mb(px(2.))
-            .rounded(px(5.))
             .drag_over::<DraggedWorkspace>(move |style, dragged, _, _| {
                 if dragged.index == index || dragged.favorite != favorite {
                     style
@@ -2760,7 +2753,6 @@ impl HubView {
                     .h(ui_px(cx, 28.))
                     .px(px(8.))
                     .gap(px(8.))
-                    .rounded(px(5.))
                     .when(enabled, |this| {
                         this.cursor_pointer()
                             .hover(|style| style.bg(colors.element_hover))
@@ -2843,7 +2835,6 @@ impl HubView {
                     .id("session-menu")
                     .w(px(190.))
                     .p(px(4.))
-                    .rounded(px(8.))
                     .border_1()
                     .border_color(colors.border)
                     .bg(colors.elevated_surface_background)
@@ -3202,7 +3193,6 @@ impl HubView {
                         .pl(px(12.))
                         .pr(px(6.))
                         .py(px(6.))
-                        .rounded(px(8.))
                         .border_1()
                         .border_color(colors.border_variant)
                         .bg(colors.code_block_background)
@@ -3303,7 +3293,6 @@ impl HubView {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(12.))
                             .border_1()
                             .border_color(colors.border_variant)
                             .bg(colors.elevated_surface_background)
@@ -3476,7 +3465,6 @@ impl HubView {
         let theme_control = h_flex()
             .p(px(2.))
             .gap(px(2.))
-            .rounded(px(7.))
             .border_1()
             .border_color(colors.border_variant)
             .bg(colors.element_background)
@@ -3488,7 +3476,6 @@ impl HubView {
                     .px(px(10.))
                     .flex()
                     .items_center()
-                    .rounded(px(5.))
                     .border_1()
                     .cursor_pointer()
                     .when(selected, |this| {
@@ -3528,7 +3515,6 @@ impl HubView {
                 .gap(px(4.))
                 .px(px(12.))
                 .py(px(8.))
-                .rounded(px(6.))
                 .bg(colors.warning_background)
                 .children(theme_problems.into_iter().map(|problem| {
                     h_flex()
@@ -3601,7 +3587,6 @@ impl HubView {
                 .gap(px(8.))
                 .px(px(12.))
                 .py(px(8.))
-                .rounded(px(6.))
                 .bg(colors.error_background)
                 .child(Icon::new(IconName::Warning).size(IconSize::XSmall).color(Color::Error))
                 .child(
@@ -3682,7 +3667,6 @@ impl HubView {
                     .flex()
                     .items_center()
                     .when(on, |this| this.justify_end())
-                    .rounded_full()
                     .border_1()
                     .cursor_pointer()
                     .map(|this| {
@@ -3706,7 +3690,6 @@ impl HubView {
             SettingKind::Select(options) => h_flex()
                 .p(px(2.))
                 .gap(px(2.))
-                .rounded(px(7.))
                 .border_1()
                 .border_color(colors.border_variant)
                 .bg(colors.element_background)
@@ -3722,7 +3705,6 @@ impl HubView {
                         .px(px(10.))
                         .flex()
                         .items_center()
-                        .rounded(px(5.))
                         .border_1()
                         .cursor_pointer()
                         .when(selected, |this| {
@@ -3757,7 +3739,6 @@ impl HubView {
                 let submit_key = key.clone();
                 div()
                     .w(width)
-                    .rounded(px(6.))
                     .border_1()
                     .border_color(colors.border)
                     .bg(colors.editor_background)
@@ -4060,7 +4041,6 @@ impl HubView {
                 .h(ui_px(cx, 20.))
                 .px(px(6.))
                 .gap(px(3.))
-                .rounded(px(5.))
                 .border_1()
                 .border_color(if accent {
                     colors.text_accent.opacity(0.35)
@@ -4152,7 +4132,6 @@ impl HubView {
             .w(px(320.))
             .p(px(12.))
             .gap(px(10.))
-            .rounded(px(10.))
             .border_1()
             .border_color(colors.border)
             .bg(colors.elevated_surface_background)

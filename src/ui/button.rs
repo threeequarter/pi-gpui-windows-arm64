@@ -162,7 +162,6 @@ impl ButtonLike {
             .justify_center()
             .gap(px(4.))
             .h(height)
-            .rounded(px(5.))
             .bg(background)
             .when(self.square, |this| this.w(height))
             .when(!self.square, |this| this.px(px(8.)))

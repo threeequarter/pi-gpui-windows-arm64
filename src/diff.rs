@@ -921,7 +921,6 @@ impl DiffPanel {
                                     .h(ui_px(cx, 22.))
                                     .px(px(4.))
                                     .gap(px(2.))
-                                    .rounded(px(4.))
                                     .cursor_pointer()
                                     .when(self.branch_picker.is_some(), |this| {
                                         this.bg(colors.ghost_element_selected)
@@ -1024,7 +1023,6 @@ impl DiffPanel {
                                 .h(ui_px(cx, 22.))
                                 .px(px(4.))
                                 .gap(px(2.))
-                                .rounded(px(4.))
                                 .cursor_pointer()
                                 .when(self.repository_menu, |this| {
                                     this.bg(colors.ghost_element_selected)
@@ -1161,7 +1159,6 @@ impl DiffPanel {
                                 .overflow_y_scroll()
                                 .mt(px(4.))
                                 .p(px(4.))
-                                .rounded(px(8.))
                                 .border_1()
                                 .border_color(colors.border)
                                 .bg(colors.elevated_surface_background)
@@ -1255,7 +1252,6 @@ impl DiffPanel {
                                 .w(px(200.))
                                 .mt(px(4.))
                                 .p(px(4.))
-                                .rounded(px(8.))
                                 .border_1()
                                 .border_color(colors.border)
                                 .bg(colors.elevated_surface_background)
@@ -1382,7 +1378,6 @@ impl DiffPanel {
             .pl(px(4. + depth as f32 * ROW_INDENT))
             .pr(px(4.))
             .gap(px(6.))
-            .rounded(px(5.))
             .cursor_pointer()
             .hover(|style| style.bg(hover))
     }
@@ -1585,7 +1580,6 @@ impl Render for DiffPanel {
                             }),
                         )
                         .size_full()
-                        .px(px(6.))
                         .pb(px(10.)),
                     )
                     .into_any_element()

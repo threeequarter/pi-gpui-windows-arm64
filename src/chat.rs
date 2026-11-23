@@ -2636,7 +2636,6 @@ impl ChatView {
                 .mt(px(12.))
                 .px(px(12.))
                 .py(px(10.))
-                .rounded(px(6.))
                 .border_1()
                 .border_color(colors.error.opacity(0.4))
                 .bg(colors.error_background)
@@ -2728,7 +2727,6 @@ impl ChatView {
                             .gap(px(6.))
                             .px(px(12.))
                             .py(px(8.))
-                            .rounded(px(8.))
                             .border_1()
                             .border_color(colors.border_focused)
                             .bg(colors.panel_background)
@@ -2764,7 +2762,6 @@ impl ChatView {
                             .pl(px(12.))
                             .pr(px(4.))
                             .py(px(8.))
-                            .rounded(px(8.))
                             .border_1()
                             .border_color(colors.border)
                             .bg(colors.panel_background)
@@ -2840,7 +2837,6 @@ impl ChatView {
                                 .gap(px(6.))
                                 .px(px(10.))
                                 .py(px(6.))
-                                .rounded(px(6.))
                                 .bg(colors.error_background)
                                 .child(
                                     div().pt(px(2.)).child(
@@ -2902,7 +2898,6 @@ impl ChatView {
                         .into_any_element(),
                 };
                 v_flex()
-                    .rounded(px(6.))
                     .border_1()
                     .border_color(colors.border_variant)
                     .overflow_hidden()
@@ -3027,7 +3022,6 @@ impl ChatView {
                     div()
                         .px(px(14.))
                         .py(px(10.))
-                        .rounded(px(8.))
                         .border_1()
                         .border_color(colors.border_variant)
                         .bg(colors.elevated_surface_background)
@@ -3157,7 +3151,6 @@ impl ChatView {
                                 .top(px(-9.))
                                 .right(px(8.))
                                 .px(px(6.))
-                                .rounded(px(5.))
                                 .border_1()
                                 .border_color(colors.border_variant)
                                 .bg(colors.editor_background)
@@ -3243,7 +3236,6 @@ impl ChatView {
                 ))
         });
         v_flex()
-            .rounded(px(6.))
             .border_1()
             .border_color(colors.border_variant)
             .overflow_hidden()
@@ -3469,7 +3461,6 @@ impl ChatView {
             .key_context(MODEL_PICKER_CONTEXT)
             .w(px(380.))
             .mb(px(6.))
-            .rounded(px(8.))
             .border_1()
             .border_color(colors.border)
             .bg(colors.elevated_surface_background)
@@ -3534,7 +3525,6 @@ impl ChatView {
             .h(ui_px(cx, 22.))
             .px(px(6.))
             .min_w(px(0.))
-            .rounded(px(5.))
             .cursor_pointer()
             .when(open, |this| this.bg(colors.ghost_element_selected))
             .hover(|style| style.bg(colors.ghost_element_hover))
@@ -3711,7 +3701,6 @@ impl ChatView {
                             .children(slash_menu)
                             .children(mention_menu)
                             .w_full()
-                            .rounded(px(8.))
                             .border_1()
                             .border_color(if focused {
                                 colors.border_focused
@@ -4216,7 +4205,6 @@ fn thumbnails(row: usize, images: &[Picture], colors: &crate::ui::ThemeColors) -
             };
             div()
                 .id(ElementId::Name(format!("thumb-{row}-{position}").into()))
-                .rounded(px(6.))
                 .border_1()
                 .border_color(colors.border_variant)
                 .overflow_hidden()

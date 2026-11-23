@@ -172,7 +172,6 @@ impl ChatView {
             ),
         };
         v_flex()
-            .rounded(px(6.))
             .border_1()
             .border_color(colors.border_variant)
             .overflow_hidden()
