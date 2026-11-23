@@ -100,11 +100,9 @@ impl RenderOnce for ListItem {
             .items_center()
             .gap(px(6.))
             .w_full()
-            .h(ui_px(cx, ROW_HEIGHT - 2.))
-            .my(ui_px(cx, 1.))
+            .h(ui_px(cx, ROW_HEIGHT))
             .pl(px(6. + self.indent_level as f32 * INDENT_WIDTH))
             .pr(px(4.))
-            .rounded(px(5.))
             .when(self.selected, |this| this.bg(colors.ghost_element_selected))
             .when(!self.selected, |this| {
                 this.hover(|style| style.bg(colors.ghost_element_hover))
