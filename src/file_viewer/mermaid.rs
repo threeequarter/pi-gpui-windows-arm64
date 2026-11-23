@@ -5,17 +5,15 @@
 
 use std::sync::{Arc, LazyLock};
 
-use gpui::{Hsla, RenderImage, Rgba, px, size};
-use image::{Frame, RgbaImage};
+use gpui::{Hsla, Rgba, px, size};
+use image::RgbaImage;
+use resvg::tiny_skia::{IntSize, Pixmap, Transform};
 
-use crate::markdown::Diagram;
 use crate::ui::ThemeColors;
+use crate::ui::raster_preview::{RasterPreview, raster_bytes};
 
 /// Rasterize at twice the logical size, as gpui does for its SVG icons.
 const RASTER_SCALE: f32 = 2.;
-/// Same bounds as the raster image previews.
-const MAX_DIAGRAM_EDGE: u32 = 8192;
-const MAX_DIAGRAM_PIXELS: u64 = 32 << 20;
 
 static SVG_OPTIONS: LazyLock<usvg::Options<'static>> = LazyLock::new(|| {
     let mut fontdb = usvg::fontdb::Database::new();
@@ -31,7 +29,7 @@ pub(super) fn render(
     colors: &ThemeColors,
     dark: bool,
     font_family: &str,
-) -> Result<Diagram, String> {
+) -> Result<RasterPreview, String> {
     let svg = render_svg(source, colors, dark, font_family)?;
     rasterize(&svg)
 }
@@ -60,47 +58,38 @@ fn render_svg(
     Ok(svg.svg().to_string())
 }
 
-fn rasterize(svg: &str) -> Result<Diagram, String> {
+fn rasterize(svg: &str) -> Result<RasterPreview, String> {
     let tree =
         usvg::Tree::from_data(svg.as_bytes(), &SVG_OPTIONS).map_err(|error| error.to_string())?;
     let natural = tree.size();
     let width = (natural.width() * RASTER_SCALE).ceil() as u32;
     let height = (natural.height() * RASTER_SCALE).ceil() as u32;
-    if width > MAX_DIAGRAM_EDGE
-        || height > MAX_DIAGRAM_EDGE
-        || u64::from(width) * u64::from(height) > MAX_DIAGRAM_PIXELS
-    {
-        return Err("diagrams are limited to 8192 pixels per side and 32 megapixels".into());
+    let invalid_size = || "the diagram raster size is invalid".to_string();
+    let dimensions = IntSize::from_wh(width, height).ok_or_else(invalid_size)?;
+    if width > i32::MAX as u32 / 4 {
+        return Err(invalid_size());
     }
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
-        .ok_or_else(|| "the diagram raster size is invalid".to_string())?;
+    let mut pixmap =
+        Pixmap::from_vec(raster_bytes(width, height)?, dimensions).ok_or_else(invalid_size)?;
     resvg::render(
         &tree,
-        resvg::tiny_skia::Transform::from_scale(RASTER_SCALE, RASTER_SCALE),
+        Transform::from_scale(RASTER_SCALE, RASTER_SCALE),
         &mut pixmap.as_mut(),
     );
-    let mut pixels = RgbaImage::new(pixmap.width(), pixmap.height());
-    for (pixel, premultiplied) in pixels.pixels_mut().zip(pixmap.pixels()) {
-        let alpha = premultiplied.alpha();
-        let channel = |value: u8| {
-            if alpha == 0 {
-                0
-            } else {
-                (u16::from(value) * 255 / u16::from(alpha)).min(255) as u8
+    let mut bytes = pixmap.take();
+    for pixel in bytes.chunks_exact_mut(4) {
+        let alpha = u16::from(pixel[3]);
+        if alpha == 0 {
+            pixel.fill(0);
+        } else {
+            for channel in &mut pixel[..3] {
+                *channel = (u16::from(*channel) * 255 / alpha).min(255) as u8;
             }
-        };
-        // RenderImage takes BGRA bytes, as the raster previews produce.
-        *pixel = image::Rgba([
-            channel(premultiplied.blue()),
-            channel(premultiplied.green()),
-            channel(premultiplied.red()),
-            alpha,
-        ]);
+            pixel.swap(0, 2);
+        }
     }
-    Ok(Diagram {
-        image: Arc::new(RenderImage::new(vec![Frame::new(pixels)])),
-        size: size(px(natural.width()), px(natural.height())),
-    })
+    let pixels = RgbaImage::from_raw(width, height, bytes).ok_or_else(invalid_size)?;
+    RasterPreview::new(pixels, size(px(natural.width()), px(natural.height())))
 }
 
 fn config(colors: &ThemeColors, dark: bool, font_family: &str) -> merman::MermaidConfig {
@@ -249,7 +238,7 @@ mod tests {
             "Segoe UI",
         )
         .expect("a flowchart should render");
-        let size = diagram.image.size(0);
+        let size = diagram.images().next().expect("a raster tile").size(0);
         assert!(size.width.0 > 0 && size.height.0 > 0);
         assert!(diagram.size.width > px(0.) && diagram.size.height > px(0.));
     }

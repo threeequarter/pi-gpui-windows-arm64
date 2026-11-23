@@ -9,14 +9,13 @@ use std::io::Read as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 
 use futures::channel::mpsc;
 use gpui::{
     AnyElement, ClipboardItem, Context, Corners, Entity, FocusHandle, FontWeight, Hsla, KeyBinding,
-    ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Pixels,
-    RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, StyledImage, Subscription, Task,
-    Window, WindowControlArea, actions, div, img, list, point, px,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, ScrollHandle,
+    ScrollWheelEvent, SharedString, Subscription, Task, Window, WindowControlArea, actions, div,
+    list, point, px,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 
@@ -28,8 +27,9 @@ use crate::project_watcher;
 use crate::selectable::{SelectableText, SpanStyle, TextSelection};
 use crate::settings::Settings;
 use crate::ui::prelude::*;
-use crate::ui::scrollbar::{ScrollDrag, thumb_height};
-use crate::ui::zoom::{self, DiagramZoom, Zoom};
+use crate::ui::raster_preview::RasterPreview;
+use crate::ui::scrollbar::{PreviewScroll, ScrollDrag, thumb_height};
+use crate::ui::zoom::{self, DiagramView, DiagramZoom, Zoom};
 use crate::ui::{SyntaxColors, ThemeColors, Tooltip};
 
 use diff_view::{DiffView, RowStyle};
@@ -92,7 +92,7 @@ enum DiffState {
 enum Content {
     Loading,
     Binary,
-    Image(Arc<RenderImage>),
+    Image(RasterPreview),
     Failed(String),
     Markdown {
         nodes: Vec<Node>,
@@ -126,9 +126,9 @@ pub struct FileViewer {
     size: u64,
     list: ListState,
     markdown_scroll: ScrollHandle,
-    image_scroll: ScrollHandle,
-    image_zoom: f32,
-    diagram_zooms: HashMap<String, f32>,
+    image_scroll: PreviewScroll,
+    image_zoom: Option<f32>,
+    diagram_views: HashMap<String, DiagramView>,
     scroll_drag: Option<ScrollDrag>,
     title_bar_drag_pending: bool,
     selection: Entity<TextSelection>,
@@ -160,9 +160,9 @@ impl FileViewer {
             size: 0,
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             markdown_scroll: ScrollHandle::new(),
-            image_scroll: ScrollHandle::new(),
-            image_zoom: 1.,
-            diagram_zooms: HashMap::new(),
+            image_scroll: PreviewScroll::default(),
+            image_zoom: None,
+            diagram_views: HashMap::new(),
             scroll_drag: None,
             title_bar_drag_pending: false,
             selection,
@@ -187,9 +187,9 @@ impl FileViewer {
         self.mode = mode;
         self.list = ListState::new(0, ListAlignment::Top, px(400.));
         self.markdown_scroll = ScrollHandle::new();
-        self.image_scroll = ScrollHandle::new();
-        self.image_zoom = 1.;
-        self.diagram_zooms.clear();
+        self.image_scroll = PreviewScroll::default();
+        self.image_zoom = None;
+        self.diagram_views.clear();
         self.scroll_drag = None;
         // A fresh selection also clears the old one and re-points links.
         self.selection = cx.new(|_| Self::selection_for(&self.path, self.focus.clone()));
@@ -260,17 +260,27 @@ impl FileViewer {
     }
 
     fn set_content(&mut self, content: Content, cx: &mut Context<Self>) {
-        let images = match std::mem::replace(&mut self.content, content) {
+        if let Content::Markdown { diagrams, .. } = &content {
+            self.diagram_views.retain(|key, _| diagrams.contains_key(key));
+            for (key, diagram) in diagrams {
+                if diagram.is_ok() {
+                    self.diagram_views.entry(key.clone()).or_default();
+                }
+            }
+        }
+        let previews = match std::mem::replace(&mut self.content, content) {
             Content::Image(image) => vec![image],
-            Content::Markdown { diagrams, .. } => diagrams
-                .into_values()
-                .filter_map(Result::ok)
-                .map(|diagram| diagram.image)
-                .collect(),
+            Content::Markdown { diagrams, .. } => {
+                diagrams.into_values().filter_map(Result::ok).collect()
+            }
             _ => Vec::new(),
         };
-        for image in images {
-            cx.defer(move |cx| cx.drop_image(image, None));
+        if !previews.is_empty() {
+            cx.defer(move |cx| {
+                for image in previews.iter().flat_map(RasterPreview::images) {
+                    cx.drop_image(image, None);
+                }
+            });
         }
     }
 
@@ -401,16 +411,34 @@ impl FileViewer {
         self.mode == ViewMode::File && matches!(self.content, Content::Markdown { .. })
     }
 
+    fn image_zoom_factors(&self, image: &RasterPreview) -> (f32, f32) {
+        let viewport = self.image_scroll.handle.bounds().size;
+        let fit = if viewport.width > px(0.) && viewport.height > px(0.) {
+            image.fit_scale(viewport)
+        } else {
+            1.
+        };
+        let factor = self.image_zoom.unwrap_or(fit);
+        (factor, zoom::MIN_FACTOR.min(fit).min(factor))
+    }
+
     fn zoom_image(&mut self, direction: Zoom, cx: &mut Context<Self>) {
-        self.image_zoom = zoom::step(self.image_zoom, direction);
-        cx.notify();
+        let Content::Image(image) = &self.content else {
+            return;
+        };
+        let (factor, minimum) = self.image_zoom_factors(image);
+        let next = zoom::step(factor, direction, minimum);
+        if next != factor {
+            self.image_zoom = Some(next);
+            cx.notify();
+        }
     }
 
     fn zoom_diagram(&mut self, key: String, direction: Zoom, cx: &mut Context<Self>) {
-        let factor = self.diagram_zooms.get(&key).copied().unwrap_or(1.);
-        self.diagram_zooms
-            .insert(key, zoom::step(factor, direction));
-        cx.notify();
+        if let Some(view) = self.diagram_views.get_mut(&key) {
+            view.factor = zoom::step(view.factor, direction, zoom::MIN_FACTOR);
+            cx.notify();
+        }
     }
 
     fn export_pdf(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -650,28 +678,12 @@ impl FileViewer {
             Content::Loading => render_message("Loading…".to_string()),
             Content::Binary => div().flex_1().into_any_element(),
             Content::Image(image) => {
-                let natural = image.size(0).map(|edge| px(u32::from(edge) as f32));
-                let viewport = self.image_scroll.bounds().size;
+                let (factor, minimum) = self.image_zoom_factors(image);
                 let entity = cx.entity();
                 let sink: zoom::ZoomSink = Rc::new(move |direction, _, cx| {
                     entity.update(cx, |this, cx| this.zoom_image(direction, cx));
                 });
-                let preview = if viewport.width > px(0.) && viewport.height > px(0.) {
-                    let fit = (viewport.width / natural.width)
-                        .min(viewport.height / natural.height)
-                        .min(1.);
-                    let size = natural.map(|edge| edge * (fit * self.image_zoom));
-                    img(image.clone())
-                        .w(size.width)
-                        .h(size.height)
-                        .object_fit(ObjectFit::Fill)
-                        .into_any_element()
-                } else {
-                    img(image.clone())
-                        .size_full()
-                        .object_fit(ObjectFit::ScaleDown)
-                        .into_any_element()
-                };
+                let preview = image.render(self.image_zoom);
                 div()
                     .flex_1()
                     .min_h(px(0.))
@@ -679,27 +691,40 @@ impl FileViewer {
                     .relative()
                     .child(
                         div()
-                            .id("file-viewer-image")
+                            .relative()
                             .size_full()
-                            .overflow_scroll()
-                            .track_scroll(&self.image_scroll)
                             .child(
                                 div()
-                                    .min_w_full()
-                                    .min_h_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .on_scroll_wheel(zoom::wheel(sink.clone()))
-                                    .child(preview),
-                            ),
+                                    .id("file-viewer-image")
+                                    .size_full()
+                                    .overflow_scroll()
+                                    .track_scroll(&self.image_scroll.handle)
+                                    .child(
+                                        div()
+                                            .min_w_full()
+                                            .min_h_full()
+                                            .map(|this| match self.image_zoom {
+                                                Some(scale) => this
+                                                    .w(image.size.width * scale)
+                                                    .h(image.size.height * scale),
+                                                None => this.size_full(),
+                                            })
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .on_scroll_wheel(zoom::wheel(sink.clone()))
+                                            .on_scroll_wheel(self.image_scroll.shift_wheel())
+                                            .child(preview),
+                                    ),
+                            )
+                            .child(self.image_scroll.horizontal_bar(cx)),
                     )
                     .child(
                         div()
                             .absolute()
                             .top(px(16.))
                             .left(px(16.))
-                            .child(zoom::controls("file-image", self.image_zoom, sink, cx)),
+                            .child(zoom::controls("file-image", factor, minimum, sink, cx)),
                     )
                     .into_any_element()
             }
@@ -711,12 +736,12 @@ impl FileViewer {
                 let settings = Settings::get(cx);
                 let entity = cx.entity();
                 let zoom = DiagramZoom::new(
-                    self.diagram_zooms.clone(),
+                    &self.diagram_views,
                     Rc::new(move |key, direction, _, cx| {
                         entity.update(cx, |this, cx| this.zoom_diagram(key, direction, cx));
                     }),
                 );
-                div()
+                let mut scroller = div()
                     .id("file-viewer-markdown")
                     .flex_1()
                     .min_h(px(0.))
@@ -734,8 +759,9 @@ impl FileViewer {
                         Some(&zoom),
                         window,
                         cx,
-                    ))
-                    .into_any_element()
+                    ));
+                scroller.style().restrict_scroll_to_axis = Some(true);
+                scroller.into_any_element()
             }
             Content::Text { lines, .. } => {
                 let settings = Settings::get(cx);

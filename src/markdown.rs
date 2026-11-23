@@ -5,17 +5,17 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, ClipboardItem, ElementId, Entity, FontWeight, Hsla, Pixels, RenderImage,
-    SharedString, Size, TextRun, Window, div, img, px,
+    AnyElement, App, ClipboardItem, ElementId, Entity, FontWeight, Hsla, Pixels, SharedString,
+    TextRun, Window, div, px,
 };
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::selectable::{SelectableText, SpanStyle, TextSelection};
 use crate::settings::Settings;
 use crate::ui::prelude::*;
+use crate::ui::raster_preview::RasterPreview;
 use crate::ui::zoom::{self, DiagramZoom};
 
 /// Text plus styled byte ranges (sorted, not overlapping).
@@ -334,15 +334,9 @@ fn heading_level(level: HeadingLevel) -> u8 {
 const PARAGRAPH_SPACING: f32 = 8.;
 const TABLE_MIN_COLUMN_WIDTH: f32 = 48.;
 
-/// A rendered mermaid block: the raster and its logical size.
-pub struct Diagram {
-    pub image: Arc<RenderImage>,
-    pub size: Size<Pixels>,
-}
-
 /// Rendered mermaid blocks by the node keys `render` assigns; an `Err`
 /// keeps the source visible with the error.
-pub type Diagrams = HashMap<String, Result<Diagram, String>>;
+pub type Diagrams = HashMap<String, Result<RasterPreview, String>>;
 
 /// The mermaid blocks in `nodes`, keyed as `render_with_diagrams` looks them
 /// up.
@@ -398,7 +392,7 @@ pub fn render_with_diagrams(
     nodes: &[Node],
     selection: &Entity<TextSelection>,
     diagrams: &Diagrams,
-    zoom: Option<&DiagramZoom>,
+    zoom: Option<&DiagramZoom<'_>>,
     window: &mut Window,
     cx: &App,
 ) -> AnyElement {
@@ -440,7 +434,7 @@ struct Renderer<'a> {
     selection: &'a Entity<TextSelection>,
     cx: &'a App,
     diagrams: &'a Diagrams,
-    zoom: Option<&'a DiagramZoom>,
+    zoom: Option<&'a DiagramZoom<'a>>,
     body: f32,
     body_line: f32,
     code: f32,
@@ -585,7 +579,7 @@ impl Renderer<'_> {
         &self,
         key: &str,
         text: &str,
-        result: &Result<Diagram, String>,
+        result: &Result<RasterPreview, String>,
         edges: Edges,
     ) -> AnyElement {
         let diagram = match result {
@@ -611,23 +605,33 @@ impl Renderer<'_> {
                     .into_any_element();
             }
         };
-        let factor = self.zoom.map_or(1., |zoom| zoom.factor(key));
+        let view = self.zoom.and_then(|zoom| zoom.view(key));
+        let factor = view.map_or(1., |view| view.factor);
         let sink = self.zoom.map(|zoom| zoom.sink(key));
-        let mut image = img(diagram.image.clone())
-            .w(diagram.size.width * factor)
-            .h(diagram.size.height * factor);
-        if let Some(sink) = &sink {
-            image = image.on_scroll_wheel(zoom::wheel(sink.clone()));
-        }
+        let image = diagram
+            .render(Some(factor))
+            .when_some(sink.clone(), |this, sink| this.on_scroll_wheel(zoom::wheel(sink)))
+            .when_some(view, |this, view| this.on_scroll_wheel(view.scroll.shift_wheel()));
         let mut scroller = div()
             .id(ElementId::Name(format!("{key}:diagram").into()))
+            .w_full()
+            .min_w(px(0.))
             .flex()
             .overflow_x_scroll()
+            .when_some(view, |this, view| this.track_scroll(&view.scroll.handle))
             .child(image);
         scroller.style().restrict_scroll_to_axis = Some(true);
-        let controls =
-            sink.map(|sink| zoom::controls(key, factor, sink, self.cx).into_any_element());
-        self.code_frame(key, text, edges, scroller.into_any_element(), controls)
+        let body = div()
+            .relative()
+            .w_full()
+            .child(scroller)
+            .when_some(view, |this, view| {
+                this.child(view.scroll.horizontal_bar(self.cx))
+            });
+        let controls = sink.map(|sink| {
+            zoom::controls(key, factor, zoom::MIN_FACTOR, sink, self.cx).into_any_element()
+        });
+        self.code_frame(key, text, edges, body.into_any_element(), controls)
     }
 
     /// The bordered frame around a code block or diagram, with a copy button

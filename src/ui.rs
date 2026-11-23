@@ -12,6 +12,7 @@ mod icon;
 mod label;
 mod list_item;
 pub mod pi_gui_theme;
+pub mod raster_preview;
 pub mod scrollbar;
 mod theme;
 pub mod user_theme;

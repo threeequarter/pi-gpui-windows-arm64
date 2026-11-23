@@ -10,6 +10,7 @@ use super::button::IconButton;
 use super::h_flex;
 use super::icon::{IconName, IconSize};
 use super::list_item::Tooltip;
+use super::scrollbar::PreviewScroll;
 use super::theme::ActiveTheme as _;
 
 pub const MIN_FACTOR: f32 = 0.25;
@@ -22,30 +23,43 @@ pub enum Zoom {
     Out,
 }
 
-pub fn step(factor: f32, direction: Zoom) -> f32 {
+pub fn step(factor: f32, direction: Zoom, minimum: f32) -> f32 {
     match direction {
         Zoom::In => factor * STEP,
         Zoom::Out => factor / STEP,
     }
-    .clamp(MIN_FACTOR, MAX_FACTOR)
+    .clamp(minimum, MAX_FACTOR)
 }
 
 pub type ZoomSink = Rc<dyn Fn(Zoom, &mut Window, &mut App)>;
 pub type DiagramZoomSink = Rc<dyn Fn(String, Zoom, &mut Window, &mut App)>;
 
-/// Diagram factors by markdown node key, plus the sink that records changes.
-pub struct DiagramZoom {
-    factors: HashMap<String, f32>,
+pub struct DiagramView {
+    pub factor: f32,
+    pub scroll: PreviewScroll,
+}
+
+impl Default for DiagramView {
+    fn default() -> Self {
+        Self {
+            factor: 1.,
+            scroll: PreviewScroll::default(),
+        }
+    }
+}
+
+pub struct DiagramZoom<'a> {
+    views: &'a HashMap<String, DiagramView>,
     on_zoom: DiagramZoomSink,
 }
 
-impl DiagramZoom {
-    pub fn new(factors: HashMap<String, f32>, on_zoom: DiagramZoomSink) -> Self {
-        Self { factors, on_zoom }
+impl<'a> DiagramZoom<'a> {
+    pub fn new(views: &'a HashMap<String, DiagramView>, on_zoom: DiagramZoomSink) -> Self {
+        Self { views, on_zoom }
     }
 
-    pub fn factor(&self, key: &str) -> f32 {
-        self.factors.get(key).copied().unwrap_or(1.)
+    pub fn view(&self, key: &str) -> Option<&DiagramView> {
+        self.views.get(key)
     }
 
     pub fn sink(&self, key: &str) -> ZoomSink {
@@ -56,7 +70,7 @@ impl DiagramZoom {
 }
 
 /// The +/- cluster; callers position it over their preview.
-pub fn controls(id: &str, factor: f32, sink: ZoomSink, cx: &App) -> impl IntoElement {
+pub fn controls(id: &str, factor: f32, minimum: f32, sink: ZoomSink, cx: &App) -> impl IntoElement {
     let colors = &cx.theme().colors;
     h_flex()
         .gap(px(2.))
@@ -69,7 +83,7 @@ pub fn controls(id: &str, factor: f32, sink: ZoomSink, cx: &App) -> impl IntoEle
                 IconName::Dash,
             )
             .icon_size(IconSize::XSmall)
-            .disabled(factor <= MIN_FACTOR)
+            .disabled(factor <= minimum)
             .tooltip(Tooltip::text("Zoom out"))
             .on_click({
                 let sink = sink.clone();
