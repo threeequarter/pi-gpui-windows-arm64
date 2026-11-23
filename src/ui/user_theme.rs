@@ -1,7 +1,7 @@
 //! Custom themes: JSON files in the app's `themes` folder.
 //!
 //! A file is either the app's own short format, where six seed colors are
-//! enough and everything else is derived the way the built-in themes are:
+//! enough and everything else is derived from them:
 //!
 //! ```json
 //! {

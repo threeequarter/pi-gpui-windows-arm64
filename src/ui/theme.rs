@@ -41,8 +41,7 @@ pub struct ThemeColors {
     pub syntax: SyntaxColors,
 }
 
-/// Code colors, one per scope group (see `highlight.rs`). The palettes are
-/// the syntax themes pi-gui pairs with each preset.
+/// Code colors, one per scope group (see `highlight.rs`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SyntaxColors {
     pub comment: Hsla,
@@ -125,79 +124,6 @@ impl SyntaxColors {
             0x0550ae, 0x116329, 0x0550ae,
         ))
     }
-
-    /// The syntax theme pi-gui uses for a preset and variant.
-    pub fn for_pi_gui_preset(preset: &str, dark: bool) -> Self {
-        let palette = match (preset, dark) {
-            ("vscode", true) => Self::palette(
-                0x6a9955, 0x569cd6, 0xce9178, 0xb5cea8, 0xdcdcaa, 0x4ec9b0, 0x569cd6, 0xd4d4d4,
-                None, 0x9cdcfe, 0x569cd6, 0x9cdcfe,
-            ),
-            ("vscode", false) => Self::palette(
-                0x008000, 0x0000ff, 0xa31515, 0x098658, 0x795e26, 0x267f99, 0x0000ff, 0x000000,
-                None, 0x001080, 0x800000, 0xe50000,
-            ),
-            ("catppuccin", true) => Self::palette(
-                0x9399b2,
-                0xcba6f7,
-                0xa6e3a1,
-                0xfab387,
-                0x89b4fa,
-                0xf9e2af,
-                0xfab387,
-                0x94e2d5,
-                Some(0x9399b2),
-                0xb4befe,
-                0xcba6f7,
-                0xf9e2af,
-            ),
-            ("catppuccin", false) => Self::palette(
-                0x7c7f93,
-                0x8839ef,
-                0x40a02b,
-                0xfe640b,
-                0x1e66f5,
-                0xdf8e1d,
-                0xfe640b,
-                0x179299,
-                Some(0x7c7f93),
-                0x7287fd,
-                0x8839ef,
-                0xdf8e1d,
-            ),
-            ("tokyo-night", true) => Self::palette(
-                0x565f89,
-                0xbb9af7,
-                0x9ece6a,
-                0xff9e64,
-                0x7aa2f7,
-                0x2ac3de,
-                0xff9e64,
-                0x89ddff,
-                Some(0x89ddff),
-                0x73daca,
-                0xf7768e,
-                0xbb9af7,
-            ),
-            ("nord", true) => Self::palette(
-                0x616e88, 0x81a1c1, 0xa3be8c, 0xb48ead, 0x88c0d0, 0x8fbcbb, 0x81a1c1, 0x81a1c1,
-                None, 0xd8dee9, 0x81a1c1, 0x8fbcbb,
-            ),
-            ("dracula", true) => Self::palette(
-                0x6272a4, 0xff79c6, 0xf1fa8c, 0xbd93f9, 0x50fa7b, 0x8be9fd, 0xbd93f9, 0xff79c6,
-                None, 0x66d9ef, 0xff79c6, 0x50fa7b,
-            ),
-            ("gruvbox", true) => Self::palette(
-                0x928374, 0xfb4934, 0xb8bb26, 0xd3869b, 0xfabd2f, 0xfabd2f, 0xd3869b, 0x8ec07c,
-                None, 0x83a598, 0x8ec07c, 0xfabd2f,
-            ),
-            // default, github and ayu use GitHub's themes, as do the light
-            // variants without a palette here.
-            (_, true) => return Self::github_dark(),
-            (_, false) => return Self::github_light(),
-        };
-        Self::from_palette(palette)
-    }
 }
 
 pub struct Theme {
@@ -215,53 +141,61 @@ impl Theme {
 }
 
 impl Theme {
-    /// The built-in Ayu themes, derived the way pi-gui derives its Ayu preset.
+    /// Zed's bundled Ayu Dark and Ayu Light (assets/themes/ayu/ayu.json).
     pub fn ayu(dark: bool) -> Self {
-        let mut theme = super::pi_gui_theme::theme("ayu", dark);
-        theme.name = SharedString::new_static(if dark { "Ayu Dark" } else { "Ayu Light" });
-        theme
-    }
-
-    /// Values from Zed's bundled "Ayu Dark" theme (assets/themes/ayu/ayu.json,
-    /// MIT, Copyright (c) 2016 Ike Ku).
-    pub fn ayu_dark() -> Self {
+        let name = if dark { "Ayu Dark" } else { "Ayu Light" };
+        let color = |dark_value, light_value| hex(if dark { dark_value } else { light_value });
+        let editor_background = color(0x0d1016ff, 0xfcfcfcff);
         Self {
-            name: SharedString::new_static("Ayu Dark"),
+            name: SharedString::new_static(name),
             colors: ThemeColors {
-                title_bar_background: hex(0x313337ff),
-                title_bar_inactive_background: hex(0x1f2127ff),
-                panel_background: hex(0x1f2127ff),
-                editor_background: hex(0x0d1016ff),
-                elevated_surface_background: hex(0x1f2127ff),
-                element_background: hex(0x1f2127ff),
-                element_hover: hex(0x2d2f34ff),
-                element_active: hex(0x3e4043ff),
-                element_selected: hex(0x3e4043ff),
-                ghost_element_hover: hex(0x2d2f34ff),
-                ghost_element_active: hex(0x3e4043ff),
-                ghost_element_selected: hex(0x3e4043ff),
-                border: hex(0x3f4043ff),
-                border_variant: hex(0x2d2f34ff),
-                border_focused: hex(0x1b4a6eff),
-                text: hex(0xbfbdb6ff),
-                text_muted: hex(0x8a8986ff),
-                text_placeholder: hex(0x696a6aff),
-                text_disabled: hex(0x696a6aff),
-                text_accent: hex(0x5ac1feff),
-                icon: hex(0xbfbdb6ff),
-                icon_muted: hex(0x8a8986ff),
-                icon_disabled: hex(0x696a6aff),
-                icon_accent: hex(0x5ac1feff),
-                error: hex(0xef7177ff),
-                error_background: hex(0x48161bff),
-                warning: hex(0xfeb454ff),
-                warning_background: hex(0x572815ff),
-                success: hex(0xaad84cff),
-                success_background: hex(0x294113ff),
-                info: hex(0x5ac1feff),
-                info_background: hex(0x0d2f4eff),
-                code_block_background: hex(0x0d1016ff),
-                syntax: SyntaxColors::github_dark(),
+                title_bar_background: color(0x313337ff, 0xdcdddeff),
+                title_bar_inactive_background: color(0x1f2127ff, 0xececedff),
+                panel_background: color(0x1f2127ff, 0xececedff),
+                editor_background,
+                elevated_surface_background: color(0x1f2127ff, 0xececedff),
+                element_background: color(0x1f2127ff, 0xececedff),
+                element_hover: color(0x2d2f34ff, 0xdfe0e1ff),
+                element_active: color(0x3e4043ff, 0xcfd0d2ff),
+                element_selected: color(0x3e4043ff, 0xcfd0d2ff),
+                ghost_element_hover: color(0x2d2f34ff, 0xdfe0e1ff),
+                ghost_element_active: color(0x3e4043ff, 0xcfd0d2ff),
+                ghost_element_selected: color(0x3e4043ff, 0xcfd0d2ff),
+                border: color(0x3f4043ff, 0xcfd1d2ff),
+                border_variant: color(0x2d2f34ff, 0xdfe0e1ff),
+                border_focused: color(0x1b4a6eff, 0xc4daf6ff),
+                text: color(0xbfbdb6ff, 0x5c6166ff),
+                text_muted: color(0x8a8986ff, 0x8b8e92ff),
+                text_placeholder: color(0x696a6aff, 0xa9acaeff),
+                text_disabled: color(0x696a6aff, 0xa9acaeff),
+                text_accent: color(0x5ac1feff, 0x3b9ee5ff),
+                icon: color(0xbfbdb6ff, 0x5c6166ff),
+                icon_muted: color(0x8a8986ff, 0x8b8e92ff),
+                icon_disabled: color(0x696a6aff, 0xa9acaeff),
+                icon_accent: color(0x5ac1feff, 0x3b9ee5ff),
+                error: color(0xef7177ff, 0xef7271ff),
+                error_background: color(0x48161bff, 0xffe3e1ff),
+                warning: color(0xfeb454ff, 0xf1ad49ff),
+                warning_background: color(0x572815ff, 0xffeedaff),
+                success: color(0xaad84cff, 0x85b304ff),
+                success_background: color(0x294113ff, 0xe9efd2ff),
+                info: color(0x5ac1feff, 0x3b9ee5ff),
+                info_background: color(0x0d2f4eff, 0xdeebfaff),
+                code_block_background: editor_background,
+                syntax: SyntaxColors {
+                    comment: color(0x5c6773ff, 0xabb0b6ff),
+                    keyword: color(0xff8f3fff, 0xfa8d3eff),
+                    string: color(0xa9d94bff, 0x86b300ff),
+                    number: color(0xd2a6ffff, 0xa37accff),
+                    function: color(0xffb353ff, 0xf2ad48ff),
+                    r#type: color(0x59c2ffff, 0x389ee6ff),
+                    constant: color(0xd2a6ffff, 0xa37accff),
+                    operator: color(0xf29668ff, 0xed9365ff),
+                    punctuation: Some(color(0xa6a5a0ff, 0x73777bff)),
+                    property: color(0x5ac1feff, 0x3b9ee5ff),
+                    tag: color(0x5ac1feff, 0x3b9ee5ff),
+                    attribute: color(0x5ac1feff, 0x3b9ee5ff),
+                },
             },
         }
     }
