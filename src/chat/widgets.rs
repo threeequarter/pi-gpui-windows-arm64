@@ -9,7 +9,7 @@ use gpui::{AnyElement, Context, ElementId, Hsla, StyledText, div, px};
 use serde_json::Value;
 
 use super::ansi::{self, StyledLine};
-use super::{ChatView, disclosure_button};
+use super::{ChatView, ROW_VERTICAL_PADDING, disclosure_button};
 use crate::settings::{Settings, THEME_LIGHT};
 use crate::ui::pi_gui_theme::darken_for_text_contrast;
 use crate::ui::prelude::*;
@@ -148,7 +148,7 @@ impl Widgets {
             .collect();
         Some(
             v_flex()
-                .gap(px(4.))
+                .gap(px(2. * ROW_VERTICAL_PADDING))
                 .font_family(font_family)
                 .text_size(px(font_size))
                 .children(cards)
