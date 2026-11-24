@@ -231,6 +231,23 @@ fn deepen_for_contrast(color: Rgb, ink: Rgb, surface: Rgb, min_contrast: f64) ->
     mix(color, ink, amount)
 }
 
+pub(crate) fn darken_for_text_contrast(foreground: Hsla, background: Hsla) -> Hsla {
+    const MIN_TEXT_CONTRAST: f64 = 4.5;
+    let channels = |color: Hsla| {
+        let rgba = Rgba::from(color);
+        [rgba.r, rgba.g, rgba.b].map(|value| f64::from(value) * 255.)
+    };
+    let color = channels(foreground);
+    let surface = channels(background);
+    if contrast_ratio(color, surface) >= MIN_TEXT_CONTRAST {
+        return foreground;
+    }
+    hsla(
+        deepen_for_contrast(color, [0.; 3], surface, MIN_TEXT_CONTRAST),
+        foreground.a,
+    )
+}
+
 fn hsla(color: Rgb, alpha: f32) -> Hsla {
     Rgba {
         r: color[0] as f32 / 255.,

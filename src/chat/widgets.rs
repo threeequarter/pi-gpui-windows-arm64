@@ -5,12 +5,13 @@
 
 use std::collections::HashSet;
 
-use gpui::{AnyElement, Context, ElementId, StyledText, div, px};
+use gpui::{AnyElement, Context, ElementId, Hsla, StyledText, div, px};
 use serde_json::Value;
 
 use super::ansi::{self, StyledLine};
 use super::{ChatView, disclosure_button};
-use crate::settings::Settings;
+use crate::settings::{Settings, THEME_LIGHT};
+use crate::ui::pi_gui_theme::darken_for_text_contrast;
 use crate::ui::prelude::*;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -100,19 +101,23 @@ impl Widgets {
         let settings = Settings::get(cx);
         let font_family = settings.buffer_font_family.clone();
         let font_size = settings.buffer_font_size;
-        let colors = cx.theme().colors.clone();
+        let theme = cx.theme();
+        let light = theme.name.as_ref() == THEME_LIGHT;
+        let colors = theme.colors.clone();
         let cards: Vec<AnyElement> = widgets
             .into_iter()
             .map(|widget| {
                 let open = self.expanded.contains(&widget.key);
                 let key = widget.key.clone();
+                let status_widget = key == "rpiv-todos" || key.starts_with("subagents:");
+                let contrast_surface = (light && status_widget).then_some(colors.panel_background);
                 let header = h_flex()
                     .gap(px(6.))
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.))
-                            .child(render_line(&widget.lines[0], open)),
+                            .child(render_line(&widget.lines[0], open, contrast_surface)),
                     )
                     .child(disclosure_button(
                         ElementId::Name(format!("widget-disclosure:{key}").into()),
@@ -123,9 +128,13 @@ impl Widgets {
                             cx.notify();
                         }),
                     ));
-                let rest =
-                    open.then(|| widget.lines[1..].iter().map(|line| render_line(line, true)));
+                let rest = open.then(|| {
+                    widget.lines[1..]
+                        .iter()
+                        .map(|line| render_line(line, true, contrast_surface))
+                });
                 v_flex()
+                    .when(contrast_surface.is_some(), |card| card.text_color(colors.text))
                     .pl(px(8.))
                     .pr(px(4.))
                     .py(px(2.))
@@ -148,11 +157,22 @@ impl Widgets {
     }
 }
 
-fn render_line(line: &StyledLine, wrap: bool) -> AnyElement {
+fn render_line(line: &StyledLine, wrap: bool, contrast_surface: Option<Hsla>) -> AnyElement {
     let text = if line.text.is_empty() {
         StyledText::new(" ")
     } else {
-        StyledText::new(line.text.clone()).with_highlights(line.highlights.clone())
+        let mut highlights = line.highlights.clone();
+        if let Some(surface) = contrast_surface {
+            for (_, style) in &mut highlights {
+                if let Some(color) = style.color {
+                    style.color = Some(darken_for_text_contrast(
+                        color,
+                        style.background_color.unwrap_or(surface),
+                    ));
+                }
+            }
+        }
+        StyledText::new(line.text.clone()).with_highlights(highlights)
     };
     if wrap {
         return div().child(text).into_any_element();

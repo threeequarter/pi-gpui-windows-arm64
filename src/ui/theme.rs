@@ -141,10 +141,16 @@ impl Theme {
 }
 
 impl Theme {
-    /// Zed's bundled Ayu Dark and Ayu Light (assets/themes/ayu/ayu.json).
+    /// Based on Zed's bundled Ayu Dark and Ayu Light (assets/themes/ayu/ayu.json).
     pub fn ayu(dark: bool) -> Self {
         let name = if dark { "Ayu Dark" } else { "Ayu Light" };
-        let color = |dark_value, light_value| hex(if dark { dark_value } else { light_value });
+        let shade = rgba(if dark { 0 } else { 0x0000000f });
+        let palette_color =
+            |dark_value, light_value| rgba(if dark { dark_value } else { light_value }).blend(shade);
+        let color = |dark_value, light_value| palette_color(dark_value, light_value).into();
+        let text_color = |dark_value, light_value| {
+            palette_color(dark_value, light_value).blend(shade).into()
+        };
         let editor_background = color(0x0d1016ff, 0xfcfcfcff);
         Self {
             name: SharedString::new_static(name),
@@ -164,37 +170,37 @@ impl Theme {
                 border: color(0x3f4043ff, 0xcfd1d2ff),
                 border_variant: color(0x2d2f34ff, 0xdfe0e1ff),
                 border_focused: color(0x1b4a6eff, 0xc4daf6ff),
-                text: color(0xbfbdb6ff, 0x5c6166ff),
-                text_muted: color(0x8a8986ff, 0x8b8e92ff),
-                text_placeholder: color(0x696a6aff, 0xa9acaeff),
-                text_disabled: color(0x696a6aff, 0xa9acaeff),
-                text_accent: color(0x5ac1feff, 0x3b9ee5ff),
+                text: text_color(0xbfbdb6ff, 0x5c6166ff),
+                text_muted: text_color(0x8a8986ff, 0x8b8e92ff),
+                text_placeholder: text_color(0x696a6aff, 0xa9acaeff),
+                text_disabled: text_color(0x696a6aff, 0xa9acaeff),
+                text_accent: text_color(0x5ac1feff, 0x3b9ee5ff),
                 icon: color(0xbfbdb6ff, 0x5c6166ff),
                 icon_muted: color(0x8a8986ff, 0x8b8e92ff),
                 icon_disabled: color(0x696a6aff, 0xa9acaeff),
                 icon_accent: color(0x5ac1feff, 0x3b9ee5ff),
-                error: color(0xef7177ff, 0xef7271ff),
+                error: text_color(0xef7177ff, 0xef7271ff),
                 error_background: color(0x48161bff, 0xffe3e1ff),
-                warning: color(0xfeb454ff, 0xf1ad49ff),
+                warning: text_color(0xfeb454ff, 0xf1ad49ff),
                 warning_background: color(0x572815ff, 0xffeedaff),
-                success: color(0xaad84cff, 0x85b304ff),
+                success: text_color(0xaad84cff, 0x85b304ff),
                 success_background: color(0x294113ff, 0xe9efd2ff),
-                info: color(0x5ac1feff, 0x3b9ee5ff),
+                info: text_color(0x5ac1feff, 0x3b9ee5ff),
                 info_background: color(0x0d2f4eff, 0xdeebfaff),
                 code_block_background: editor_background,
                 syntax: SyntaxColors {
-                    comment: color(0x5c6773ff, 0xabb0b6ff),
-                    keyword: color(0xff8f3fff, 0xfa8d3eff),
-                    string: color(0xa9d94bff, 0x86b300ff),
-                    number: color(0xd2a6ffff, 0xa37accff),
-                    function: color(0xffb353ff, 0xf2ad48ff),
-                    r#type: color(0x59c2ffff, 0x389ee6ff),
-                    constant: color(0xd2a6ffff, 0xa37accff),
-                    operator: color(0xf29668ff, 0xed9365ff),
-                    punctuation: Some(color(0xa6a5a0ff, 0x73777bff)),
-                    property: color(0x5ac1feff, 0x3b9ee5ff),
-                    tag: color(0x5ac1feff, 0x3b9ee5ff),
-                    attribute: color(0x5ac1feff, 0x3b9ee5ff),
+                    comment: text_color(0x5c6773ff, 0xabb0b6ff),
+                    keyword: text_color(0xff8f3fff, 0xfa8d3eff),
+                    string: text_color(0xa9d94bff, 0x86b300ff),
+                    number: text_color(0xd2a6ffff, 0xa37accff),
+                    function: text_color(0xffb353ff, 0xf2ad48ff),
+                    r#type: text_color(0x59c2ffff, 0x389ee6ff),
+                    constant: text_color(0xd2a6ffff, 0xa37accff),
+                    operator: text_color(0xf29668ff, 0xed9365ff),
+                    punctuation: Some(text_color(0xa6a5a0ff, 0x73777bff)),
+                    property: text_color(0x5ac1feff, 0x3b9ee5ff),
+                    tag: text_color(0x5ac1feff, 0x3b9ee5ff),
+                    attribute: text_color(0x5ac1feff, 0x3b9ee5ff),
                 },
             },
         }
